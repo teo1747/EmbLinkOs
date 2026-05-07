@@ -1,7 +1,7 @@
 [BITS 16]
 [ORG 0x7E00]
 
-
+start:
     mov si, msg_stage2       ; Load the address of the stage 2 message into SI
     call print_string         ; Call the print_string function
 
@@ -12,6 +12,8 @@
 
     ; step 2: load GDT
     lgdt [gdt_descriptor]     ; Load the GDT descriptor into GDTR
+    
+          
 
     ; step 3: switch to protected mode
     mov eax, cr0            
@@ -56,12 +58,17 @@ gdt_descriptor:
     dd gdt_start             ; Base
 
 
+;Section .bss
+;    align 4096
+;    p4_table: resd 4096 ; Reserve space for 4 page tables (4KB each): PML4
+;    p3_table: resd 4096 ; Reserve space for 3 page directories (4KB each): PDPT
+ ;   p2_table: resd 4096 ; Reserve space for 2 page tables (4KB each): PD
+
+
 
 [BITS 32]
 protected_mode:
     ; At this point, we are in protected mode and can use 32-bit instructions
-    
-    
     mov ax, 0x10            ; Load the data segment selector (index 2 in GDT)
     mov ds, ax              ; Set DS to the data segment
     mov es, ax              ; Set ES to the data segment
@@ -70,9 +77,74 @@ protected_mode:
     mov ss, ax              ; Set SS to the data segment
     mov esp, 0x9000         ; Set stack pointer to 0x9000
 
+    call zero_page_tables     ; Clear the page tables before using them
+    call setup_page_tables     ; Set up page tables for protected mode (identity mapping for the first 1GB)
+    call enable_paging          ; Enable paging and long mode
+
+
     mov esi, msg_protected   
     call print_string_pm
-    jmp $                       
+    jmp $    
+
+setup_page_tables:
+    ; This is where you would set up your page tables for paging
+    ; For simplicity, we will identity map the first 1GB of memory
+    ; You would need to fill in the page tables and then enable paging by setting the PG bit in CR0  
+
+    ;PML4[0] -> p3_table
+    mov eax, p3_table
+    or eax, 0x03            ; Present and Read/Write
+    mov [p4_table], eax     ; Set PML4[0] to point to the PDPT
+
+    ;PDPT[0] -> p2_table
+    mov eax, p2_table
+    or eax, 0x03            ; Present and Read/Write
+    mov [p3_table], eax     ; Set PDPT[0] to point to the PD
+
+    ;PD[0] -> 2MB page (maps 512 x 2MB = 1GB)
+    mov ecx, 0
+.map_p2:
+    mov eax, 0x200000 ; 2MB 
+    mul ecx              ; eax = 2MB * ecx  calculates the physical address for the page
+    or eax, 0b10000011        ; Present, Read/Write, huge (ps bit) 
+    mov [p2_table + ecx*8], eax ; Set PD[ecx] to point to the 2MB page
+    inc ecx
+    cmp ecx, 512            ; We need to map 512 entries to cover 1GB
+    jl .map_p2
+    ret
+
+    ; After setting up the page tables, you would enable paging by setting the PG bit in CR0
+
+enable_paging:
+    ; Load the address of the PML4 table into CR3 to enable paging
+    mov eax, p4_table 
+    mov cr3, eax              
+
+    ; Enable PAE by setting the PAE bit in CR4
+    mov eax, cr4
+    or eax, (1 << 5)              ; Set the PAE bit
+    mov cr4, eax
+
+    ; Enable long mode by setting the LME bit in EFER MSR
+    ; To access MSRs, we need to use the RDMSR and WRMSR instructions. The EFER MSR is at index 0xC0000080.
+    mov ecx, 0xC0000080          ; EFER MSR comvention to use ecx to specify the MSR index
+    rdmsr
+    or eax, (1 << 8)              ; Set the LME bit
+    wrmsr
+
+    ; Enable paging by setting the PG bit in CR0
+    mov eax, cr0
+    or eax, (1 << 31)             ; Set the PG bit (Paging Enable)
+    mov cr0, eax
+
+    ret
+
+zero_page_tables:
+    mov edi, 0x9000         ; start of p4_table
+    mov ecx, 3 * 4096 / 4  ; 3 tables × 4KB / 4 bytes each
+    xor eax, eax
+    rep stosd               ; fill with zeros
+    ret
 
 print_string_pm:
     pusha                    
@@ -108,3 +180,9 @@ print_string:
 msg_stage2    db 'MyOS Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
 
 msg_protected db 'Welcome to MyOS Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
+
+
+; Page tables at fixed addresses (must be 4KB aligned)
+p4_table equ 0x9000     ; PML4
+p3_table equ 0xA000     ; PDPT
+p2_table equ 0xB000     ; PD
