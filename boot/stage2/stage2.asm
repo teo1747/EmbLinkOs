@@ -58,12 +58,33 @@ gdt_descriptor:
     dd gdt_start             ; Base
 
 
-;Section .bss
-;    align 4096
-;    p4_table: resd 4096 ; Reserve space for 4 page tables (4KB each): PML4
-;    p3_table: resd 4096 ; Reserve space for 3 page directories (4KB each): PDPT
- ;   p2_table: resd 4096 ; Reserve space for 2 page tables (4KB each): PD
 
+gdt64_start:
+
+gdt64_null:
+    dq 0                     ; Null descriptor (8 bytes)
+
+gdt64_code:
+    dw 0x0000                ; Limit (low 16 bits)
+    dw 0x0000                ; Base (low 16 bits)
+    db 0x00                  ; Base (middle 8 bits) 
+    db 10011010b             ; Type and attributes (code segment)(p = 1, dpl = 00, s = 1, e = 1, rw = 1)
+    db 00100000b             ; Limit (high 4 bits) and Base (high 8 bits) (long mode code segment has a limit of 0)
+    db 0x00                  ; Base (high 8 bits)
+
+gdt64_data:
+    dw 0x0000                ; Limit (low 16 bits)
+    dw 0x0000                ; Base (low 16 bits)
+    db 0x00                  ; Base (middle 8 bits) 
+    db 10010010b             ; Type and attributes (data segment)(p = 1, dpl = 00, s = 1, e = 0, rw = 1)
+    db 00000000b             ; Limit (high 4 bits) and Base (high 8 bits) (long mode data segment has a limit of 0)
+    db 0x00                  ; Base (high 8 bits)
+
+gdt64_end:
+
+gdt64_descriptor:
+    dw gdt64_end - gdt64_start - 1 ; Limit
+    dd gdt64_start           ; Base
 
 
 [BITS 32]
@@ -81,6 +102,8 @@ protected_mode:
     call setup_page_tables     ; Set up page tables for protected mode (identity mapping for the first 1GB)
     call enable_paging          ; Enable paging and long mode
 
+    lgdt [gdt64_descriptor]     ; Load the 64-bit GDT descriptor into GDTR
+    jmp 0x08:long_mode_start          
 
     mov esi, msg_protected   
     call print_string_pm
@@ -177,10 +200,62 @@ print_string:
     popa                     ; Restore all registers
     ret                      ; Return from the function
 
+
+
+
+
+
+[BITS 64]
+
+long_mode_start:
+    ; This is where you would continue with your long mode code
+    ; You can set up your kernel, initialize devices, etc.
+
+    mov ax, 0x10            ; Load the data segment selector (index 2 in GDT)
+    mov ds, ax              
+    mov es, ax              
+    mov fs, ax              
+    mov gs, ax              
+    mov ss, ax              
+
+
+    mov rsi, msg_longmode     
+    call print_string_64
+    jmp $               
+
+print_string_64:
+    push rax
+    push rdx
+    push rsi
+    mov rdx, 0xB8000          ; VGA text mode buffer
+.loop:
+    mov al, [rsi]             ; Load byte at DS:RSI into AL
+    or al, al               
+    jz .done
+    mov ah, 0x0F            ; Attribute byte (white on black)
+    mov [rdx], ax           
+    add rdx, 2              
+    inc rsi                 
+    jmp .loop               
+.done:
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+    
+
+
+
+
+
+
+
+
 msg_stage2    db 'MyOS Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
 
 msg_protected db 'Welcome to MyOS Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
 
+msg_longmode  db 'Welcome to MyOS Long Mode!', 0 ; Message to display in long mode (null-terminated)
 
 ; Page tables at fixed addresses (must be 4KB aligned)
 p4_table equ 0x9000     ; PML4
