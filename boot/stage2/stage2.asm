@@ -15,7 +15,7 @@ start:
 
     ;load kernel from disk 
     mov ah, 0x02            ; BIOS read sector function
-    mov al, 19            
+    mov al, 30           
     mov ch, 0               ; Cylinder 0
     mov cl, 10              ; Sector 10 (first sector is 1)              
     mov dh, 0               

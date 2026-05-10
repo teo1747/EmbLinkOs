@@ -37,6 +37,19 @@ void serial_write_string(const char *str) {
 }
 
 
+void serial_write_hex(uint64_t value) {
+    const char *hex_digits = "0123456789ABCDEF"; 
+    char buffer[17]; // 16 hex digits + null terminator
+    buffer[16] = '\0';
+    
+    for (int i = 15; i >= 0; i--) {
+        buffer[i] = hex_digits[value & 0xF];
+        value >>= 4;
+    }
+    serial_write_string("0x");
+    serial_write_string(buffer);
+}
+
 
 
 

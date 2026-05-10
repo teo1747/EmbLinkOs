@@ -11,7 +11,14 @@ IMG = myos.img
 # Sources
 STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
-KERNEL_SRC  = kernel/main.c
+ISR_SRC     = kernel/cpu/isr.asm
+KERNEL_SRC = kernel/main.c \
+             kernel/cpu/isr.c \
+             kernel/drivers/serial.c \
+             kernel/cpu/idt.c
+ISR_ASM     = kernel/cpu/isr.asm			 
+ISR_OBJ     = kernel/cpu/isr.o
+
 LINKER      = kernel/linker.ld
 
 # Binaries
@@ -30,9 +37,13 @@ $(STAGE1_BIN): $(STAGE1_SRC)
 $(STAGE2_BIN): $(STAGE2_SRC)
 	$(ASM) $(ASM_FLAGS) $< -o $@
 
+# Assemble ISR stubs
+$(ISR_OBJ): $(ISR_ASM)
+	$(ASM) -f elf64 $< -o $@
+
 # Compile kernel
-$(KERNEL_ELF): $(KERNEL_SRC) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC)
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ)
 
 # Combine into disk image
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
@@ -40,7 +51,7 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 
 # Run in QEMU
 run: $(IMG)
-	qemu-system-x86_64 -drive format=raw,file=$(IMG) -no-reboot -no-shutdown
+	qemu-system-x86_64 -drive format=raw,file=$(IMG) -serial stdio -no-reboot -no-shutdown
 
 # Debug mode
 debug: $(IMG)
