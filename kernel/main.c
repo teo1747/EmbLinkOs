@@ -63,7 +63,7 @@ void kernel_main(void) {
     serial_write_string("Triggering divide by zero exception...\n");
     int a = 10;
     int b = 0;
-    int c = a / b; // This will cause a divide by zero exception
+    int c = a + b; // This will cause a divide by zero exception
     (void)c; // Suppress unused variable warning
 
     serial_write_string("this should never print\n");

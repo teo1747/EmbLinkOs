@@ -5,7 +5,9 @@ start:
     mov si, msg_stage2       ; Load the address of the stage 2 message into SI
     call print_string         ; Call the print_string function
 
-    ; step 1: enable A20 line
+    call e820_query            ; Query the memory map using BIOS interrupt 0x15, function 0xE820
+
+    ;step 1: enable A20 line
     call enable_a20
 
     ;mov bx, 0x10000        ; Load the sector into memory at 0x10000 (16-bit mode can only address up to 1MB, so we use segment:offset to access memory above 64KB)
@@ -108,6 +110,72 @@ gdt64_end:
 gdt64_descriptor:
     dw gdt64_end - gdt64_start - 1 ; Limit
     dd gdt64_start           ; Base
+
+e820_query:
+    ; This function will query the memory map using BIOS interrupt 0x15, function 0xE820
+
+    pusha                    
+    
+    mov di, 0x7004            ; Buffer to store the memory map entry 
+    xor ebx, ebx              ; Set EBX to 0 for the first call
+    xor bp, bp                ; Clear BP to use as a counter for the number of entries
+    mov edx, 0x534D4150       ; 'SMAP' signature
+    mov eax, 0xE820           ; E820 function number
+    mov [es:di + 20], dword 1 ; Force a valid ACPI 3.X entry
+    mov ecx, 24               ; Size of the buffer for each entry (20 bytes for the entry + 4 bytes for the ACPI 3.X flag)
+    int 0x15                  ; Call BIOS interrupt
+    jc .failed                ; If carry flag is set, there are no more entries / don't support E820
+
+    cmp eax, 0x534D4150       ; Check if the returned signature is correct
+    jne .failed
+
+    test ebx, ebx              ; Check if EBX is zero, which indicates the last entry / or none since it the first call
+    je .failed
+    jmp .got_entry
+
+.next_entry:
+    mov eax, 0xE820           ; 
+    mov [es:di + 20], dword 1 
+    mov ecx, 24  
+    mov edx, 0x534D4150             
+    int 0x15                  ; Call BIOS interrupt
+    jc .done                  ; If carry flag is set, there are no more entries 
+
+    mov eax, 0x534D4150
+
+.got_entry:
+    jcxz .skip_entry ; If EBX is zero, skip processing this entry since it indicates the last entry \
+    cmp cl, 20              ; Check if the returned entry size is at least 20 bytes (the size of the standard E820 entry)
+    jbe .accept
+    test dword [es:di + 20], 1 ; Check if the ACPI 3.X flag is set, which indicates that the entry is valid even if it's larger than 20 bytes
+    je .skip_entry       ; If the ACPI 3.X flag is not set, skip this entry since it's not valid
+
+.accept:
+    ; At this point, we have a valid memory map entry in the buffer at es:
+    mov ecx, [es:di + 8]    ; check lehgth low
+    or ecx, [es:di + 12]    ; check length high
+    jz .skip_entry       ; If the length is zero, skip this entry since it doesn't describe any usable memory
+
+    inc bp                  ; Increment the entry counter
+    add di, 24              ; Move to the next entry (size of the buffer for each entry)
+
+.skip_entry:
+    test ebx, ebx          ; Check if EBX is zero, which indicates the last entry / or none since it the first call
+    jne .next_entry 
+
+
+.done:
+    mov [0x7000], bp        ; Store the number of valid entries in a known location for later use
+    clc                     ; Clear carry flag to indicate success
+    popa       
+    ret
+
+.failed:
+    mov [0x7000], 0         
+    stc                     ; Set carry flag to indicate failure              
+    popa
+    ret
+
 
 
 [BITS 32]
@@ -340,13 +408,13 @@ print_string_64:
     pop rdx
     pop rax
     ret
-    
 
-msg_stage2    db 'MyOS Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
 
-msg_protected db 'Welcome to MyOS Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
+msg_stage2    db 'Helios Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
 
-msg_longmode  db 'Welcome to MyOS Long Mode!', 0 ; Message to display in long mode (null-terminated)
+msg_protected db 'Welcome to Helios Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
+
+msg_longmode  db 'Welcome to Helios Long Mode!', 0 ; Message to display in long mode (null-terminated)
 
 msg_error_S2   db 'Kernel loading failed!', 0x0D, 0x0A, 0 ; Error message for stage 2 (null-terminated)
 
