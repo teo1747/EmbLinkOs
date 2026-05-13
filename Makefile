@@ -2,8 +2,9 @@
 ASM      = nasm
 ASM_FLAGS = -f bin
 CC = x86_64-elf-gcc
-CFLAGS   = -ffreestanding -nostdlib -nostartfiles \
-           -mno-red-zone -mno-mmx -mno-sse -mno-sse2
+CFLAGS = -ffreestanding -nostdlib -nostartfiles \
+         -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+         -g -O0
 
 # Output
 IMG = myos.img
@@ -54,10 +55,13 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 # Run in QEMU
 run: $(IMG)
 	qemu-system-x86_64 -drive format=raw,file=$(IMG) -serial stdio -no-reboot -no-shutdown
+	
 
 # Debug mode
 debug: $(IMG)
-	qemu-system-x86_64 -drive format=raw,file=$(IMG) -no-reboot -no-shutdown -d int,cpu_reset
+	qemu-system-x86_64 -drive format=raw,file=$(IMG) \
+	    -serial stdio -no-reboot -no-shutdown \
+	    -s -S
 
 # Clean build artifacts
 clean:
