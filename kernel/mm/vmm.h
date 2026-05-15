@@ -1,0 +1,41 @@
+#ifndef _VMM_H_
+#define _VMM_H_
+#include <stdint.h>
+
+
+// Page table entry flags
+#define VMM_PRESENT       (1ULL << 0)
+#define VMM_WRITABLE      (1ULL << 1)
+#define VMM_USER          (1ULL << 2)
+#define VMM_WRITETHROUGH  (1ULL << 3)
+#define VMM_NOCACHE       (1ULL << 4)
+#define VMM_ACCESSED      (1ULL << 5)
+#define VMM_DIRTY         (1ULL << 6)
+#define VMM_HUGE          (1ULL << 7)
+#define VMM_GLOBAL        (1ULL << 8)
+#define VMM_NX            (1ULL << 63)
+
+// Address mask for physical addresses in page table entries
+#define VMM_ADDR_MASK 0x0000fffffffff000ULL
+
+// Initialize VMM and switch to kernel paage tables
+void vmm_init(void);
+
+// Map a virtual address to a physical address with the given flags
+// Return 0 on succes, -1 on failure
+int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
+
+// Unmap a virtual address
+void vmm_unmap(uint64_t virt);
+
+// Get the physical address of a virtual address (returns 0 if not mapped)
+uint64_t vmm_get_phys(uint64_t virt);
+
+// Invalidates the TLB entry for the given virtual address
+void vmm_flush_tlb(uint64_t virt);
+
+// Get the kernel's PML4 (for context switching)
+uint64_t vmm_get_kernel_pml4(void);
+
+
+#endif

@@ -2,6 +2,7 @@
 #include "drivers/serial.h"
 #include "../kernel/cpu/idt.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"
 
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
@@ -51,46 +52,43 @@ void kernel_main(void) {
    
     vga_clear();  // Clear screen with white on black
     vga_print("Helios kernel\n", 0x0F);  // Print message in white on black
-    vga_print("64-bit Long Mode\n", 0x0F); 
-    vga_print("Kernel loaded successfully!\n", 0x0B);
-
-    serial_write_string("Helios kernel initialized.\n");  // Print message via serial port
-    serial_write_string("Serial output working!\n");
+    
 
     idt_init();     // Initialize the Interrupt Descriptor Table (IDT)
     serial_write_string("IDT loaded\n");
 
     pmm_init();
-
-    serial_write_string("\n=== PMM Allocation Test ===\n");
-    void* page1 = pmm_alloc_page();
-    serial_write_string("Allocation page 1:  ");
-    serial_write_hex((uint64_t)page1);
-    serial_write_string("\n");
-
-    void* page2 = pmm_alloc_page();
-    serial_write_string("Allocation page 2:  ");
-    serial_write_hex((uint64_t)page2);
-    serial_write_string("\n");
-
-    void* page3 = pmm_alloc_page();
-    serial_write_string("Allocation page 3:  ");
-    serial_write_hex((uint64_t)page3);
-    serial_write_string("\n");
-
-    pmm_free_page(page2);
-    serial_write_string("Freed page 2\n");
-
-    void* page4 = pmm_alloc_page();
-    serial_write_string("Allocation page 4 (should reuse page 2):  ");
-    serial_write_hex((uint64_t)page4);
-    serial_write_string("\n");
-
-    pmm_print_stats();
+    vmm_init();
+   // Test: allocate a new page and map it to a fresh virtual address
+    serial_write_string("\n=== VMM Test ===\n");
     
-    for(;;) {
-        // Infinite loop to keep the kernel running
-    }
+    uint64_t phys = pmm_alloc_page();
+    uint64_t virt = 0xFFFFFFFF90000000;  // somewhere new in higher half
+    
+    serial_write_string("Allocated phys: ");
+    serial_write_hex(phys);
+    serial_write_string("\nMapping to virt: ");
+    serial_write_hex(virt);
+    serial_write_string("\n");
+    
+    vmm_map(virt, phys, VMM_WRITABLE);
+    
+    // Write to it
+    uint64_t *ptr = (uint64_t *)virt;
+    *ptr = 0xCAFEBABEDEADBEEF;
+    
+    serial_write_string("Wrote magic value\n");
+    serial_write_string("Read back: ");
+    serial_write_hex(*ptr);
+    serial_write_string("\n");
+    
+    // Verify translation
+    uint64_t actual_phys = vmm_get_phys(virt);
+    serial_write_string("vmm_get_phys returned: ");
+    serial_write_hex(actual_phys);
+    serial_write_string("\n");
+
+    for(;;);
 }
 
 

@@ -23,6 +23,13 @@ struct e820_entry {
 #define E820_ACPI_NVS     4
 #define E820_BAD_MEMORY   5
 
+
+// Virtual memory mapping (Higher half conversion)
+#define KERNEL_VIRTUAL_BASE 0xFFFFFFFF80000000ULL // Base address of kernel virtual memory
+#define V2P(addr)((uint64_t)(addr) - KERNEL_VIRTUAL_BASE) // Convert virtual address to physical address
+#define P2V(addr)((uint64_t)(addr) + KERNEL_VIRTUAL_BASE) // Convert physical address to virtual address
+
+
 // Memory map BUFFER
 
 #define E820_COUNT_ADDR   0X7000
@@ -33,9 +40,14 @@ struct e820_entry {
 
 void pmm_init(void);
 void pmm_print_map(void);
-void *pmm_alloc_page(void);
-void pmm_free_page(void *page);
 void pmm_print_stats(void);
+
+
+// Returns Physical address of the given virtual address (or NULL if not found)
+uint64_t pmm_alloc_page(void);
+
+// takes a physical address and frees the corresponding virtual page
+void pmm_free_page(uint64_t phys_addr);
 
 
 
