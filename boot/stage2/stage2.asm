@@ -14,6 +14,8 @@ start:
     mov si, msg_stage2
     call print_string
 
+    call vbe_init
+
     call e820_query
     call enable_a20
 
@@ -206,6 +208,98 @@ e820_query:
     ret
 
 
+vbe_init:
+    ; This function will initialize the VBE (Video BIOS Extension) and return the address of the VBE control structure
+    ; INT 10h AX=4FOOH - get VBE controller info
+    
+    mov ax, 0x4F00           ; Get VBE controller information
+    mov di, 0x5000           ; Address of VBE info buffer
+    int 0x10                 ; Call BIOS video interrupt
+    cmp ax, 0x004F           ; Check if the function returned successfully
+    jne .vbe_failed 
+ 
+    ; This function will get the mode information for the VBE mode specified by the parameter
+    ; INT 10h AX=4F01 - get VBE mode info
+                     
+    mov ax, 0x4F01           ; Get VBE mode information
+    mov cx, 0x118            ; Mode
+    mov di, 0x5200        ; Address of VBE mode info buffer
+    int 0x10                 ; Call BIOS video interrupt
+    cmp ax, 0x004F           ; Check if the function returned successfully
+    jne .vbe_failed    
+
+
+    ; Set up the VBE mode
+    ; INT 10h AX=4F02 - set VBE mode
+
+    mov ax, 0x4F02           ; Set VBE mode
+    mov bx, 0x118 | 0x4000  ; Mode 
+    mov esi, 0x6000          ; Address of VBE mode info buffer
+    int 0x10                 ; Call BIOS video interrupt
+    cmp ax, 0x004F           ; Check if the function returned successfully
+    jne .vbe_failed 
+
+
+
+    ; Step 4: Copy field to 0x6000
+    ; ModeInfoBlock    ofsets:
+    ; 0x00 = Mode Attributes (16 bits)
+    ; 0x10 = PBytesPerScanLine (16 bits pitch)
+    ; 0x12 = XResolution (16 bits width)
+    ; 0x14 = YResolution (16 bits height
+    ; 0x19 = BitsPerPixel (8 bits depth)
+    ; 0x28 = PhysBasePtr (32 bits framebuffer address)
+
+    mov esi, 0x5200          ; Address of VBE mode info buffer
+
+    xor eax, eax
+    mov eax, [esi + 0x28]  
+    mov [0x6000], eax       ; lower 32 bits of PhysBasePtr
+    mov dword [0x6004], 0   ; higher 32 bits of PhysBasePtr (set to 0)
+
+    ;width
+    xor eax, eax
+    mov ax, [esi + 0x12]
+    mov [0x6008], eax
+
+    ;height
+    xor eax, eax
+    mov ax, [esi + 0x14]
+    mov [0x600C], eax
+
+    ;pitch
+    xor eax, eax
+    mov ax, [esi + 0x10]
+    mov [0x6010], eax
+
+    ;depth bpp
+    xor eax, eax
+    mov al, [esi + 0x19]
+    mov [0x6014], eax
+
+   
+    ; Format - read from VBE mode info buffer
+    xor eax, eax
+    mov al, [esi + 0x1C] ; read field position 0x1C
+    cmp al, 0
+    je .rgb
+    mov dword [0x6018], 1 ; 32-bit 
+
+    ret
+
+.rgb:
+    mov dword [0x6018], 0 
+
+    ret
+
+
+.vbe_failed:
+    ; If we get here, the VBE initialization failed
+    mov si, msg_vbe_failed
+    call print_string
+    jmp $
+
+    
 
 [BITS 32]
 protected_mode:
@@ -465,6 +559,8 @@ msg_error_S2   db 'Kernel loading failed!', 0x0D, 0x0A, 0 ; Error message for st
 msg_error_efl  db 'ELF loading failed!', 0 ; Error message for ELF loading (null-terminated)
 
 msg_no_lba db 'BIOS does not support LBA!', 0x0D, 0x0A, 0
+
+msg_vbe_failed db 'VBE initialization failed!', 0x0D, 0x0A, 0 ; Error message for VBE initialization (null-terminated)
 
 
 ; Page tables at fixed addresses (must be 4KB aligned)
