@@ -36,8 +36,8 @@ static inline int bitmap_test(uint64_t page_index) {
 
 
 void pmm_print_map(void) {
-    uint32_t count = *(uint32_t *)P2V(E820_COUNT_ADDR);
-    struct e820_entry *entries = (struct e820_entry *)P2V(E820_ENTRIES_ADDR);
+    uint32_t count = *(uint32_t *)KP2V(E820_COUNT_ADDR);
+    struct e820_entry *entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR);
 
     serial_write_string("\n=== E820 Memory Map ===\n");
     serial_write_string("entries: ");
@@ -86,8 +86,8 @@ void pmm_init(void) {
     // For now, we just print the memory map. In a real implementation, we would initialize our physical memory manager here.
     pmm_print_map();
 
-    uint32_t count = *(uint32_t *)P2V(E820_COUNT_ADDR); // Get the number of E820 entries
-    struct e820_entry *entries = (struct e820_entry *)P2V(E820_ENTRIES_ADDR); // Get pointer to the E820 entries
+    uint32_t count = *(uint32_t *)KP2V(E820_COUNT_ADDR); // Get the number of E820 entries
+    struct e820_entry *entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR); // Get pointer to the E820 entries
 
     // step 1: find the highest addressable memory to determine how many pages we need to manage
     uint64_t highest_address = 0;
@@ -151,7 +151,7 @@ void pmm_init(void) {
     }
 
     // step 6: Reserve kernel + bitmap region
-    uint64_t bitmap_phys_end = V2P(pmm_bitmap) + bitmap_size; // Calculate the physical end of the bitmap region
+    uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size; // Calculate the physical end of the bitmap region
     uint64_t reserve_end_page = (bitmap_phys_end + PAGE_SIZE - 1) / PAGE_SIZE ; // Reserve the entire bitmap region for now
 
     for (uint64_t p = 0; p <= reserve_end_page && p < total_pages; p++) {

@@ -37,5 +37,6 @@ void vmm_flush_tlb(uint64_t virt);
 // Get the kernel's PML4 (for context switching)
 uint64_t vmm_get_kernel_pml4(void);
 
+// Get the current process's PML4 (for context switching)
 
 #endif

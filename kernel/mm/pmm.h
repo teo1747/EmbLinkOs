@@ -26,9 +26,17 @@ struct e820_entry {
 
 // Virtual memory mapping (Higher half conversion)
 #define KERNEL_VIRTUAL_BASE 0xFFFFFFFF80000000ULL // Base address of kernel virtual memory
-#define V2P(addr)((uint64_t)(addr) - KERNEL_VIRTUAL_BASE) // Convert virtual address to physical address
-#define P2V(addr)((uint64_t)(addr) + KERNEL_VIRTUAL_BASE) // Convert physical address to virtual address
+#define DIRECT_MAP_BASE     0xFFFF800000000000ULL // Base address of direct mapped memory
+#define MMIO_BASE           0xFFFFC00000000000ULL // Base address of memory-mapped I/O
 
+
+// Direct map conversion(for physical addresses in the direct mapped range)
+#define V2P(addr)((uint64_t)(addr) - DIRECT_MAP_BASE) // Convert virtual address to physical address
+#define P2V(addr)((uint64_t)(addr) + DIRECT_MAP_BASE) // Convert physical address to virtual address
+
+// Kernel range conversions(for kernel symbols like kernel_end, )
+#define KV2P(addr)((uint64_t)(addr) - KERNEL_VIRTUAL_BASE) 
+#define KP2V(addr)((uint64_t)(addr) + KERNEL_VIRTUAL_BASE) 
 
 // Memory map BUFFER
 

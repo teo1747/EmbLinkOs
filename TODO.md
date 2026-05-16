@@ -65,3 +65,35 @@
   - PCI enumeration to find GPU
   - GPU driver
   - 2D acceleration (rectangle blit, glyph cache)
+
+## Phase 6 - Framebuffer
+
+#### Stage 2 VBE - Proper Mode Selection (Future)
+Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
+
+1. EDID Query (INT 10h AX=4F15h, BL=01h)
+   - Returns 128-byte EDID block from monitor
+   - Parse bytes 0x36-0x47 (detailed timing descriptor 1)
+   - Extract native horizontal/vertical resolution
+   - Fall back gracefully if EDID unavailable
+
+2. VBE Mode Enumeration
+   - Read VbeModeListPtr from VBEInfoBlock (offset 0x0E)
+   - This is a far pointer (segment:offset) to uint16_t array
+   - Array terminated by 0xFFFF
+   - For each mode, call 4F01h and read ModeInfoBlock
+
+3. Mode Filtering & Scoring
+   - Require: ModeAttributes bit 0 (supported), bit 4 (graphics), bit 7 (LFB)
+   - Require: MemoryModel == 6 (direct color)
+   - Score: closeness to EDID native resolution
+   - Tiebreaker: prefer 32bpp > 24bpp > 16bpp
+
+4. Fallback Chain (if EDID/scoring fails)
+   - Try 1920x1080, 1280x1024, 1024x768, 800x600, 640x480
+   - For each, search mode list for a match
+   - Final fallback: stay in text mode with VGA at 0xB8000
+
+References:
+- VBE 3.0 spec (Function 15h: Display Data Channel)
+- EDID 1.4 spec (VESA E-EDID)

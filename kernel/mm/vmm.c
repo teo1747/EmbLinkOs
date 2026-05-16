@@ -20,7 +20,7 @@ static uint64_t *alloc_table(void) {
     if (!pyhs_addr){
         return 0;
     }
-    uint64_t *table = (uint64_t *)P2V(pyhs_addr);
+    uint64_t *table = (uint64_t *)KP2V(pyhs_addr);
     for (int i = 0; i < 512; i++) {
         table[i] = 0;
     }
@@ -33,7 +33,7 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
     if (parent[index] & VMM_PRESENT) {
         // Table already exists, return its vitual address
         uint64_t phys_addr = parent[index] & VMM_ADDR_MASK;
-        return (uint64_t *)P2V(phys_addr);
+        return (uint64_t *)KP2V(phys_addr);
     }
     // Allocate a new table and set its flags
     uint64_t phys_addr = pmm_alloc_page();
@@ -41,7 +41,7 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
         return 0;
     }
     
-    uint64_t *table = (uint64_t *)P2V(phys_addr);
+    uint64_t *table = (uint64_t *)KP2V(phys_addr);
     for (int i = 0; i < 512; i++) {
         table[i] = 0;
     }
@@ -77,17 +77,17 @@ int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
 }
 
 void vmm_unmap(uint64_t virt_addr){
-    uint64_t *pdpt = (uint64_t *)P2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pdpt = (uint64_t *)KP2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
     if (!(kernel_pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
 
-    uint64_t *pd = (uint64_t *)P2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pd = (uint64_t *)KP2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
     if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
 
-    uint64_t *pt = (uint64_t *)P2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pt = (uint64_t *)KP2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
     if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
@@ -101,18 +101,18 @@ uint64_t vmm_get_phys(uint64_t virt_addr) {
     if (!(kernel_pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pdpt = (uint64_t *)P2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pdpt = (uint64_t *)KP2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
 
   
     if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pd = (uint64_t *)P2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pd = (uint64_t *)KP2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pt = (uint64_t *)P2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pt = (uint64_t *)KP2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
@@ -128,7 +128,7 @@ void vmm_flush_tlb(uint64_t virt_addr) {
 }
 
 uint64_t vmm_get_kernel_pml4(void) {
-    return V2P(kernel_pml4);
+    return KV2P(kernel_pml4);
 }
 
 
@@ -145,33 +145,80 @@ void vmm_init(void) {
     }
 
     serial_write_string("PML4 Allocated at phys: ");
-    serial_write_hex(V2P(kernel_pml4));
+    serial_write_hex(KV2P(kernel_pml4));
     serial_write_string("\n");
 
 
     // step 2: Map 0 to 1GB physical memory to higher half virtual memory
-    // virt 0xFFFFFFFF80000000 -> phys 0x0
-    // virt 0xFFFFFFFF80100000 -> phys 0x100000
+    // Map all usable physical RAM E820 using 2 MB pages
+    // for simplicity, we map from 0 to the highest usable address
     // ... etc 1GB
-    serial_write_string("Mapping 1GB to higher half...\n");
-    for (uint64_t addr = 0; addr < 0x40000000; addr += PAGE_SIZE) {
-        uint64_t virt_addr = P2V(addr);
-        if (vmm_map(virt_addr, addr, VMM_WRITABLE) < 0) {
-            serial_write_string("FATAL: vmm_map failed at\n");
-            serial_write_hex(addr);
-            serial_write_string("\n");
+    uint32_t e820_count = *(uint32_t *)KP2V(E820_COUNT_ADDR);
+    struct e820_entry *e820_entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR);
+
+    uint64_t highest_phys = 0;
+    for (uint64_t i = 0; i < e820_count; i++) {
+        if (e820_entries[i].type != E820_USABLE) {
+            continue;
+        }
+        uint64_t end = e820_entries[i].base + e820_entries[i].length;
+        if (end > highest_phys) {
+            highest_phys = end;
+        }
+    }
+
+    // Rounded up to nearest 2MB boundary
+    highest_phys = (highest_phys + 0x1fffff) & ~0x1fffffULL; // 2MB pages
+
+    serial_write_string("Building direct map from 0 to phys: ");
+    serial_write_hex(highest_phys);
+    serial_write_string("(2MB pages)\n");
+
+    for (uint64_t phys = 0; phys < highest_phys; phys += 0x200000) {
+        uint64_t virt = phys + DIRECT_MAP_BASE;
+        
+        uint64_t *pdpt = get_or_create_table(kernel_pml4, pml4_index(virt),  VMM_WRITABLE);
+        if (!pdpt) {
+            serial_write_string("FATAL: Could not allocate PDPT\n");
             while (1) {}
         }
+
+        uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt), VMM_WRITABLE);
+        if (!pd) {
+            serial_write_string("FATAL: Could not allocate PD\n");
+            while (1) {}
+        }
+
+        uint64_t page_index = pd_index(virt); // 21 bits for 2MB pages
+        pd[page_index] = (phys & ~0x1fffffULL) | VMM_PRESENT | VMM_WRITABLE | VMM_HUGE;
     }
        
     
     serial_write_string("Mapping complete\n");
 
-    // step 3: switch CR3 to point to the kernel PML4 (new page tables)
+    // step 3: build the kernel mapping at KERNEL_VIRTUAL_BASE
+    // Map physical 0 to 2 MB (kernel + bitmap + stack live here)
+    // we keep 4KB granularity for the kernel area for future flexibility
+    serial_write_string("Mapping Kernel at 0xFFFFFFFF80000000...\n");
+    for (uint64_t phys = 0; phys < 0x200000; phys +=PAGE_SIZE) {
+        uint64_t virt = KERNEL_VIRTUAL_BASE + phys;
+        if (vmm_map(virt, phys, VMM_WRITABLE) < 0) {
+            serial_write_string("FATAL: vmm_map kernel failed at\n");
+            serial_write_hex(phys);
+            serial_write_string("\n");
+            while (1) {}
+    
+        }
+
+    }
+    serial_write_string("Kernel mapping complete\n");
+
+
+    // step 4: switch CR3 to point to the kernel PML4 (new page tables)
 
     serial_write_string("switching CR3 ...\n");
-    uint64_t new_cr3 = V2P(kernel_pml4);
-    __asm__ volatile("mov %0, %%cr3" : : "r" (new_cr3));
+    uint64_t new_cr3 = KV2P(kernel_pml4);
+    __asm__ volatile("mov %0, %%cr3" : : "r" (new_cr3): "memory");
     serial_write_string("CR3 set to ");
     serial_write_hex(new_cr3);
     serial_write_string("\n");
