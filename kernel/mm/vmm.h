@@ -38,5 +38,12 @@ void vmm_flush_tlb(uint64_t virt);
 uint64_t vmm_get_kernel_pml4(void);
 
 // Get the current process's PML4 (for context switching)
+//uint64_t vmm_get_current_pml4(void);
+
+// Map a contiguous Physical MMIO region to a fresh virtual address
+// In the MMIO_BASE range. Returns the virtual address on success, 0 on failure.
+// Size in bytes, will be rounded up to a multiple of PAGE_SIZE.
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size);
+
 
 #endif

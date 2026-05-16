@@ -223,3 +223,45 @@ void vmm_init(void) {
     serial_write_hex(new_cr3);
     serial_write_string("\n");
 }
+
+// Bump pointer for MMIO Virtual address allocation
+static uint64_t mmio_next_virt = MMIO_BASE;
+
+uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
+    // Round up to nearest 4KB boundary
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    // Page-align the physical address downwards, remember the offset
+    uint64_t phys_algned = phys_addr & ~0xFFFULL; // 4KB pages
+    uint64_t offset = phys_addr - phys_algned;
+
+    // If the offset pushes us into the next page, we need to allocate a new page
+    uint64_t total_size = (size + PAGE_SIZE + offset -1) & ~0xFFFULL; 
+    pages = total_size  / PAGE_SIZE;
+
+    // Reserve the virtual address range
+    uint64_t virt_base = mmio_next_virt;
+    mmio_next_virt += total_size;
+
+    serial_write_string("vmm_map_mmio: phys=");
+    serial_write_hex(phys_algned);
+    serial_write_string(", virt=");
+    serial_write_hex(virt_base);
+    serial_write_string(", pages=");
+    serial_write_hex(pages);
+    serial_write_string(", \n");
+
+    // Map the pages
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t virt = virt_base + (i * PAGE_SIZE);
+        uint64_t phys = phys_algned + (i * PAGE_SIZE);
+        if (vmm_map(virt, phys, VMM_WRITABLE | VMM_NOCACHE) < 0) {
+            serial_write_string("FATAL: vmm_map mmio failed at\n");
+            serial_write_hex(phys);
+            return 0;
+        }
+    }
+
+    // Return the virtual address of the first page
+    return virt_base + offset;
+}

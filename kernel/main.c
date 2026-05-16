@@ -75,6 +75,16 @@ void kernel_main(void) {
 
     kprintf("\nVMM PML4 at phys: %p\n", (void *)vmm_get_kernel_pml4());
 
+    // Test MMIO mapping with the framebuffer
+    uint64_t fb_virt = vmm_map_mmio(0xfd000000, 0x300000);
+    kprintf("Framebuffer mapped at virt: %p\n", (void *)fb_virt);
+
+    // Write a single pixel to confirm the mapping works
+    // (just stomp on memory — visual confirmation comes in Phase 6)
+    volatile uint32_t *fb = (volatile uint32_t *)fb_virt;
+    fb[30] = 0xFFFFFFFF;  // white pixel at top-left
+    kprintf("Wrote to framebuffer, didn't crash\n");
+
     for(;;);
 }
 

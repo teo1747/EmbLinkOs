@@ -23,7 +23,9 @@
 ### PMM
 - [ ] Stack region hardcoded at 0x200000
   - Should be allocated dynamically and tracked properly
-- [ ] No support for memory >128MB testing yet (need to verify on larger RAM)
+- [ ] No support for memory hot-plugging (e.g., PCI devices)
+- [ ] No support for memory overcommit (e.g., swap)
+- [ ] No support for memory encryption
 - [ ] Linear scan for free page is O(n) - slow with lots of allocations
   - Future: free list or buddy allocator
 
@@ -37,6 +39,18 @@
 
 - [ ] After full direct map: also implement vmalloc-style dynamic mapping
 - [ ] Note: storage (HDD/SSD) is NOT a VMM concern - handled by drivers
+
+### vmm_map_mmio
+- [ ] MMIO pages mapped as cached memory — slow for framebuffer
+  - Need to set cache-disable bit (VMM_NOCACHE) for general MMIO
+  - For framebuffer specifically, want write-combining (WC) via PAT
+  - See Intel SDM Vol 3, section 11.12 (Memory Type Range Registers + PAT)
+- [ ] No deallocation — bump allocator only
+  - Eventually need vmm_unmap_mmio that frees the virtual range
+  - Would require tracking allocated ranges (list or tree)
+- [ ] No bounds check on mmio_next_virt
+  - Could run off the end of MMIO region without warning
+  - Add MMIO_END constant and check before advancing pointer
 
 ## Architecture
 
