@@ -4,6 +4,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
+#include "drivers/framebuffer.h"
 
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
@@ -75,16 +76,33 @@ void kernel_main(void) {
 
     kprintf("\nVMM PML4 at phys: %p\n", (void *)vmm_get_kernel_pml4());
 
-    // Test MMIO mapping with the framebuffer
-    uint64_t fb_virt = vmm_map_mmio(0xfd000000, 0x300000);
-    kprintf("Framebuffer mapped at virt: %p\n", (void *)fb_virt);
+    fb_init();
 
-    // Write a single pixel to confirm the mapping works
-    // (just stomp on memory — visual confirmation comes in Phase 6)
-    volatile uint32_t *fb = (volatile uint32_t *)fb_virt;
-    fb[30] = 0xFFFFFFFF;  // white pixel at top-left
-    kprintf("Wrote to framebuffer, didn't crash\n");
+     // Visual test: draw three colored rectangles
+    fb_clear(0, 0, 32);  // dark blue background
 
+    // Red rectangle top-left
+    for (uint32_t y = 50; y < 150; y++) {
+        for (uint32_t x = 50; x < 200; x++) {
+            fb_put_pixel(x, y, 255, 0, 0);
+        }
+    }
+
+    // Green rectangle middle
+    for (uint32_t y = 50; y < 150; y++) {
+        for (uint32_t x = 250; x < 400; x++) {
+            fb_put_pixel(x, y, 0, 255, 0);
+        }
+    }
+
+    // Blue rectangle right
+    for (uint32_t y = 50; y < 150; y++) {
+        for (uint32_t x = 450; x < 600; x++) {
+            fb_put_pixel(x, y, 0, 0, 255);
+        }
+    }
+
+    
     for(;;);
 }
 

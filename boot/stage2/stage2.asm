@@ -280,7 +280,7 @@ vbe_init:
    
     ; Format - read from VBE mode info buffer
     xor eax, eax
-    mov al, [esi + 0x1C] ; read field position 0x1C
+    mov al, [esi + 0x20] ; read field position 0x20
     cmp al, 0
     je .rgb
     mov dword [0x6018], 1 ; 32-bit 
@@ -294,7 +294,7 @@ vbe_init:
 
 
 .vbe_failed:
-    ; If we get here, the VBE initialization failed
+   
     mov si, msg_vbe_failed
     call print_string
     jmp $

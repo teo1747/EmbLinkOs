@@ -17,6 +17,7 @@ ISR_SRC     = kernel/cpu/isr.asm
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
              kernel/drivers/serial.c \
+			 kernel/drivers/framebuffer.c \
 			 kernel/mm/pmm.c \
              kernel/cpu/idt.c \
 			 kernel/mm/vmm.c \

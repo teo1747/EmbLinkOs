@@ -56,10 +56,23 @@ Building a complete x86_64 operating system from absolute zero. No GRUB, no shor
 - Separate KV2P/KP2V macros for kernel-range conversion
 - Successfully tested on 128 MB QEMU
 
+### Phase 4.1b — vmm_map_mmio() helper ✅
+- Add ability to dynamically map MMIO regions (framebuffer, PCI BARs)
+at MMIO_BASE virtual range using 4 KB pages.
+
+
 ### Phase 5 — kprintf ✅
 - Full format specifier support: %d %u %x %X %p %s %c %% %lx
 - Width and zero-padding modifiers
 - Uses GCC __builtin va_list
+
+
+### Phase 6.1 — Framebuffer Driver ✅
+- VBE mode 0x118 setup in Stage 2 (1024x768x24bpp, BGR, LFB)
+- VBE info struct passed to kernel via physical 0x6000
+- Framebuffer dynamically mapped via vmm_map_mmio
+- fb_put_pixel handles RGB and BGR formats
+- fb_clear fills screen with solid color
 
 ## Current State
 - Boots cleanly in QEMU (`make run`)
@@ -69,9 +82,7 @@ Building a complete x86_64 operating system from absolute zero. No GRUB, no shor
 - Debug output via COM1 serial
 
 ## Next Steps
-### Phase 4.1b — vmm_map_mmio() helper
-- Add ability to dynamically map MMIO regions (framebuffer, PCI BARs)
-at MMIO_BASE virtual range using 4 KB pages.
+
 
 ## File Structure
 myos/
@@ -135,11 +146,15 @@ make clean      # remove binaries
 **Phase 6 — Framebuffer + Console Abstraction**
 
 Plan:
-1. VBE mode setup in Stage 2 (INT 10h 4F00h, 4F01h, 4F02h)
-2. Pass framebuffer physical address to kernel
 3. Framebuffer driver with embedded 8x16 font
 4. Console abstraction layer (kprintf → serial + framebuffer)
 5. Later: swap embedded font for PSF file
+
+**Phase 6.2 — Bitmap Font Rendering**
+1. Embed a fixed 8x16 PC font (PSF or array)
+2. Render single glyphs at (x, y) with foreground/background colors
+3. Render strings with line wrapping and scrolling
+4. Later: load PSF from disk
 
 Just starting. Need to read https://wiki.osdev.org/VESA_Video_Modes
 
@@ -152,9 +167,9 @@ Just starting. Need to read https://wiki.osdev.org/VESA_Video_Modes
 - User is electronics/embedded background, junior engineer level
 
 ## Known Limitations (See TODO.md For Full List)
-- VMM only maps first 1GB physical (breaks on real hardware >1GB)
 - Stack hardcoded at 0x200000
 - No NX bit support yet
 - Single core only
 - BIOS-only (no UEFI)
 - Hardcoded 90 sectors loaded for kernel
+

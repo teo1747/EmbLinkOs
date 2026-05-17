@@ -102,6 +102,15 @@ Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
    - For each, search mode list for a match
    - Final fallback: stay in text mode with VGA at 0xB8000
 
+### vmm_map_mmio
+- [x] Now uses VMM_NOCACHE (PCD bit) - correct for register MMIO
+- [ ] Add vmm_map_mmio_wc() for write-combining (framebuffer, large buffers)
+  - Requires PAT (Page Attribute Table) setup in IA32_PAT MSR (0x277)
+  - Then PWT bit + PAT bit in page table entry select WC slot
+  - See Intel SDM Vol 3, section 11.12
+- [ ] No deallocation — bump allocator only
+- [ ] No bounds check on mmio_next_virt — could overflow MMIO_BASE region
+
 References:
 - VBE 3.0 spec (Function 15h: Display Data Channel)
 - EDID 1.4 spec (VESA E-EDID)
