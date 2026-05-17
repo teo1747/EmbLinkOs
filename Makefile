@@ -17,11 +17,13 @@ ISR_SRC     = kernel/cpu/isr.asm
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
              kernel/drivers/serial.c \
-			 kernel/drivers/framebuffer.c \
-			 kernel/mm/pmm.c \
+             kernel/drivers/framebuffer.c \
+             kernel/drivers/font_8x16.c \
+             kernel/drivers/console.c \
+             kernel/mm/pmm.c \
              kernel/cpu/idt.c \
-			 kernel/mm/vmm.c \
-			 kernel/kprintf.c
+             kernel/mm/vmm.c \
+             kernel/kprintf.c
 ISR_ASM     = kernel/cpu/isr.asm			 
 ISR_OBJ     = kernel/cpu/isr.o
 

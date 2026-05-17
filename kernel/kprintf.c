@@ -1,5 +1,5 @@
 #include "include/kprintf.h"
-#include "drivers/serial.h"
+#include "drivers/console.h"
 #include <stdint.h>
 
 
@@ -37,13 +37,13 @@ static void print_unsigned(uint64_t value, uint8_t base, uint8_t width, uint8_t 
 
     // Output in reverse order
     while (i > 0) {
-        serial_write_char(buffer[--i]);
+        console_putchar(buffer[--i]);
     }
 }
 
 static void print_signed(int64_t value, uint8_t width, uint8_t pad_zero) {
     if (value < 0) {
-        serial_write_char('-');
+        console_putchar('-');
         value = -value;
         if (width > 0) width--;
     }
@@ -58,7 +58,7 @@ void kprintf(const char *fmt,...)
     va_start(arg, fmt);
     while (*fmt) {
         if (*fmt != '%') {
-        serial_write_char(*fmt++);   // print normal char
+        console_putchar(*fmt++);   // print normal char
         continue;
     }
     
@@ -113,12 +113,12 @@ void kprintf(const char *fmt,...)
             }
             case 'c': {
                 char value = (char)va_arg(arg, int);
-                serial_write_char(value);
+                console_putchar(value);
                 break;
             }
             case 'p': {
                 uint64_t value = (uint64_t)va_arg(arg, void *);
-                serial_write_string("0x");
+                console_write("0x");
                 print_unsigned(value, 16, 16, 1, 0);   // pad with zeros to 16 chars
                 break;
             }
@@ -128,15 +128,15 @@ void kprintf(const char *fmt,...)
                     string = "(null)";
                 }
                 while (*string) {
-                    serial_write_char(*string++);
+                    console_putchar(*string++);
                 }
                 break;
             }
             case '%':
-                serial_write_char('%');
+                console_putchar('%');
                 break;
             default: {
-                serial_write_char('?');
+                console_putchar('?');
                 break;
             }
         }

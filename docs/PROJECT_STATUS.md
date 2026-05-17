@@ -74,6 +74,15 @@ at MMIO_BASE virtual range using 4 KB pages.
 - fb_put_pixel handles RGB and BGR formats
 - fb_clear fills screen with solid color
 
+
+### Phase 6.2 — Bitmap Font Rendering
+1. Embed an 8x16 PC font (binary array, ~4KB)
+2. Render single glyphs at (x, y) with fg/bg colors
+3. Render strings with line wrapping and scrolling
+4. Maintain a cursor (col, row)
+5. Later (Phase 6.3): console abstraction + kprintf routing
+
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000
@@ -101,6 +110,7 @@ myos/
 │   │   ├── isr.asm, isr.c
 │   ├── drivers/
 │   │   └── serial.h, serial.c
+|   |   └── framebuffer.h, framebuffer.c
 │   └── mm/
 │       ├── pmm.h, pmm.c
 │       └── vmm.h, vmm.c
@@ -144,16 +154,57 @@ make clean      # remove binaries
 
 ## Next Phase In Progress
 
+ Phase 6.3 — Console Abstraction Layer
 
-**Phase 6.2 — Bitmap Font Rendering**
-1. Embed an 8x16 PC font (binary array, ~4KB)
-2. Render single glyphs at (x, y) with fg/bg colors
-3. Render strings with line wrapping and scrolling
-4. Maintain a cursor (col, row)
-5. Later (Phase 6.3): console abstraction + kprintf routing
+Goal: unify all kernel text output through a single console interface
+that can route to multiple backends (serial + framebuffer simultaneously).
+
+Plan:
+1. Create kernel/drivers/console.h, console.c
+2. Console state: cursor (col, row), fg/bg colors, dimensions
+   - For 1024x768 with 8x16 font: 128 cols × 48 rows
+3. Core API:
+   - console_init() — compute dimensions from fb_info, clear screen
+   - console_putchar(c) — write one character, advance cursor
+   - console_write(s) — write a null-terminated string
+   - console_set_color(fg_r, fg_g, fg_b, bg_r, bg_g, bg_b)
+   - console_clear() — clear screen, cursor to (0, 0)
+4. Handle special characters:
+   - '\n' — move to next line, col = 0
+   - '\r' — col = 0
+   - '\t' — advance to next 8-column boundary
+   - '\b' — backspace (cursor back, blank cell)
+5. Scrolling:
+   - When cursor would go past last row, scroll framebuffer up by one
+     character row (16 pixels)
+   - memmove framebuffer contents up, clear bottom row
+   - Cursor stays on last row
+6. Backend routing:
+   - Each console_putchar writes to:
+     a) Serial (always — keeps debug logs intact)
+     b) Framebuffer (via fb_draw_char at cursor position)
+7. kprintf migration:
+   - Change kprintf.c to call console_putchar instead of
+     serial_write_char
+   - Result: every kprintf appears on both serial and screen
+
+Stretch goals (move to TODO if time-constrained):
+- Color escape sequences (basic ANSI \x1b[31m for red, etc.)
+- Cursor blink (would need a timer interrupt — defer)
+- Auto-scroll on long output
+
+Files to create:
+- kernel/drivers/console.h
+- kernel/drivers/console.c
+
+Files to modify:
+- kernel/kprintf.c (route to console instead of serial)
+- kernel/main.c (call console_init, remove vga_* functions)
+- Makefile (add console.c)
+
+
 Later: swap embedded font for PSF file
 
-Just starting. Need to read https://wiki.osdev.org/VESA_Video_Modes
 
 ## Teaching Style Preferences
 - Go slow, line by line

@@ -3,6 +3,7 @@
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include <stdint.h>
+#include "font_8x16.h"
 
 
 static fb_info_t fb;
@@ -75,3 +76,45 @@ void fb_clear(uint8_t r, uint8_t g, uint8_t b) {
         }
     }
 }
+
+void fb_draw_char(char c, uint32_t px, uint32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
+    
+    // pointer to the 16 byte glyph data for the character
+    const uint8_t *glyph = &font_8x16[(uint8_t)c * FONT_HEIGHT];
+
+    // loop through each row of the glyph
+    for (uint32_t row = 0; row < FONT_HEIGHT; row++) {
+        uint8_t bits = glyph[row];
+        for (uint32_t col = 0; col < FONT_WIDTH; col++) {
+            // bit 7 is leftmost pixel, bit 0 is rightmost pixel
+            // so we need to iterate through the pixels from left to right
+            uint8_t pixel_on = (bits >> (7 - col)) & 1;
+            if (pixel_on) {
+                fb_put_pixel(px + col, py + row, fg_r, fg_g, fg_b);
+            }else {
+                fb_put_pixel(px + col, py + row, bg_r, bg_g, bg_b);
+            }
+        }   
+        
+    }
+}
+
+void fb_draw_string(char *str, uint32_t px, uint32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
+    
+    uint32_t x = px;
+    while (*str) {
+        fb_draw_char(*str, x, py, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+        x += FONT_WIDTH;
+        str++;
+    }
+} 
+
+const fb_info_t *fb_get_info(void) {
+    return &fb;
+}
+
+uint8_t *fb_get_buffer(void) {
+    return fb_virt;
+}
+
+

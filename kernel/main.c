@@ -5,6 +5,7 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "drivers/framebuffer.h"
+#include "drivers/console.h"
 
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
@@ -50,19 +51,21 @@ static void vga_clear(void) {
 
 void kernel_main(void) {
 
-    serial_init();  // Initialize serial communication
-   
-    vga_clear();  // Clear screen with white on black
-    vga_print("Helios kernel\n", 0x0F);  // Print message in white on black
-    
+   serial_init();
 
-    idt_init();     // Initialize the Interrupt Descriptor Table (IDT)
+    idt_init();
     serial_write_string("IDT loaded\n");
 
     pmm_init();
     vmm_init();
-   // Test:
-    kprintf("\n=== kprintf Test ===\n");
+    fb_init();
+    console_init();
+
+    // Now kprintf goes to both serial AND framebuffer
+    kprintf("=== Helios Kernel ===\n");
+    kprintf("Phase 6.3: Console abstraction\n");
+    kprintf("\n");
+
     kprintf("Signed:    %d\n", -42);
     kprintf("Unsigned:  %u\n", 100);
     kprintf("Hex:       %x\n", 0xCAFE);
@@ -73,37 +76,9 @@ void kernel_main(void) {
     kprintf("Long hex:  %lx\n", (uint64_t)0xCAFEBABEDEADBEEF);
     kprintf("Padded:    %08x\n", 0xABCD);
     kprintf("Percent:   %%\n");
-
     kprintf("\nVMM PML4 at phys: %p\n", (void *)vmm_get_kernel_pml4());
 
-    fb_init();
-
-     // Visual test: draw three colored rectangles
-    fb_clear(0, 0, 32);  // dark blue background
-
-    // Red rectangle top-left
-    for (uint32_t y = 50; y < 150; y++) {
-        for (uint32_t x = 50; x < 200; x++) {
-            fb_put_pixel(x, y, 255, 0, 0);
-        }
-    }
-
-    // Green rectangle middle
-    for (uint32_t y = 50; y < 150; y++) {
-        for (uint32_t x = 250; x < 400; x++) {
-            fb_put_pixel(x, y, 0, 255, 0);
-        }
-    }
-
-    // Blue rectangle right
-    for (uint32_t y = 50; y < 150; y++) {
-        for (uint32_t x = 450; x < 600; x++) {
-            fb_put_pixel(x, y, 0, 0, 255);
-        }
-    }
-
-    
-    for(;;);
+    for (;;);
 }
 
 
