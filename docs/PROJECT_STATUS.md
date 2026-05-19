@@ -83,6 +83,13 @@ at MMIO_BASE virtual range using 4 KB pages.
 5. Later (Phase 6.3): console abstraction + kprintf routing
 
 
+### Phase 6.3 — Framebuffer + Console ✅
+- Framebuffer driver: fb_put_pixel, fb_clear, fb_draw_char, fb_draw_string
+- Embedded IBM VGA 8x16 font (public domain), ASCII 0x00-0x7F
+- Console abstraction: cursor, colors, scrolling, dual-backend (serial + FB)
+- kprintf routes through console — appears on both serial and screen
+
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000
@@ -154,53 +161,26 @@ make clean      # remove binaries
 
 ## Next Phase In Progress
 
- Phase 6.3 — Console Abstraction Layer
+**Phase 7 — Hardware Interrupts (PIC + Keyboard)**
 
-Goal: unify all kernel text output through a single console interface
-that can route to multiple backends (serial + framebuffer simultaneously).
+Currently we handle only CPU exceptions (vectors 0-31). Time to enable
+hardware interrupt sources:
 
-Plan:
-1. Create kernel/drivers/console.h, console.c
-2. Console state: cursor (col, row), fg/bg colors, dimensions
-   - For 1024x768 with 8x16 font: 128 cols × 48 rows
-3. Core API:
-   - console_init() — compute dimensions from fb_info, clear screen
-   - console_putchar(c) — write one character, advance cursor
-   - console_write(s) — write a null-terminated string
-   - console_set_color(fg_r, fg_g, fg_b, bg_r, bg_g, bg_b)
-   - console_clear() — clear screen, cursor to (0, 0)
-4. Handle special characters:
-   - '\n' — move to next line, col = 0
-   - '\r' — col = 0
-   - '\t' — advance to next 8-column boundary
-   - '\b' — backspace (cursor back, blank cell)
-5. Scrolling:
-   - When cursor would go past last row, scroll framebuffer up by one
-     character row (16 pixels)
-   - memmove framebuffer contents up, clear bottom row
-   - Cursor stays on last row
-6. Backend routing:
-   - Each console_putchar writes to:
-     a) Serial (always — keeps debug logs intact)
-     b) Framebuffer (via fb_draw_char at cursor position)
-7. kprintf migration:
-   - Change kprintf.c to call console_putchar instead of
-     serial_write_char
-   - Result: every kprintf appears on both serial and screen
+1. Configure or disable the legacy 8259 PIC
+   - Remap PIC vectors to 0x20-0x2F (avoid collision with CPU exceptions)
+   - Mask all IRQs initially, unmask as drivers come online
+2. Enable interrupts globally (sti)
+3. PS/2 keyboard driver
+   - IRQ 1 handler
+   - Scan code translation
+   - Keyboard buffer
+4. PIT (Programmable Interval Timer)
+   - IRQ 0 at 100 Hz for system tick
+   - Foundation for preemptive scheduling later
+5. Later (Phase 7.5): switch from PIC to APIC + IOAPIC for SMP-ready
 
-Stretch goals (move to TODO if time-constrained):
-- Color escape sequences (basic ANSI \x1b[31m for red, etc.)
-- Cursor blink (would need a timer interrupt — defer)
-- Auto-scroll on long output
 
-Files to create:
-- kernel/drivers/console.h
-- kernel/drivers/console.c
 
-Files to modify:
-- kernel/kprintf.c (route to console instead of serial)
-- kernel/main.c (call console_init, remove vga_* functions)
-- Makefile (add console.c)
 
 
 Later: swap embedded font for PSF file

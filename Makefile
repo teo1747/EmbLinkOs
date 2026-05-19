@@ -16,10 +16,14 @@ STAGE2_SRC  = boot/stage2/stage2.asm
 ISR_SRC     = kernel/cpu/isr.asm
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
+			 kernel/cpu/pic.c \
+			 kernel/cpu/irq.c \
+			 kernel/cpu/gdt.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
              kernel/drivers/font_8x16.c \
              kernel/drivers/console.c \
+             kernel/drivers/timer.c \
              kernel/mm/pmm.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
@@ -59,9 +63,10 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	truncate -s 1M $(IMG)
 
 # Run in QEMU
+#run: $(IMG)
+#	qemu-system-x86_64 -drive format=raw,file=$(IMG) -serial stdio -no-reboot -no-shutdown
 run: $(IMG)
-	qemu-system-x86_64 -drive format=raw,file=$(IMG) -serial stdio -no-reboot -no-shutdown
-	
+	qemu-system-x86_64 -drive format=raw,file=$(IMG) -serial stdio -d int -D qemu.log
 
 # Debug mode
 debug: $(IMG)

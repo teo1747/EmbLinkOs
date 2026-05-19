@@ -6,7 +6,10 @@
 #include "include/kprintf.h"
 #include "drivers/framebuffer.h"
 #include "drivers/console.h"
-
+#include "cpu/pic.h"
+#include "cpu/irq.h"
+#include "drivers/timer.h"
+#include "cpu/gdt.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -51,34 +54,46 @@ static void vga_clear(void) {
 
 void kernel_main(void) {
 
-   serial_init();
-
+    serial_init();
+    gdt_init();
     idt_init();
     serial_write_string("IDT loaded\n");
 
+    pic_init();
+    irq_install();
     pmm_init();
     vmm_init();
     fb_init();
     console_init();
-
+    timer_init();
+    
     // Now kprintf goes to both serial AND framebuffer
     kprintf("=== Helios Kernel ===\n");
     kprintf("Phase 6.3: Console abstraction\n");
     kprintf("\n");
 
-    kprintf("Signed:    %d\n", -42);
-    kprintf("Unsigned:  %u\n", 100);
-    kprintf("Hex:       %x\n", 0xCAFE);
-    kprintf("HEX:       %X\n", 0xDEADBEEF);
-    kprintf("Pointer:   %p\n", &kernel_main);
-    kprintf("String:    %s\n", "hello world");
-    kprintf("Char:      %c\n", 'A');
-    kprintf("Long hex:  %lx\n", (uint64_t)0xCAFEBABEDEADBEEF);
-    kprintf("Padded:    %08x\n", 0xABCD);
-    kprintf("Percent:   %%\n");
-    kprintf("\nVMM PML4 at phys: %p\n", (void *)vmm_get_kernel_pml4());
+    //kprintf("Signed:    %d\n", -42);
+    //kprintf("Unsigned:  %u\n", 100);
+    //kprintf("Hex:       %x\n", 0xCAFE);
+    //kprintf("HEX:       %X\n", 0xDEADBEEF);
+    //kprintf("Pointer:   %p\n", &kernel_main);
+    //kprintf("String:    %s\n", "hello world");
+    //kprintf("Char:      %c\n", 'A');
+    //kprintf("Long hex:  %lx\n", (uint64_t)0xCAFEBABEDEADBEEF);
+    //kprintf("Padded:    %08x\n", 0xABCD);
+    //kprintf("Percent:   %%\n");
+    //kprintf("\nVMM PML4 at phys: %p\n", (void *)vmm_get_kernel_pml4());
 
-    for (;;);
+    kprintf("Enabling Interrupts...\n");
+    __asm__ volatile ("sti"); // Enable interrupts - now we should start receiving timer IRQs
+    kprintf("Timer interrupts enabled.\n");
+
+    // Poll the tick count from main loop instead of from handler
+    uint64_t last_print = 0;
+    for(;;) {
+        
+        __asm__ volatile ("hlt");
+    }
+
+
 }
-
-

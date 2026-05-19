@@ -2,6 +2,7 @@
 
 
 extern isr_handler
+extern irq_handler
 
 
 %macro ISR_NOERR 1 ; macro for ISRs without error code
@@ -19,6 +20,15 @@ isr%1:
     ; error code is already pushed by CPU, so we only need to push the ISR number
     push qword %1 ; push ISR number / interrupt number / vector number
     jmp isr_commom
+%endmacro
+
+
+%macro IRQ_STUB 2
+global irq%1
+irq%1:
+    push qword 0 ; push dummy error code (not used for IRQs, but we want to keep the stack layout consistent)
+    push qword %2 ; push IRQ number ( VECTOR NUMBER)
+    jmp irq_commom
 %endmacro
 
 
@@ -54,6 +64,31 @@ ISR_NOERR 28
 ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
+
+; === IRQ stubs (vectors 32-47 = 0x20-0x2F ) ===
+; same pattern as ISR_NOERR - push dummy error code (0), push vector
+; jump to common handler
+
+
+IRQ_STUB 0, 32
+IRQ_STUB 1, 33
+IRQ_STUB 2, 34
+IRQ_STUB 3, 35
+IRQ_STUB 4, 36
+IRQ_STUB 5, 37
+IRQ_STUB 6, 38
+IRQ_STUB 7, 39
+IRQ_STUB 8, 40
+IRQ_STUB 9, 41
+IRQ_STUB 10, 42
+IRQ_STUB 11, 43     
+IRQ_STUB 12, 44
+IRQ_STUB 13, 45
+IRQ_STUB 14, 46
+IRQ_STUB 15, 47
+
+
+
 
 isr_commom:
     ; save registers
@@ -96,5 +131,50 @@ isr_commom:
 
     ;skip the error code and ISR number on the stack
     add rsp, 16 ; 8 bytes for error code + 8 bytes for ISR number
+
+    iretq ; return from interrupt
+
+
+irq_commom:
+    ; save registers
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; pass pinter to register frame to c handler
+    mov rdi, rsp ; pass pointer to stack as first argument (in RDI)
+    call irq_handler
+
+    ; restore registers and return from interrupt
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    ;skip the error code and vector number on the stack
+    add rsp, 16 ; 8 bytes for error code + 8 bytes for vector number
 
     iretq ; return from interrupt
