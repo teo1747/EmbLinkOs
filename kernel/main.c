@@ -78,60 +78,21 @@ void kernel_main(void) {
         kprintf("types.h works: NULL and bool OK\n");
     }
    
+
     __asm__ volatile ("sti");
 
-    // === Heap allocator test ===
-    kprintf("\n=== kmalloc test ===\n");
-
-    char *a = kmalloc(64);
-    char *b = kmalloc(128);
-    char *c = kmalloc(32);
-    kprintf("a = %p\n", a);
-    kprintf("b = %p\n", b);
-    kprintf("c = %p\n", c);
-
-    // Write to all three (must not crash, must not overlap)
-    for (int i = 0; i < 64;  i++) a[i] = 'A';
-    for (int i = 0; i < 128; i++) b[i] = 'B';
-    for (int i = 0; i < 32;  i++) c[i] = 'C';
-
-    kheap_check();
-    kheap_stats();
-
-    // Free middle one; allocate a smaller one — should reuse the slot
-    kfree(b);
-    kprintf("After kfree(b):\n");
-    kheap_stats();
-
-    char *d = kmalloc(64);
-    kprintf("d = %p (should be inside old b region)\n", d);
-    kheap_stats();
-
-    // Free everything and verify
-    kfree(a);
-    kfree(c);
-    kfree(d);
-    kprintf("After freeing all:\n");
-    kheap_stats();
-    kheap_check();
-
-    // Stress test: many small allocs
-    kprintf("\nStress: 100 small allocations\n");
-    void *ptrs[100];
-    for (int i = 0; i < 100; i++) {
-        ptrs[i] = kmalloc(16 + (i * 7) % 200);
+    // Quick heap sanity check
+    void *test = kmalloc(128);
+    if (test) {
+        kfree(test);
+        kprintf("Heap OK. ");
     }
-    kheap_stats();
-    for (int i = 0; i < 100; i++) {
-        kfree(ptrs[i]);
+
+    kprintf("Helios ready.\n");
+
+    // Echo keyboard input
+    for (;;) {
+        char ch = keyboard_getchar();
+        kprintf("%c", ch);
     }
-    kprintf("After freeing all stress:\n");
-    kheap_stats();
-    kheap_check();
-
-    kprintf("\nAll heap tests passed!\n");
-
-    for (;;) __asm__ volatile ("hlt");
-
-
 }

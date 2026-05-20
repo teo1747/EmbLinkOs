@@ -19,6 +19,7 @@ KERNEL_SRC = kernel/main.c \
 			 kernel/cpu/pic.c \
 			 kernel/cpu/irq.c \
 			 kernel/cpu/gdt.c \
+			 kernel/cpu/spinlock.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
              kernel/drivers/font_8x16.c \

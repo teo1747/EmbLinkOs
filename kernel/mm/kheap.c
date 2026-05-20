@@ -1,4 +1,5 @@
 #include "kheap.h"
+#include "../cpu/spinlock.h"
 #include "pmm.h"
 #include "vmm.h"
 #include "../include/kprintf.h"
@@ -39,13 +40,14 @@ typedef struct block {
 #define MIN_BLOCK_SIZE (sizeof(block_t) + KHEAP_ALIGNMENT + sizeof(uint64_t))
 
 
+static spinlock_t heap_lock = SPINLOCK_INIT; // Spinlock to protect heap data structures in case of concurrent access from multiple cores or interrupts
+
 // Heap state
 static block_t *heap_head = 0; // pointer to the first block in the heap
 static uint64_t  heap_end = 0; // next virtual address beyond the heap
 static uint64_t total_size = 0; // total size of the heap in bytes (including all blocks and canaries)
 static uint64_t used_size = 0;  // total used bytes (excluding free blocks and canaries)
 static uint64_t block_count = 0; // total number of blocks (free + used)
-
 
 // Round up size to next multiple of KHEAP_ALIGNMENT(align must be power of 2)
 static inline uint64_t align_up(uint64_t size, uint64_t align) {
@@ -127,7 +129,7 @@ void kheap_init(void) {
 }
 
 
-void *kmalloc(uint64_t size) {
+static void *kmalloc_locked(uint64_t size) {
     if (size == 0) {
         return 0; // Don't allocate zero bytes
     }
@@ -199,11 +201,11 @@ void *kmalloc(uint64_t size) {
     block_count++;  
 
     // Recursively call kmalloc to allocate from the new block (this will handle splitting if the new block is larger than needed)
-    return kmalloc(size);
+    return kmalloc_locked(size);
 }
 
 
-void kfree(void *ptr) {
+static void kfree_locked(void *ptr) {
     if (!ptr) {
         return; // No operation on NULL pointer
     }
@@ -254,6 +256,21 @@ void kfree(void *ptr) {
         block_count--;
     }
 }
+
+void *kmalloc(uint64_t size) {
+    spin_lock(&heap_lock);
+    void *ptr = kmalloc_locked(size);
+    spin_unlock(&heap_lock);
+    return ptr;
+}
+
+
+void kfree(void *ptr) {
+    spin_lock(&heap_lock);
+    kfree_locked(ptr);
+    spin_unlock(&heap_lock);
+}
+
 
 
 void *kcalloc(uint64_t count, uint64_t size) {
