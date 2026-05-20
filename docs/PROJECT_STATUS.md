@@ -112,6 +112,15 @@ at MMIO_BASE virtual range using 4 KB pages.
   * keyboard_getchar blocks via hlt
 
 
+### Phase 8a — Kernel Heap Allocator ✅
+- Linked-list first-fit allocator (kmalloc/kfree/kcalloc/krealloc)
+- 16-byte aligned, block splitting + bidirectional coalescing
+- Auto-grows from PMM, heap at 0xFFFFFF8000000000
+- Heap canaries (head + tail) for corruption/double-free detection
+- kheap_check + kheap_stats debug tools
+- Verified with 100-alloc stress test, full coalesce on free
+
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000

@@ -163,6 +163,18 @@ Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
   * Disable mouse port, set scan code set, enable IRQs
 - [ ] Migration to USB HID when we have USB stack
 
+## Phase 8 — Heap (deferred)
+- [ ] No locking in kmalloc/kfree — corruption if called from IRQ while
+  main context is mid-allocation. Need spinlock with cli/sti save-restore.
+- [ ] No slab allocator (Phase 8b) — add fixed-size pools (16/32/64/...)
+  on top of linked-list for O(1) common-case alloc
+- [ ] krealloc could expand in-place if next block is free (currently always
+  copies)
+- [ ] No guard pages between allocations (security hardening)
+- [ ] No allocation randomization (security hardening)
+- [ ] No quarantine/delayed-free for use-after-free detection
+- [ ] First-fit is O(n) — consider segregated free lists or best-fit
+
 References:
 - VBE 3.0 spec (Function 15h: Display Data Channel)
 - EDID 1.4 spec (VESA E-EDID)
