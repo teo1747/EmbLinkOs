@@ -20,6 +20,7 @@ KERNEL_SRC = kernel/main.c \
 			 kernel/cpu/irq.c \
 			 kernel/cpu/gdt.c \
 			 kernel/cpu/spinlock.c \
+			 kernel/cpu/lapic.c \
 			 kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
@@ -27,6 +28,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/console.c \
              kernel/drivers/timer.c \
              kernel/drivers/keyboard.c \
+			 kernel/drivers/pit.c \
              kernel/mm/pmm.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \

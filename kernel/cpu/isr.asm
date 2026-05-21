@@ -3,6 +3,14 @@
 
 extern isr_handler
 extern irq_handler
+extern lapic_timer_handler
+global lapic_timer_stub
+
+
+lapic_timer_stub:
+    push qword 0 ; push dummy error code (not used for LAPIC timer, but we want to keep the stack layout consistent)
+    push qword 48 ; push vector number for LAPIC timer (we can choose any unused vector, using 255 here)
+    jmp irq_common_lapic
 
 
 %macro ISR_NOERR 1 ; macro for ISRs without error code
@@ -178,3 +186,47 @@ irq_commom:
     add rsp, 16 ; 8 bytes for error code + 8 bytes for vector number
 
     iretq ; return from interrupt
+
+irq_common_lapic:
+    ; save registers
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; pass pinter to register frame to c handler
+    mov rdi, rsp ; pass pointer to stack as first argument (in RDI)
+    call lapic_timer_handler
+
+    ; restore registers and return from interrupt
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+     ;skip the error code and vector number on the stack (even if LAPIC timer doesn't use error code, we pushed a dummy one for consistency)
+     add rsp, 16 ; 8 bytes for error code + 8 bytes for vector number
+
+     iretq ; return from interrupt

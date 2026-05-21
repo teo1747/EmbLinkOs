@@ -14,6 +14,7 @@
 #include "drivers/keyboard.h"
 #include "mm/kheap.h"
 #include "acpi/acpi.h"
+#include "cpu/lapic.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -68,33 +69,34 @@ void kernel_main(void) {
     pmm_init();
     vmm_init();
     acpi_init();
+    lapic_init();
     kheap_init();
     fb_init();
     console_init();
-    timer_init();
-    keyboard_init();
-
-    void *p = NULL;
-    bool ready = true;
-    if (p == NULL && ready) {
-        kprintf("types.h works: NULL and bool OK\n");
-    }
+    //timer_init();
    
+
+     // DON'T call timer_init() — replaced by LAPIC timer
+    lapic_timer_init(48);
+
+    keyboard_init();   // keyboard still on PIC IRQ 1
 
     __asm__ volatile ("sti");
 
-    // Quick heap sanity check
-    void *test = kmalloc(128);
-    if (test) {
-        kfree(test);
-        kprintf("Heap OK. ");
-    }
-
-    kprintf("Helios ready.\n");
-
-    // Echo keyboard input
+    // Verify LAPIC timer is ticking
+    kprintf("Waiting for LAPIC timer ticks...\n");
+    extern uint64_t lapic_timer_get_ticks(void);
+    uint64_t last = 0;
     for (;;) {
-        char ch = keyboard_getchar();
-        kprintf("%c", ch);
+        uint64_t now = lapic_timer_get_ticks();
+        if (now >= last + 100) {   // every ~1 sec at 100 Hz
+            kprintf("LAPIC tick %u\n", (unsigned int)now);
+            last = now;
+        }
+        // also echo keyboard
+        if (keyboard_has_char()) {
+            kprintf("%c", keyboard_getchar());
+        }
+        __asm__ volatile ("hlt");
     }
 }
