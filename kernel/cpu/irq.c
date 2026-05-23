@@ -1,4 +1,5 @@
 #include "irq.h"
+#include "lapic.h"
 #include "pic.h"
 #include "idt.h"
 #include "../drivers/serial.h"
@@ -82,7 +83,7 @@ void irq_handler(struct registers *regs) {
         serial_write_string("]\n");
     }
 
-    pic_send_eoi(irq); // Send End of Interrupt to PIC
+    lapic_send_eoi(); // Send End of Interrupt to IO-APIC
 }
 
 

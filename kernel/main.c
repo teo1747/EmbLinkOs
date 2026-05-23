@@ -1,4 +1,5 @@
 # include <stdint.h>
+#include "cpu/ioapic.h"
 #include "include/types.h"
 #include "drivers/serial.h"
 #include "../kernel/cpu/idt.h"
@@ -15,6 +16,7 @@
 #include "mm/kheap.h"
 #include "acpi/acpi.h"
 #include "cpu/lapic.h"
+#include "include/io.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -70,6 +72,7 @@ void kernel_main(void) {
     vmm_init();
     acpi_init();
     lapic_init();
+    ioapic_init();
     kheap_init();
     fb_init();
     console_init();
@@ -80,6 +83,16 @@ void kernel_main(void) {
     lapic_timer_init(48);
 
     keyboard_init();   // keyboard still on PIC IRQ 1
+
+    // fully mask the PIC 8259A interrupt controllers
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+
+    
+
+    // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
+    ioapic_route(1, 33, 0, false);
+
 
     __asm__ volatile ("sti");
 

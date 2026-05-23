@@ -21,6 +21,7 @@ KERNEL_SRC = kernel/main.c \
 			 kernel/cpu/gdt.c \
 			 kernel/cpu/spinlock.c \
 			 kernel/cpu/lapic.c \
+			 kernel/cpu/ioapic.c \
 			 kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
