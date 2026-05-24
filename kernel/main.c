@@ -1,5 +1,6 @@
 # include <stdint.h>
 #include "cpu/ioapic.h"
+#include "drivers/ata.h"
 #include "include/types.h"
 #include "drivers/serial.h"
 #include "../kernel/cpu/idt.h"
@@ -18,6 +19,7 @@
 #include "cpu/lapic.h"
 #include "include/io.h"
 #include "drivers/pci.h"
+#include "drivers/ata.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -74,6 +76,24 @@ void kernel_main(void) {
     acpi_init();
     lapic_init();
     pci_init();
+    ata_init();
+     // Read sector 0 (the boot sector) and verify
+    uint8_t sector[512];
+    if (ata_read_sectors(0, 1, sector) == 0) {
+        kprintf("Sector 0 read OK\n");
+        // Boot signature is at offset 510-511: 0x55 0xAA
+        kprintf("Boot signature: %x %x (expect 55 AA)\n",
+                (unsigned int)sector[510], (unsigned int)sector[511]);
+
+        // Dump first 16 bytes
+        kprintf("First 16 bytes: ");
+        for (int i = 0; i < 16; i++) {
+            kprintf("%x ", (unsigned int)sector[i]);
+        }
+        kprintf("\n");
+    } else {
+        kprintf("Sector 0 read FAILED\n");
+    }
     ioapic_init();
     kheap_init();
     fb_init();
