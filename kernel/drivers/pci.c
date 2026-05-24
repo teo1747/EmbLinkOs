@@ -6,21 +6,21 @@
 
 
 // Built the CONFIG_ADDRESS and select the register to read/write
-static uint32_t pci_config_address(uint8_t bus, uint8_t device, uint8_t fonction, uint8_t offset) {
+static uint32_t pci_config_address(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
     return(uint32_t)(
         (1U << 31)                     // Enable bit
         | ((uint32_t)bus << 16)        // Bus number
         | ((uint32_t)device << 11)      // Device number
-        | ((uint32_t)fonction << 8)     // Function number
+        | ((uint32_t)function << 8)     // Function number
         | ((uint32_t)(offset & 0xfc))   // dword-aligned offset
     );
 }
 
 
 // Read a 32-bit value from the PCI configuration space
-uint32_t pci_read32(uint8_t bus, uint8_t device, uint8_t fonction, uint8_t offset) {
-    outl_func:;  // Placeholder label removed below
-    uint32_t address = pci_config_address(bus, device, fonction, offset);
+uint32_t pci_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    
+    uint32_t address = pci_config_address(bus, device, function, offset);
     // We need outl/inl (32 bits port I/O). 
 
     outl(PCI_CONFIG_ADDRESS, address);
@@ -28,8 +28,8 @@ uint32_t pci_read32(uint8_t bus, uint8_t device, uint8_t fonction, uint8_t offse
 }
 
 
-uint16_t pci_read16(uint8_t bus, uint8_t device, uint8_t fonction, uint8_t offset) {
-    uint32_t value = pci_read32(bus, device, fonction, offset & 0xFC);
+uint16_t pci_read16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t value = pci_read32(bus, device, function, offset & 0xFC);
     // Extract the 16-bit value from the 32-bit value low bits
     return (uint16_t)((value >> ((offset & 2) * 8)) & 0xFFFF);
 
@@ -107,11 +107,31 @@ static bool pci_probe_device(uint8_t bus, uint8_t device, uint8_t function) {
                 (unsigned int)vendor_id, (unsigned int)dev->device_id,
                 (unsigned int)dev->class_code, (unsigned int)dev->subclass, (unsigned int)dev->prog_if,
                 pci_device_description(dev->class_code));
+    // parse and print the BARs
+    for (uint8_t i = 0; i < 6; i++) {
+        struct pci_bar bar = pci_read_bar(bus, device, function, i);
+        if (!bar.valid) {
+            continue;
+        }
+        kprintf("BAR%u: %s ", (unsigned int)i,
+                 (bar.is_mmio ? "MMIO" : "I/O"));
+        kprintf("base=%p size=%u" ,
+                 (void *)bar.address, (unsigned int)bar.size);
+        
+        if (bar.is_mmio) {
+            kprintf("%s%s",
+            bar.is_64bit ? "64-bit " : "32-bit ",
+            bar.prefetchable ? "prefetchable" : "" );
+        }
+        kprintf("\n");
 
-    
+        // 64-bit BARs are not supported yet
+        if (bar.is_64bit) {
+            i++;  // skip the next BAR
+        }
+    }
     return true;
 }
-
 
 void pci_init(void) {
     // Probe all PCI buses
@@ -147,4 +167,78 @@ const struct pci_device *pci_get_device(uint32_t index) {
         return NULL;
     }
     return &devices[index];
+}
+
+
+struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8_t bar_index){
+    struct pci_bar result;
+    result.address = 0;
+    result.size = 0;
+    result.is_mmio = false;
+    result.is_64bit = false;
+    result.prefetchable = false;
+    result.valid = false;
+
+    uint8_t offset = PCI_BAR0 + (bar_index * 4);
+    uint32_t bar = pci_read32(bus, device, function, offset);
+
+    if (bar == 0) {
+        // BAR is not implemented / Unused
+        return result;  
+    }
+
+    if (bar & 0x1) {
+        // I/O BAR
+        result.is_mmio = false;
+        result.address = bar & 0xFFFFFFFC;
+
+        // Size it: write all 1s, read back, restore
+        pci_write32(bus, device, function, offset, 0xFFFFFFFF);
+        uint32_t readback = pci_read32(bus, device, function, offset);
+        pci_write32(bus, device, function, offset, bar);  // restore original value
+
+        // Mask off the type bits, invert, add 1
+        uint32_t size = (~(readback & 0xFFFFFFFC)) + 1;
+        result.size = size & 0xFFFFFFFF;
+        result.valid = (result.size != 0);
+
+    } else {
+        // Memory BAR
+        result.is_mmio = true;
+        result.prefetchable = (bar & 0x8) != 0;
+        uint8_t type = (bar >> 1) & 0x3;
+
+        if (type == 0x2) {
+            // 64-bit BAR: combine this and the next BAR
+            result.is_64bit = true;
+            uint32_t ber_high = pci_read32(bus, device, function, offset + 4);
+            result.address = (((uint64_t)ber_high << 32) | (bar & 0xFFFFFFF0));
+
+            // Size: write all 1s to both halves, read back, restore
+            pci_write32(bus, device, function, offset, 0xFFFFFFFF);
+            pci_write32(bus, device, function, offset + 4, 0xFFFFFFFF);
+            uint32_t low = pci_read32(bus, device, function, offset);
+            uint32_t high = pci_read32(bus, device, function, offset + 4);
+            pci_write32(bus, device, function, offset, bar);  // restore original value
+            pci_write32(bus, device, function, offset + 4, ber_high);  // restore original value
+
+            // Mask off the type bits, invert, add 1
+            uint64_t mask = (((uint64_t)high << 32) | (low & 0xFFFFFFF0));
+            result.size = (~mask) + 1;
+            result.valid = (result.size != 0);  
+        } else {
+            // 32-bit BAR
+            result.address = bar & 0xFFFFFFF0;
+
+            // Size: write all 1s, read back, restore
+            pci_write32(bus, device, function, offset, 0xFFFFFFFF);
+            uint32_t readback = pci_read32(bus, device, function, offset);
+            pci_write32(bus, device, function, offset, bar);  // restore original value
+
+            uint32_t size = (~(readback & 0xFFFFFFF0)) + 1;
+            result.size = size & 0xFFFFFFFF;
+            result.valid = (result.size != 0);
+        }
+    }
+    return result;
 }

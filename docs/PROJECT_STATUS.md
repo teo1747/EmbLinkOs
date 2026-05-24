@@ -136,6 +136,13 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Interrupt path: device -> IO-APIC -> LAPIC -> CPU -> LAPIC EOI
 - All prerequisites for SMP now in place
 
+### Phase 10a — PCI Enumeration ✅
+- Legacy port-based config access (0xCF8/0xCFC)
+- Full brute-force bus/device/function scan
+- Per-device: vendor, device, class, subclass, prog_if, header type
+- Discovered device table for driver use
+- io.h gained outl/inl
+- Found on QEMU: 440FX bridge, PIIX3, IDE, ACPI, Bochs VGA, e1000
 
 ## Current State
 - Boots cleanly in QEMU (`make run`)
@@ -214,13 +221,11 @@ make clean      # remove binaries
 1. SMP bringup — wake the other 3 CPUs (we have their APIC IDs).
    Send INIT-SIPI-SIPI via LAPIC, give each core a stack, bring online.
    Big, exciting, the natural payoff of all the APIC work.
-2. PCI enumeration — scan config space, discover devices. Gateway to
-   real device drivers (disk, network).
+
 3. Phase 8b — slab allocator (deferred performance work).
 
 
 4. Filesystem (FAT12/16 on the disk image) — needed for loading files
-
 
 
 

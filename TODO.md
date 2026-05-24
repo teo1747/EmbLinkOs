@@ -205,6 +205,19 @@ Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
   irq_commom_lapic in isr.asm — refactor to share
 
 
+## Phase 10 — PCI (deferred)
+- [ ] No BAR parsing — need to read Base Address Registers to find each
+  device's MMIO/IO regions (size via write-all-1s-then-read trick)
+- [ ] No ECAM/MCFG (PCIe memory-mapped config) — only legacy CAM
+  Parse MCFG ACPI table, map config space, support 4KB extended config
+- [ ] No recursive bridge scanning — brute-force works but doesn't follow
+  secondary buses behind PCI-to-PCI bridges properly
+- [ ] No capability list parsing (MSI/MSI-X, power management)
+- [ ] No interrupt routing — need to wire device INTx/MSI to IO-APIC/LAPIC
+- [ ] No device-specific driver binding mechanism yet
+- [ ] Vendor/device ID -> human name database (currently only class names)
+
+
 References:
 - VBE 3.0 spec (Function 15h: Display Data Channel)
 - EDID 1.4 spec (VESA E-EDID)

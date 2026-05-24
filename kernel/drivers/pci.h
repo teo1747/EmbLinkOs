@@ -37,6 +37,20 @@
     uint8_t  header_type;
  };
 
+struct pci_bar {
+    uint64_t address;   // base physical address (or I/O port base)
+    uint64_t size;     // size of the BAR (in bytes)
+    bool     is_mmio;   // true if the BAR is memory-mapped false is I/O port-mapped
+    bool     is_64bit;  // true if the BAR is 64-bit
+    bool     prefetchable; // true if the BAR is prefetchable
+    bool     valid;     // true if the BAR is valid (i.e. not zero) false if the BAR is unused(size 0)
+};
+
+
+// Read and size BAR. bar_index is 0-5 for BAR0-BAR5
+// For 64 bit BAR, read the pair (index and index + 1)
+struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8_t bar_index);
+
 
  #define PCI_MAX_DEVICES 64
 
