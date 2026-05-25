@@ -151,6 +151,16 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Confirmed Bochs VGA BAR0 = framebuffer 0xFD000000
 - e1000 NIC and IDE controller register regions located
 
+### Phase 11a — ATA PIO Disk Driver (polled) ✅
+- Multi-drive detection: scans primary + secondary, master + slave (4 candidates)
+- IDENTIFY-based detection, LBA28 addressing (CHS fallback for tiny disks)
+- ata_read_sectors / ata_write_sectors (PIO, 256 words/sector, polled)
+- Per-drive struct: io_base, ctrl_base, master/slave, total_sectors, model
+- io.h gained inw/outw (16-bit port I/O)
+- Verified: boot disk (drive 0) sector 0 sig 0x55AA correct;
+  64 MB data disk (drive 1) write/read test PASS — persistent storage works
+- Makefile: DRIVES variable, separate disk.img data disk (preserved on clean)
+- Fixed: stage2 load-size bug (kernel outgrew 90 sectors -> 512, with guard)
 
 ## Current State
 - Boots cleanly in QEMU (`make run`)
@@ -226,16 +236,18 @@ make clean      # remove binaries
 ## Next Phase In Progress
 
 **Phase 10 — Candidates (pick one):**
-1. SMP bringup — wake the other 3 CPUs (we have their APIC IDs).
-   Send INIT-SIPI-SIPI via LAPIC, give each core a stack, bring online.
-   Big, exciting, the natural payoff of all the APIC work.
+
 
 3. Phase 8b — slab allocator (deferred performance work).
 
 
 4. Filesystem (FAT12/16 on the disk image) — needed for loading files
 
-
+**Phase 11b — Interrupt-driven ATA (in progress)**
+- Route IRQ 14 (primary channel) via IO-APIC to a vector
+- Register handler; replace busy-poll with sleep-until-IRQ
+- Must read status register in handler to ack the ATA interrupt
+- Prereq met: IO-APIC routing proven (keyboard GSI1), polled ATA proven
 
 
 
