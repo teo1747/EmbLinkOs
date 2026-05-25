@@ -162,6 +162,13 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Makefile: DRIVES variable, separate disk.img data disk (preserved on clean)
 - Fixed: stage2 load-size bug (kernel outgrew 90 sectors -> 512, with guard)
 
+### Phase 11b — Interrupt-driven ATA ✅
+- Reads and writes both IRQ-driven (IRQ 14 -> vector 46 via IO-APIC)
+- Read: IRQ before transfer (data ready); Write: poll DRQ to accept,
+  IRQ after transfer (sector committed); CACHE FLUSH IRQ-confirmed
+- Handler acks device via status read, sets flag; wait sleeps on hlt
+- Verified IRQ count matches op count (4 ops = 4 IRQs)
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000
@@ -235,7 +242,7 @@ make clean      # remove binaries
 
 ## Next Phase In Progress
 
-**Phase 10 — Candidates (pick one):**
+
 
 
 3. Phase 8b — slab allocator (deferred performance work).
@@ -243,11 +250,6 @@ make clean      # remove binaries
 
 4. Filesystem (FAT12/16 on the disk image) — needed for loading files
 
-**Phase 11b — Interrupt-driven ATA (in progress)**
-- Route IRQ 14 (primary channel) via IO-APIC to a vector
-- Register handler; replace busy-poll with sleep-until-IRQ
-- Must read status register in handler to ack the ATA interrupt
-- Prereq met: IO-APIC routing proven (keyboard GSI1), polled ATA proven
 
 
 
