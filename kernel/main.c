@@ -76,7 +76,15 @@ void kernel_main(void) {
     acpi_init();
     lapic_init();
     pci_init();
+    ioapic_init();
     ata_init();
+
+
+    // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
+    ioapic_route(1, 33, 0, false);
+
+
+    __asm__ volatile ("sti");
 
     // Read boot sector from drive 0 (boot disk)
     uint8_t sector[512];
@@ -98,9 +106,11 @@ void kernel_main(void) {
                 if (wbuf[i] != rbuf[i]) { match = false; break; }
             }
             kprintf("Data disk write/read test: %s\n", match ? "PASS" : "FAIL");
+            extern volatile uint64_t ata_irq_count;
+            kprintf("ATA IRQ fired %u times\n", (unsigned int)ata_irq_count);
         }
     }
-    ioapic_init();
+    
     kheap_init();
     fb_init();
     console_init();
@@ -120,11 +130,7 @@ void kernel_main(void) {
 
     
 
-    // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
-    ioapic_route(1, 33, 0, false);
 
-
-    __asm__ volatile ("sti");
 
     // Verify LAPIC timer is ticking
     kprintf("Waiting for LAPIC timer ticks...\n");

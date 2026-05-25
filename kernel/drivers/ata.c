@@ -2,12 +2,44 @@
 #include "../include/io.h"
 #include "../include/kprintf.h"
 #include "../drivers/serial.h"
+#include "../cpu/irq.h"
+#include "../cpu/ioapic.h"
 
 #include <stdint.h>
 
+#define ATA_PRIMARY_IRQ  14
+#define ATA_PRIMARY_VECTOR 46   // IDT vector for IRQ14 (32 + 14)
+
+static volatile bool ata_irq_fired = false;
 
 static struct ata_drive drives[ATA_MAX_DRIVES];
 static uint32_t drive_count = 0;
+volatile uint64_t ata_irq_count = 0;
+
+
+static void ata_irq_handler(void) {
+    // Reading the status register acknowledge the interrupt at the drive.
+    // Without this, the controller never sends another interrupt.
+    inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
+    ata_irq_count++;
+    ata_irq_fired = true;
+    // LAPIC EOI (End Of Interrupt) is sent by the common irq_handler() after return.
+}
+
+static int ata_wait_irq(void){
+    // Sleep until the ATA IRQ sets the flag. the 100 hz timer guarantees
+    // We wake periodically to re-check even if we miss the exact moment.
+    int timeout = 0;
+    while (!ata_irq_fired) {
+        __asm__ volatile ("hlt");
+        if (++timeout > 1000000) {
+        kprintf("ATA IRQ timeout\n");
+        return -1; // safety: never hang forever on bad hardware
+        }
+    }
+    ata_irq_fired = false;
+    return 0;
+}
 
 
 // 400ns delY: READ ALTERNATE STATUS 4 TIMESS (~100ns each)
@@ -140,6 +172,10 @@ void ata_init(void) {
     } else {
         kprintf("ATA: %u drive(s) detected.\n", (unsigned int)drive_count);
     }
+    // Install IRQ handler, routing to IRQ14 via IOAPIC
+    irq_register(ATA_PRIMARY_IRQ, ata_irq_handler);
+    ioapic_route(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0, false); // Route to CPU 0, unmasked
+    kprintf("ATA: IRQ14 routed to vector %u\n", (unsigned int)ATA_PRIMARY_VECTOR);
 }
 
 
@@ -176,18 +212,24 @@ int ata_read_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, void *bu
     uint16_t *buffer16 = (uint16_t *)buffer; // Cast buffer to uint16_t pointer
 
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
+
+    ata_irq_fired = false; // Clear the flag for the first sector's IRQ
     ata_setup_lba(d, lba, count); // Setup LBA and count
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_READ_PIO); // Send Read command
 
     // Read each sector
     for (int i = 0; i < count; i++) {
-        if (ata_wait_drq(d->io_base) < 0) return -1; // Wait for DRQ to set;
-        
+        if (ata_wait_irq() < 0){
+            kprintf("ATA: IRQ wait timeout at sctor %u\n", (unsigned int)i);
+            return -1; // Wait for DRQ to set;
+        }
         for (int j = 0; j < 256; j++) {
             buffer16[j] = inw(d->io_base + ATA_REG_DATA); // Read 256 bytes
         }
         buffer16 += 256; // Move buffer pointer forward
-    }
+        // Clear the flag for the next sector's IRQ
+        ata_irq_fired = false;
+    }   
     return 0;
 }
 
@@ -200,17 +242,33 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
 
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
 
+    ata_irq_fired = false;
     ata_setup_lba(d, lba, count);
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO); // Send Write command
 
     // Write each sector
     for (int i = 0; i < count; i++) {
-        if (ata_wait_drq(d->io_base) < 0) return -1; // Wait for DRQ to set
-        
+        // Wait for the drive to be ready to ACCEPT this sector's data
+        // After WRITE command (and after each completed section), the drive sets DRQ when its buffer is ready
+        // We poll DRQ here - the drive doesn't raise an irq to ask for data, only to confirm completion. 
+        if (ata_wait_drq(d->io_base) < 0) {
+            kprintf("ATA: write to DRQ failed at sector %u\n", (unsigned int)i); // Wait for DRQ to set
+            return -1; // Wait for DRQ to set
+        }
+
+        // Write 256 bytes to the drive
+        ata_irq_fired = false;
         for (int j = 0; j < 256; j++) {
             outw(d->io_base + ATA_REG_DATA, buffer16[j]); // Write 256 bytes
         }
         buffer16 += 256; // Move buffer pointer forward
+
+        // Now that the drive write to the platter and raises IRQ 14 WHEN done.
+        // Wait for the completion IRQ
+        if (ata_wait_irq() < 0) {
+            kprintf("ATA: IRQ wait timeout at sector %u\n", (unsigned int)i);
+            return -1; // Wait for DRQ to set
+        }
     }
 
     // Flush the cache after writing
