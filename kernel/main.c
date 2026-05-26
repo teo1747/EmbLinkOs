@@ -106,6 +106,27 @@ void kernel_main(void) {
                 (unsigned int)sector[510], (unsigned int)sector[511]);
     }
 
+    // Test DMA write + read on data disk (drive 1)
+    if (ata_drive_count() > 1) {
+        static uint8_t dma_wbuf[512] __attribute__((aligned(4)));
+        static uint8_t dma_rbuf[512] __attribute__((aligned(4)));
+        for (int i = 0; i < 512; i++) dma_wbuf[i] = (uint8_t)(0xA0 + (i & 0x1F));
+
+        kprintf("Testing DMA write+read...\n");
+        int w = ata_write_dma(1, 200, 1, dma_wbuf);
+        int r = ata_read_dma(1, 200, 1, dma_rbuf);
+
+        if (w == 0 && r == 0) {
+            bool match = true;
+            for (int i = 0; i < 512; i++) {
+                if (dma_wbuf[i] != dma_rbuf[i]) { match = false; break; }
+            }
+            kprintf("DMA write+read test: %s\n", match ? "PASS" : "FAIL");
+        } else {
+            kprintf("DMA write/read failed (w=%d r=%d)\n", w, r);
+        }
+    }
+
     // Test write+read on the data disk (drive 1) if present
     if (ata_drive_count() > 1) {
         uint8_t wbuf[512], rbuf[512];
