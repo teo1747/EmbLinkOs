@@ -242,3 +242,15 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
     }
     return result;
 }
+
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function) {
+    uint32_t dword = pci_read32(bus, device, function, PCI_COMMAND); // PCI command register
+    dword |= (1 << 2 ); // Set bus mastering bit
+    // Also ensure I/O space and memory space are enabled (bits 0 and 1) otherwise the device won't respond to MMIO or I/O accesses even if bus mastering is enabled
+    dword |= (1 << 0);
+    pci_write32(bus, device, function, PCI_COMMAND, dword); // Write back to PCI command register
+
+    uint32_t verify = pci_read32(bus, device, function, PCI_COMMAND);
+    kprintf("IDE PCI command now %x (bus master %s)\n",
+            (unsigned int)(verify & 0xFFFF), (verify & (1 << 2)) ? "ON" : "OFF");
+}

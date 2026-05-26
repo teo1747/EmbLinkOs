@@ -65,4 +65,6 @@ int ata_read_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, void *bu
 // Write `count` sectors starting from `lba` from `buffer`. Return 0 on success, -1 on error.
 int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const void *buffer);
 
+int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer);
+
 #endif  // __ATA_H__

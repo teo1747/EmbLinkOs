@@ -69,4 +69,6 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
  uint32_t pci_devices_count(void);
  const struct pci_device *pci_get_device(uint32_t index);
 
+// Enable bus mastering (command register bit 2) for a device
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function);
 #endif /* __PCI_H__ */
