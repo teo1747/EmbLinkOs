@@ -86,6 +86,19 @@ void kernel_main(void) {
 
     __asm__ volatile ("sti");
 
+    // Test DMA read
+    kprintf("Testing DMA read...\n");
+    static uint8_t dma_buf[512] __attribute__((aligned(4)));
+    if (ata_read_dma(0, 0, 1, dma_buf) == 0) {
+        kprintf("DMA read sector 0: sig %x %x (expect 55 aa)\n",
+                (unsigned int)dma_buf[510], (unsigned int)dma_buf[511]);
+        kprintf("First 4 bytes: %x %x %x %x\n",
+                (unsigned int)dma_buf[0], (unsigned int)dma_buf[1],
+                (unsigned int)dma_buf[2], (unsigned int)dma_buf[3]);
+    } else {
+        kprintf("DMA read FAILED\n");
+    }
+
     // Read boot sector from drive 0 (boot disk)
     uint8_t sector[512];
     if (ata_read_sectors(0, 0, 1, sector) == 0) {

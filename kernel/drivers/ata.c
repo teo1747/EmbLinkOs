@@ -1,14 +1,52 @@
 #include "ata.h"
+#include "pci.h"
+#include "../mm/pmm.h"
 #include "../include/io.h"
 #include "../include/kprintf.h"
 #include "../drivers/serial.h"
 #include "../cpu/irq.h"
 #include "../cpu/ioapic.h"
 
+
 #include <stdint.h>
 
 #define ATA_PRIMARY_IRQ  14
 #define ATA_PRIMARY_VECTOR 46   // IDT vector for IRQ14 (32 + 14)
+
+// Bus Master IDE register offsets (from BAR4 base, Primary channel)
+#define BMIDE_COMMAND      0x00
+#define BMIDE_STATUS       0x02
+#define BMIDE_PRDT         0x04
+
+// BMIDE_COMMAND bits
+#define BMIDE_CMD_START    0x01     // Start/Stop bus master transfer
+#define BMIDE_CMD_READ     0x08     // Direction: 1 = device to memory, 0 = memory to device
+
+// BMIDE_STATUS bits
+#define BMIDE_STATUS_ACTIVE    0x01     // Busy
+#define BMIDE_STATUS_ERROR     0x02     // Error
+#define BMIDE_STATUS_IRQ       0x04     // Interrupt request (set when transfer completes)
+
+// ATA DMA commands
+#define ATA_CMD_IDENTIFY_DMA 0xA1
+#define ATA_CMD_READ_DMA     0xC8   
+#define ATA_CMD_WRITE_DMA    0xCA
+
+// Physical address of the PRDT (Physical Region Descriptor Table) must be 4K-aligned and in the first 4GB of memory (for 32-bit addressing)
+struct prd{
+    uint32_t phys_addr;   // Physical address of the data buffer (must be 4K-aligned)
+    uint16_t byte_count;  // Byte count for this entry (max 64KB, but we will use 4K pages)
+    uint16_t flags;       // Flags: bit 15 = end of table
+} __attribute__((packed));
+
+#define PRD_EOT 0x8000;
+
+// A single PRD, 4-bytes aligned. won't cross 4K boundary, (it's 8 bytes in BSS)
+// Static so it has a fixed physical address we can compute with KV2P.
+static struct prd dma_prdt[1] __attribute__((aligned(4)));
+
+// Bus master I/O base (BAR4 of the IDE controller)
+static uint16_t bmide_base;
 
 static volatile bool ata_irq_fired = false;
 
@@ -167,6 +205,23 @@ void ata_init(void) {
         }
 
     }
+
+    // IDE conntroller is at PCI bus 0, device 1, function 1. Read its BAR4 for bus master registers
+    pci_enable_bus_mastering(0, 1, 1); // Enable bus mastering for the IDE controller
+
+    // Read BAR4 for bus master registers
+    struct pci_bar bar4 = pci_read_bar(0, 1, 1, 4);
+    if (bar4.valid && !bar4.is_mmio) {
+        bmide_base = (uint16_t)bar4.address;
+        kprintf("ATA: bus-master base (BAR4) = %X\n",
+                 (unsigned int)bmide_base);
+
+    } else {
+        kprintf("ATA: invalid BAR4 for bus master registers\n");
+        bmide_base = 0; // fallback to 0, but DMA won't work
+    }
+    kprintf("ATA: Bus Master IDE I/O base at 0x%X\n", (unsigned int)bmide_base);
+
     if (drive_count == 0) {
         kprintf("ATA: no drives detected.\n");   
     } else {
@@ -275,5 +330,79 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH); // Send Cache flush command
     ata_wait_not_busy(d->io_base); // Wait for BSY to clear
 
+    return 0;
+}
+
+int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer) {
+    if (drive_index >= drive_count) return -1; 
+    if (count == 0) return -1;
+    if (bmide_base == 0) return -1; // DMA not available without valid bus master I/O base
+
+    const struct ata_drive *d = &drives[drive_index]; // Get drive pointer
+
+    // Transfer size in bytes. Single PRD must not cross 64KB boundary, so we limit to 64KB (128 sectors) per transfer. For simplicity, we also require the buffer to be physically contiguous and not cross 4K boundary.
+    uint32_t byte_count = (uint32_t)count * ATA_SECTOR_SIZE;
+    if (byte_count > 64 * 1024) {
+        kprintf("ATA: DMA transfer too large (max 128 sectors)\n");
+        return -1;
+    }
+
+    // Physical address of the destination buffer.
+    // NOTE: buffer must be a kernel static/stack address (KV2P applies)
+    // and physically contiguous, not crossing a 64KB boundary.
+    uint64_t buf_phys = KV2P(buffer);
+    if ((buf_phys >> 32) != 0) {
+        kprintf("ATA DMA: buffer above 4GB, unsupported\n");
+        return -1;
+    }
+
+    // 1. Built the PRDT (single entry since we limit to 64KB)
+    dma_prdt[0].phys_addr = (uint32_t)buf_phys;
+    dma_prdt[0].byte_count = (uint16_t)byte_count;  // 0 would mean 64KB; bytes<=64kb ok
+    dma_prdt[0].flags = PRD_EOT; // End of table
+
+    uint64_t prdt_phys = KV2P(dma_prdt); // Physical address of the PRDT
+
+    // 2. Stop any previous DMA, then program the PRDT physical address and start the transfer
+    outb(bmide_base + BMIDE_COMMAND, 0); // Stop any previous DMA
+    outl(bmide_base + BMIDE_PRDT, (uint32_t)prdt_phys); // Program PRDT physical address
+
+    // 3. Set direction = read (controller writes into Ram)
+    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_READ); // Set direction = read
+
+    // 4. Clear interrupt + error status bits by writing 1s 
+    uint8_t status = inb(bmide_base + BMIDE_STATUS);
+    outb(bmide_base + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
+
+    // 5. Program the ATA registers (drive, LBA, count) - same as PIO
+    if (ata_wait_not_busy(d->io_base) < 0) return -1;
+    ata_setup_lba(d, lba, count);
+
+    // 6. Clear IRQ fired flag, issue READ DMA command to the drive (different from PIO command)
+    ata_irq_fired = false;
+    outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_READ_DMA); // Send READ DMA command
+
+    // 7. Start the bus master engine (set start bit, keep read direction)
+    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_READ | BMIDE_CMD_START); // Start the transfer
+
+    // 8. Wait for completion IRQ, check for errors
+    if (ata_wait_irq() < 0) {
+        kprintf("ATA: IRQ wait timeout\n");
+        outb(bmide_base + BMIDE_COMMAND, 0); // Stop the bus master
+        return -1; // Wait for DRQ to set
+    }
+
+    // 9. Stop the bus master engine
+    outb(bmide_base + BMIDE_COMMAND, 0); // Stop the transfer
+
+    // 10. Check for errors
+    uint8_t st = inb(bmide_base + BMIDE_STATUS);
+    outb(bmide_base + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
+    if (st & BMIDE_STATUS_ERROR) {
+        kprintf("ATA DMA read error: status %x\n", (unsigned int)st);
+        return -1;
+    }
+
+    // Data is now in the buffer, placed there by the controller via DMA. We can return success.
     return 0;
 }
