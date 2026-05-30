@@ -177,6 +177,14 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Zero CPU copy — controller writes RAM directly
 - Verified sector 0 read via DMA, boot signature + bytes correct
 
+### Phase 11c — ATA DMA (bus mastering) ✅
+- Read (0xC8) and write (0xCA) both via bus-master DMA
+- Direction bit: set for disk read (device writes RAM),
+  cleared for disk write (device reads RAM)
+- Single-entry PRDT in BSS (KV2P physical), EOT, <=64KB
+- Completion via IRQ 14; cache flush after writes
+- Zero-copy: controller moves all data; verified byte-exact round-trip
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000

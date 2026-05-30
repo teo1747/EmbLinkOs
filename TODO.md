@@ -234,7 +234,6 @@ Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
 
 
 ## Phase 11c — ATA DMA (deferred / next)
-- [ ] DMA WRITE path (0xCA WRITE DMA) — mirror of read, direction bit 0
 - [ ] Multi-PRD scatter-gather for buffers > 64KB or spanning pages
   (current limit: single contiguous region <= 64KB, <= 128 sectors)
 - [ ] LBA48 DMA (READ DMA EXT 0x25) for >128 sectors / disks > 128GB

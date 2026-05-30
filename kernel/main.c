@@ -20,6 +20,7 @@
 #include "include/io.h"
 #include "drivers/pci.h"
 #include "drivers/ata.h"
+#include "drivers/bootanim.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -79,12 +80,17 @@ void kernel_main(void) {
     ioapic_init();
     ata_init();
 
+    kheap_init();
+    fb_init();
+    console_init();
+
 
     // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
     ioapic_route(1, 33, 0, false);
+    keyboard_init();   // keyboard still on PIC IRQ 1
 
-
-    __asm__ volatile ("sti");
+    __asm__ volatile ("sti");keyboard_init();   // keyboard still on PIC IRQ 1
+    boot_animation();           // play the splash
 
     // Test DMA read
     kprintf("Testing DMA read...\n");
@@ -140,14 +146,11 @@ void kernel_main(void) {
                 if (wbuf[i] != rbuf[i]) { match = false; break; }
             }
             kprintf("Data disk write/read test: %s\n", match ? "PASS" : "FAIL");
-            extern volatile uint64_t ata_irq_count;
-            kprintf("ATA IRQ fired %u times\n", (unsigned int)ata_irq_count);
+            
         }
     }
     
-    kheap_init();
-    fb_init();
-    console_init();
+    
     fb_clear(0, 0, 64);   // dark blue screen — if you see this, framebuffer works
     kprintf("Helios — framebuffer alive\n");
     //timer_init();
@@ -156,7 +159,7 @@ void kernel_main(void) {
      // DON'T call timer_init() — replaced by LAPIC timer
     lapic_timer_init(48);
 
-    keyboard_init();   // keyboard still on PIC IRQ 1
+    
 
     // fully mask the PIC 8259A interrupt controllers
     outb(PIC1_DATA, 0xFF);

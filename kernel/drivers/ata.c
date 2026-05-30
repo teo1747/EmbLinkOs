@@ -52,14 +52,12 @@ static volatile bool ata_irq_fired = false;
 
 static struct ata_drive drives[ATA_MAX_DRIVES];
 static uint32_t drive_count = 0;
-volatile uint64_t ata_irq_count = 0;
 
 
 static void ata_irq_handler(void) {
     // Reading the status register acknowledge the interrupt at the drive.
     // Without this, the controller never sends another interrupt.
     inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
-    ata_irq_count++;
     ata_irq_fired = true;
     // LAPIC EOI (End Of Interrupt) is sent by the common irq_handler() after return.
 }
