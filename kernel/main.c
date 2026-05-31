@@ -1,5 +1,6 @@
 # include <stdint.h>
 #include "cpu/ioapic.h"
+#include "drivers/ahci.h"
 #include "drivers/ata.h"
 #include "include/types.h"
 #include "drivers/serial.h"
@@ -79,6 +80,7 @@ void kernel_main(void) {
     pci_init();
     ioapic_init();
     ata_init();
+    ahci_init();
 
     kheap_init();
     fb_init();
