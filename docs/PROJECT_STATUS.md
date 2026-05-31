@@ -169,6 +169,22 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Handler acks device via status read, sets flag; wait sleeps on hlt
 - Verified IRQ count matches op count (4 ops = 4 IRQs)
 
+### Phase 11c — ATA DMA (bus mastering, read) ✅
+- Bus mastering enabled in IDE PCI command register
+- BMIDE registers at BAR4 (0xc040)
+- Single-entry PRDT in BSS (KV2P for physical addr), EOT, <=64KB
+- ata_read_dma: full bus-master sequence, completion via IRQ 14
+- Zero CPU copy — controller writes RAM directly
+- Verified sector 0 read via DMA, boot signature + bytes correct
+
+### Phase 11c — ATA DMA (bus mastering) ✅
+- Read (0xC8) and write (0xCA) both via bus-master DMA
+- Direction bit: set for disk read (device writes RAM),
+  cleared for disk write (device reads RAM)
+- Single-entry PRDT in BSS (KV2P physical), EOT, <=64KB
+- Completion via IRQ 14; cache flush after writes
+- Zero-copy: controller moves all data; verified byte-exact round-trip
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000

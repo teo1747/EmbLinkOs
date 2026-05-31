@@ -231,6 +231,16 @@ Currently hardcoded to mode 0x118 (1024x768x24bpp). Real implementation:
 - [ ] BARs not yet stored in pci_device struct — only printed.
   Should cache them so drivers can retrieve without re-reading.
 - [ ] No ECAM/MCFG, no recursive bridges, no capabilities (still pending)
+
+
+## Phase 11c — ATA DMA (deferred / next)
+- [ ] Multi-PRD scatter-gather for buffers > 64KB or spanning pages
+  (current limit: single contiguous region <= 64KB, <= 128 sectors)
+- [ ] LBA48 DMA (READ DMA EXT 0x25) for >128 sectors / disks > 128GB
+- [ ] DMA buffer currently must be kernel BSS/contiguous (KV2P).
+  For arbitrary virtual buffers: walk pages, build multi-PRD, or bounce-buffer
+- [ ] No cache coherency handling (fine on QEMU/x86; matters on some HW)
+- [ ] Secondary channel DMA (offset 0x08 in BMIDE) not handled
 References:
 - VBE 3.0 spec (Function 15h: Display Data Channel)
 - EDID 1.4 spec (VESA E-EDID)

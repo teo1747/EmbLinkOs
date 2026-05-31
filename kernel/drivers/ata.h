@@ -67,4 +67,6 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
 
 int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer);
 
+int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const  void *buffer);
+
 #endif  // __ATA_H__

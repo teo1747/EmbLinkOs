@@ -52,14 +52,12 @@ static volatile bool ata_irq_fired = false;
 
 static struct ata_drive drives[ATA_MAX_DRIVES];
 static uint32_t drive_count = 0;
-volatile uint64_t ata_irq_count = 0;
 
 
 static void ata_irq_handler(void) {
     // Reading the status register acknowledge the interrupt at the drive.
     // Without this, the controller never sends another interrupt.
     inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
-    ata_irq_count++;
     ata_irq_fired = true;
     // LAPIC EOI (End Of Interrupt) is sent by the common irq_handler() after return.
 }
@@ -404,5 +402,82 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
     }
 
     // Data is now in the buffer, placed there by the controller via DMA. We can return success.
+    return 0;
+}
+
+
+int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void *buffer) {
+    if (drive_index >= drive_count) return -1;
+    if (count == 0) return -1;
+    if (bmide_base == 0) return -1;
+
+    const struct ata_drive *d = &drives[drive_index];
+
+    uint32_t bytes = (uint32_t)count * ATA_SECTOR_SIZE;
+    if (bytes > 64 * 1024) {
+        kprintf("ATA DMA: write too large for single PRD\n");
+        return -1;
+    }
+
+    uint64_t buf_phys = KV2P(buffer);
+    if ((buf_phys >> 32) != 0) {
+        kprintf("ATA DMA: buffer above 4GB, unsupported\n");
+        return -1;
+    }
+
+    // 1. Build PRDT (single entry pointing at the source buffer)
+    dma_prdt[0].phys_addr  = (uint32_t)buf_phys;
+    dma_prdt[0].byte_count = (uint16_t)bytes;
+    dma_prdt[0].flags      = PRD_EOT;
+
+    uint64_t prdt_phys = KV2P(dma_prdt);
+
+    // 2. Stop, program PRDT address
+    outb(bmide_base + BMIDE_COMMAND, 0);
+    outl(bmide_base + BMIDE_PRDT, (uint32_t)prdt_phys);
+
+    // 3. Set direction = WRITE (controller reads RAM). Direction bit CLEARED.
+    outb(bmide_base + BMIDE_COMMAND, 0);   // direction bit 3 = 0 means RAM->disk
+
+    // 4. Clear interrupt + error status
+    uint8_t st = inb(bmide_base + BMIDE_STATUS);
+    outb(bmide_base + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
+
+    // 5. Program ATA registers
+    if (ata_wait_not_busy(d->io_base) < 0) return -1;
+    ata_setup_lba(d, lba, count);
+
+    // 6. Clear IRQ flag, issue WRITE DMA command
+    ata_irq_fired = false;
+    outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_DMA);
+
+    // 7. Start the bus master (start bit set, direction bit 0 for write)
+    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_START);
+
+    // 8. Wait for completion IRQ
+    if (ata_wait_irq() < 0) {
+        kprintf("ATA DMA: write IRQ timeout\n");
+        outb(bmide_base + BMIDE_COMMAND, 0);
+        return -1;
+    }
+
+    // 9. Stop bus master
+    outb(bmide_base + BMIDE_COMMAND, 0);
+
+    // 10. Check error, clear status
+    uint8_t status = inb(bmide_base + BMIDE_STATUS);
+    outb(bmide_base + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
+    if (status & BMIDE_STATUS_ERROR) {
+        kprintf("ATA DMA: write error (status %x)\n", (unsigned int)status);
+        return -1;
+    }
+
+    // 11. Flush the drive cache so data is durable on the platter
+    ata_irq_fired = false;
+    outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+    if (ata_wait_irq() < 0) {
+        ata_wait_not_busy(d->io_base);   // fallback if no flush IRQ
+    }
+
     return 0;
 }

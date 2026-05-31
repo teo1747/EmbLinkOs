@@ -20,6 +20,7 @@
 #include "include/io.h"
 #include "drivers/pci.h"
 #include "drivers/ata.h"
+#include "drivers/bootanim.h"
 // VGA text mode buffer
 #define VGA_ADDR ((volatile uint16_t*) 0xB8000)
 #define VGA_COLS 80
@@ -79,12 +80,17 @@ void kernel_main(void) {
     ioapic_init();
     ata_init();
 
+    kheap_init();
+    fb_init();
+    console_init();
+
 
     // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
     ioapic_route(1, 33, 0, false);
+    keyboard_init();   // keyboard still on PIC IRQ 1
 
-
-    __asm__ volatile ("sti");
+    __asm__ volatile ("sti");keyboard_init();   // keyboard still on PIC IRQ 1
+    boot_animation();           // play the splash
 
     // Test DMA read
     kprintf("Testing DMA read...\n");
@@ -106,6 +112,27 @@ void kernel_main(void) {
                 (unsigned int)sector[510], (unsigned int)sector[511]);
     }
 
+    // Test DMA write + read on data disk (drive 1)
+    if (ata_drive_count() > 1) {
+        static uint8_t dma_wbuf[512] __attribute__((aligned(4)));
+        static uint8_t dma_rbuf[512] __attribute__((aligned(4)));
+        for (int i = 0; i < 512; i++) dma_wbuf[i] = (uint8_t)(0xA0 + (i & 0x1F));
+
+        kprintf("Testing DMA write+read...\n");
+        int w = ata_write_dma(1, 200, 1, dma_wbuf);
+        int r = ata_read_dma(1, 200, 1, dma_rbuf);
+
+        if (w == 0 && r == 0) {
+            bool match = true;
+            for (int i = 0; i < 512; i++) {
+                if (dma_wbuf[i] != dma_rbuf[i]) { match = false; break; }
+            }
+            kprintf("DMA write+read test: %s\n", match ? "PASS" : "FAIL");
+        } else {
+            kprintf("DMA write/read failed (w=%d r=%d)\n", w, r);
+        }
+    }
+
     // Test write+read on the data disk (drive 1) if present
     if (ata_drive_count() > 1) {
         uint8_t wbuf[512], rbuf[512];
@@ -119,14 +146,11 @@ void kernel_main(void) {
                 if (wbuf[i] != rbuf[i]) { match = false; break; }
             }
             kprintf("Data disk write/read test: %s\n", match ? "PASS" : "FAIL");
-            extern volatile uint64_t ata_irq_count;
-            kprintf("ATA IRQ fired %u times\n", (unsigned int)ata_irq_count);
+            
         }
     }
     
-    kheap_init();
-    fb_init();
-    console_init();
+    
     fb_clear(0, 0, 64);   // dark blue screen — if you see this, framebuffer works
     kprintf("Helios — framebuffer alive\n");
     //timer_init();
@@ -135,7 +159,7 @@ void kernel_main(void) {
      // DON'T call timer_init() — replaced by LAPIC timer
     lapic_timer_init(48);
 
-    keyboard_init();   // keyboard still on PIC IRQ 1
+    
 
     // fully mask the PIC 8259A interrupt controllers
     outb(PIC1_DATA, 0xFF);
