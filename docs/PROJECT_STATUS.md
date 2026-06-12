@@ -185,6 +185,11 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Completion via IRQ 14; cache flush after writes
 - Zero-copy: controller moves all data; verified byte-exact round-trip
 
+### Phase 11d-2 — AHCI command machinery + IDENTIFY ✅
+- Full command path working: header -> table -> CFIS -> PRD -> PxCI
+- Controller DMAs IDENTIFY data into kernel buffer
+- 64MB SATA disk on port 0 fully identified
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000
