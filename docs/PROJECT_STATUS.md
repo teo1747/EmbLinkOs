@@ -195,6 +195,7 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Controller DMAs IDENTIFY data into kernel buffer
 - 64MB SATA disk on port 0 fully identified
 
+
 ## Current State
 - Boots cleanly in QEMU (`make run`)
 - Kernel runs at 0xFFFFFFFF80100000
