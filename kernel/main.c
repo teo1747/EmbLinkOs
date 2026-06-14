@@ -1,5 +1,6 @@
 # include <stdint.h>
 #include "cpu/ioapic.h"
+#include "drivers/ahci.h"
 #include "drivers/ata.h"
 #include "include/types.h"
 #include "drivers/serial.h"
@@ -79,7 +80,45 @@ void kernel_main(void) {
     pci_init();
     ioapic_init();
     ata_init();
+    ahci_init();
+     // Test: IDENTIFY device on AHCI port 0
+    static uint16_t ahci_id_buf[256] __attribute__((aligned(4)));
+    kprintf("Testing AHCI IDENTIFY on port 0...\n");
+    if (ahci_identify_device(0, ahci_id_buf)) {
+        kprintf("AHCI IDENTIFY OK\n");
 
+        // Total sectors: word 60-61 (LBA28) or word 100-103 (LBA48)
+        uint32_t lba28 = ahci_id_buf[60] | ((uint32_t)ahci_id_buf[61] << 16);
+        uint64_t lba48 = (uint64_t)ahci_id_buf[100]
+                       | ((uint64_t)ahci_id_buf[101] << 16)
+                       | ((uint64_t)ahci_id_buf[102] << 32)
+                       | ((uint64_t)ahci_id_buf[103] << 48);
+
+        kprintf("AHCI: LBA28 sectors=%u, LBA48 sectors=%u\n",
+                (unsigned int)lba28, (unsigned int)lba48);
+
+        // Model string at words 27-46, byte-swapped
+        char model[41];
+        for (int i = 0; i < 20; i++) {
+            uint16_t w = ahci_id_buf[27 + i];
+            model[i * 2]     = (char)(w >> 8);
+            model[i * 2 + 1] = (char)(w & 0xFF);
+        }
+        model[40] = '\0';
+        kprintf("AHCI model: '%s'\n", model);
+    } else {
+        kprintf("AHCI IDENTIFY FAILED\n");
+    }
+    static uint8_t ahci_rbuf[512] __attribute__((aligned(4)));
+    kprintf("Testing AHCI read (sector 5)...\n");
+    if (ahci_read_sectors(0, 5, 1, ahci_rbuf)) {
+        ahci_rbuf[32] = '\0';   // terminate for printing
+        kprintf("AHCI sector 5 says: '%s'\n", (char *)ahci_rbuf);
+    } else {
+        kprintf("AHCI read FAILED\n");
+    }
+
+    
     kheap_init();
     fb_init();
     console_init();
@@ -91,6 +130,9 @@ void kernel_main(void) {
 
     __asm__ volatile ("sti");keyboard_init();   // keyboard still on PIC IRQ 1
     boot_animation();           // play the splash
+
+
+   
 
     // Test DMA read
     kprintf("Testing DMA read...\n");
