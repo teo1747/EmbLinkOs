@@ -190,10 +190,14 @@ at MMIO_BASE virtual range using 4 KB pages.
 - Controller DMAs IDENTIFY data into kernel buffer
 - 64MB SATA disk on port 0 fully identified
 
-### Phase 11d-2 — AHCI command machinery + IDENTIFY ✅
-- Full command path working: header -> table -> CFIS -> PRD -> PxCI
-- Controller DMAs IDENTIFY data into kernel buffer
-- 64MB SATA disk on port 0 fully identified
+### Phase 11d — AHCI (SATA) ✅ COMPLETE
+- 11d-1: controller discovery, ABAR map, AHCI mode, port enumeration
+- 11d-2: command list / FIS / command table machinery + IDENTIFY
+- 11d-3: READ DMA EXT (LBA48)
+- 11d-4: WRITE DMA EXT (LBA48)
+- Per-port BSS memory (command list, FIS area, 32 command tables)
+- Verified read AND write against host-visible ground truth on 64MB SATA disk
+- STATED PROJECT GOAL (DMA + AHCI) REACHED
 
 
 ## Current State
