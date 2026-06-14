@@ -146,6 +146,7 @@ bool ahci_identify_device(uint8_t port_num, void *buffer);
 
 bool ahci_read_sectors(uint8_t port_num, uint64_t lba, uint16_t count, void *buffer);
 
+bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const void *buffer);
 // Initialize AHCI controller: Discover, map ABAR, enumerate ports
 void ahci_init(void);
 
