@@ -33,6 +33,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/pci.c \
              kernel/drivers/ata.c \
              kernel/drivers/bootanim.c \
+             kernel/drivers/ahci.c \
              kernel/mm/pmm.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
@@ -74,6 +75,19 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=64
 
+# Create a 64MB AHCI test disk (separate from disk.img)
+ahci.img:
+	dd if=/dev/zero of=ahci.img bs=1M count=64
+
+run-ahci: $(IMG) $(DISK) ahci.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=$(DISK),if=ide,index=1 \
+	    -device ahci,id=ahci0 \
+	    -drive id=satadisk,file=ahci.img,format=raw,if=none \
+	    -device ide-hd,drive=satadisk,bus=ahci0.0 \
+	    -serial stdio -no-reboot -no-shutdown
+
 run: $(IMG) $(DISK)
 	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown
 
@@ -92,4 +106,4 @@ run-kvm: $(IMG) $(DISK)
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) $(ISR_OBJ)
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm
+.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci

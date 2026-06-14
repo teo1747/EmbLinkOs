@@ -3,3 +3,4 @@
 *.elf
 *.img
 qemu.log
+ahci.img
