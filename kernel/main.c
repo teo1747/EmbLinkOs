@@ -117,7 +117,26 @@ void kernel_main(void) {
     } else {
         kprintf("AHCI read FAILED\n");
     }
+    
+    // AHCI write+read round-trip on sector 10
+    static uint8_t ahci_wbuf[512] __attribute__((aligned(4)));
+    static uint8_t ahci_rbuf2[512] __attribute__((aligned(4)));
+    const char *msg = "WRITTEN BY HELIOS VIA AHCI";
+    for (int i = 0; i < 512; i++) ahci_wbuf[i] = 0;
+    for (int i = 0; msg[i]; i++) ahci_wbuf[i] = (uint8_t)msg[i];
 
+    kprintf("Testing AHCI write+read (sector 10)...\n");
+    bool w = ahci_write_sectors(0, 10, 1, ahci_wbuf);
+    bool r = ahci_read_sectors(0, 10, 1, ahci_rbuf2);
+    if (w && r) {
+        bool match = true;
+        for (int i = 0; i < 512; i++) {
+            if (ahci_wbuf[i] != ahci_rbuf2[i]) { match = false; break; }
+        }
+        kprintf("AHCI write+read test: %s\n", match ? "PASS" : "FAIL");
+    } else {
+        kprintf("AHCI write/read failed (w=%u r=%u)\n", (unsigned int)w, (unsigned int)r);
+    }
     
     kheap_init();
     fb_init();

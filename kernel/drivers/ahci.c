@@ -423,3 +423,78 @@ bool ahci_read_sectors(uint8_t port_num, uint64_t lba, uint16_t count, void *buf
     return false;
 }
 
+bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const void *buffer) {
+    if (port_num >= port_count) return false;
+    if (count == 0) return false;
+
+    uint32_t bytes = (uint32_t)count * 512;
+
+    int slot = find_free_command_slot(port_num);
+    if (slot == -1) {
+        kprintf("AHCI: no free slot on port %u\n", (unsigned int)port_num);
+        return false;
+    }
+
+    // Command header: CFL=5 dwords, write (W=1), 1 PRD
+    struct ahci_cmd_header *hdr = &port_mem[port_num].cmd_list[slot];
+    hdr->flags = ((sizeof(struct fis_reg_h2d) / 4) & 0x1F) | (1 << 5); // W=1 for write
+    hdr->prdtl = 1;
+    hdr->prdbc = 0;
+
+    // Command table
+    struct ahci_cmd_table *tbl = &port_mem[port_num].cmd_tables[slot];
+    for (uint32_t i = 0; i < sizeof(struct ahci_cmd_table) / 4; i++) {
+        ((uint32_t *)tbl)[i] = 0;
+    }
+
+    // H2D FIS: WRITE DMA EXT with LBA48
+    struct fis_reg_h2d *fis = &tbl->cfis;
+    fis->fis_type = AHCI_FIS_TYPE_REG_H2D;
+    fis->pmport_c = (1 << 7);          // command
+    fis->command  = 0x35;              // WRITE DMA EXT
+    fis->device   = (1 << 6);          // LBA mode bit — REQUIRED
+    fis->lba0 = (uint8_t)(lba & 0xFF);
+    fis->lba1 = (uint8_t)((lba >> 8) & 0xFF);
+    fis->lba2 = (uint8_t)((lba >> 16) & 0xFF);
+    fis->lba3 = (uint8_t)((lba >> 24) & 0xFF);
+    fis->lba4 = (uint8_t)((lba >> 32) & 0xFF);
+    fis->lba5 = (uint8_t)((lba >> 40) & 0xFF);
+    fis->count = count;
+
+    // PRD: source buffer
+    uint64_t buf_phys = KV2P(buffer);
+    if (buf_phys >> 32) {
+        kprintf("AHCI: buffer above 4GB unsupported\n");
+        return false;
+    }
+    tbl->prdt[0].dba   = (uint32_t)buf_phys;
+    tbl->prdt[0].dbau  = 0;
+    tbl->prdt[0].dbc_i = (bytes - 1) | (1U << 31);  
+
+    // Wait not-busy, issue, poll completion — same as IDENTIFY
+    for (int i = 0; i < 100000; i++) {
+        uint32_t tfd = ahci_port_read(port_num, AHCI_PORT_TFD);
+        if (!(tfd & 0x88)) break;
+        if (i == 99999) { kprintf("AHCI: port busy\n"); return false; }
+    }
+
+    ahci_port_write(port_num, AHCI_PORT_CI, (1U << slot));
+
+    for (int i = 0; i < 1000000; i++) {
+        if (!(ahci_port_read(port_num, AHCI_PORT_CI) & (1U << slot))) {
+            uint32_t tfd = ahci_port_read(port_num, AHCI_PORT_TFD);
+            if (tfd & 0x01) {
+                kprintf("AHCI: write error, TFD=%x\n", (unsigned int)tfd);
+                return false;
+            }
+            return true;
+        }
+        if (ahci_port_read(port_num, AHCI_PORT_IS) & (1U << 30)) {
+            kprintf("AHCI: TFE during write\n");
+            return false;
+        }
+    }
+    kprintf("AHCI: write timeout\n");
+    return false;
+}
+
