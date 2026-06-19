@@ -5,7 +5,10 @@
 #include "../include/kprintf.h"
 #include "serial.h"
 #include <stdint.h>
+#include "../block/block.h"
+#include "../include/errno.h"
 
+static struct embk_block_device ahci_block_devs[AHCI_MAX_PORTS];
 
 static volatile uint8_t *ahci_abar = 0;
 static uint32_t ahci_cap = 0;
@@ -259,92 +262,7 @@ static const char *sig_string(uint32_t sig) {
     return "unknown";
 }
 
-// Initialize the AHCI controller
-void ahci_init(void) {
-    serial_write_string("\n=== AHCI INIT ===\n");
 
-    // 1. Find the AHCI controller via PCI
-    uint8_t bus, device, function;
-    if (!find_ahci_controller(&bus, &device, &function)) {
-        kprintf("AHCI controller not found\n");
-        return;
-    }
-    kprintf("AHCI: controller at PCI %x:%x.%x\n",
-           (unsigned int)bus, (unsigned int)device, (unsigned int)function);
-           
-
-    // 2. Enable bus mastering + memory space in PCI command register
-    pci_enable_bus_mastering(bus, device, function);
-    
-    // 3. Get ABAR (BAR5)
-    struct pci_bar bar5 = pci_read_bar(bus, device, function, 5);
-    if (!bar5.valid || !bar5.is_mmio) {
-        kprintf("AHCI: BAR5 invalid or not MMIO\n");
-        return;
-    }
-    kprintf("AHCI: ABAR phys = %p, size = %u\n", (void *)bar5.address, (unsigned int)bar5.size);
-
-    // 4. Map ABAR to virtual memory
-    ahci_abar = (volatile uint8_t *)vmm_map_mmio(bar5.address, bar5.size);
-    if (!ahci_abar) {
-        kprintf("AHCI: failed to map ABAR\n");
-        return;
-    }
-    kprintf("AHCI: ABAR mapped at %p\n", (void *)ahci_abar);
-
-    // 5. Read global capabilities register
-    ahci_cap = ahci_read(AHCI_REG_CAP);
-    uint32_t ghc = ahci_read(AHCI_REG_GHC);
-    ahci_pi = ahci_read(AHCI_REG_PI);
-    uint32_t vs = ahci_read(AHCI_REG_VS);
-
-    uint32_t num_ports = (ahci_cap & 0x1F) + 1;      // CAP bits 0-4 + 1
-    uint32_t num_slots = ((ahci_cap >> 8) & 0x1F) + 1;   // CAP bits 8-12 + 1
-    bool s64a = (ahci_cap & (1U << 31)) != 0;   // 64-bit DMA support addressing
-    bool sncq = (ahci_cap & (1U << 30)) != 0;   // NCQ support
-
-    kprintf("AHCI: version %x.%x, CAP=%x, GHC=%x, PI=%x\n",
-              (unsigned int)((vs >> 16) & 0xFFFF), (unsigned int)(vs & 0xFFFF), (unsigned int)ahci_cap, (unsigned int)ghc, (unsigned int)ahci_pi);
-    
-    kprintf("AHCI: %u ports max, %u command slots/port, S64A=%u NCQ=%u\n",
-             (unsigned int)num_ports, (unsigned int)num_slots, (unsigned int)s64a, (unsigned int)sncq);
-    
-    //6. Enable AHCI mode (set GHC.AE)
-    ahci_write(AHCI_REG_GHC, ghc | AHCI_GHC_AE);
-    ghc = ahci_read(AHCI_REG_GHC);
-    kprintf("AHCI: AHCI mode %s (GHC=%x)\n",
-            (ghc & AHCI_GHC_AE) ? "enabled" : "Failed to enable", (unsigned int)ghc);
-    
-    // 7. Enumerate ports
-    port_count = 0;
-    for (uint32_t i = 0; i < num_ports && i < AHCI_MAX_PORTS; i++) {
-        if (!(ahci_pi & (1U << i))) continue; // not Implemented
-
-        uint32_t ssts = ahci_port_read(i, AHCI_PORT_SSTS);
-        uint8_t det = ssts & 0x0F;  
-        uint32_t sig = ahci_port_read(i, AHCI_PORT_SIG);
-        uint32_t tfd = ahci_port_read(i, AHCI_PORT_TFD);
-
-        ports[port_count].port_num = (uint8_t)i;
-        ports[port_count].signature = sig;
-        ports[port_count].det = det;
-        ports[port_count].present = (det == AHCI_DET_READY);
-        port_count++;
-
-        kprintf(" Port %u: SSTS=%x (%s), SIG=%x (%s), TFD=%x\n",
-                     (unsigned int)i, (unsigned int)ssts, det_string(det), (unsigned int)sig, sig_string(sig), (unsigned int)tfd);
-
-    }
-    kprintf("AHCI: %u port(s) implemented\n", (unsigned int)port_count);
-
-    // 8. Set up memory for each port
-    for (uint32_t i = 0; i < port_count; i++) {
-        if (ports[i].present) {
-            port_setup_memory(ports[i].port_num);
-            kprintf("AHCI: Port %u memory set up\n", (unsigned int)ports[i].port_num);
-        }
-    }
-}
 
 // Read `count` sectors starting at LBA from an AHCI port into buffer.
 // LBA48 READ DMA EXT. Buffer must be kernel-static (KV2P) and contiguous.
@@ -498,3 +416,162 @@ bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const vo
     return false;
 }
 
+
+static int ahci_block_read(struct embk_block_device *dev,
+                           uint64_t lba, uint32_t count, void *buf) {
+    if (!dev || !buf) return -EMBK_EINVAL;
+    uint8_t port = (uint8_t)(uintptr_t)dev->driver_data;
+    // ahci_read_sectors takes uint16_t count; chunk to be safe (stay within one PRD region)
+    uint8_t *p = (uint8_t *)buf;
+    while (count > 0) {
+        uint16_t chunk = (count > 64) ? 64 : (uint16_t)count;
+        if (!ahci_read_sectors(port, lba, chunk, p)) {
+            return -EMBK_EIO;
+        }
+        lba += chunk;
+        count -= chunk;
+        p += (uint32_t)chunk * 512;
+    }
+    return 0;
+}
+
+
+static int ahci_block_write(struct embk_block_device *dev,
+                            uint64_t lba, uint32_t count, const void *buf) {
+    if (!dev || !buf) return -EMBK_EINVAL;
+    uint8_t port = (uint8_t)(uintptr_t)dev->driver_data;
+    const uint8_t *p = (const uint8_t *)buf;
+    while (count > 0) {
+        uint16_t chunk = (count > 64) ? 64 : (uint16_t)count;
+        if (!ahci_write_sectors(port, lba, chunk, p)) {
+            return -EMBK_EIO;
+        }
+        lba += chunk;
+        count -= chunk;
+        p += (uint32_t)chunk * 512;
+    }
+    return EMBK_OK;
+}
+
+void ahci_register_block_devices(void) {
+    for (uint32_t i = 0; i < port_count; i++) {
+        if (!ports[i].present) continue;
+        uint8_t port = ports[i].port_num;
+        ahci_block_devs[i].block_count = ports[i].sectors;
+        ahci_block_devs[i].block_size  = 512;
+        ahci_block_devs[i].read        = ahci_block_read;
+        ahci_block_devs[i].write       = ahci_block_write;
+        ahci_block_devs[i].driver_data = (void *)(uintptr_t)port;
+        embk_block_register(&ahci_block_devs[i]);
+    }
+}
+
+// Initialize the AHCI controller
+void ahci_init(void) {
+    serial_write_string("\n=== AHCI INIT ===\n");
+
+    // 1. Find the AHCI controller via PCI
+    uint8_t bus, device, function;
+    if (!find_ahci_controller(&bus, &device, &function)) {
+        kprintf("AHCI controller not found\n");
+        return;
+    }
+    kprintf("AHCI: controller at PCI %x:%x.%x\n",
+           (unsigned int)bus, (unsigned int)device, (unsigned int)function);
+           
+
+    // 2. Enable bus mastering + memory space in PCI command register
+    pci_enable_bus_mastering(bus, device, function);
+    
+    // 3. Get ABAR (BAR5)
+    struct pci_bar bar5 = pci_read_bar(bus, device, function, 5);
+    if (!bar5.valid || !bar5.is_mmio) {
+        kprintf("AHCI: BAR5 invalid or not MMIO\n");
+        return;
+    }
+    kprintf("AHCI: ABAR phys = %p, size = %u\n", (void *)bar5.address, (unsigned int)bar5.size);
+
+    // 4. Map ABAR to virtual memory
+    ahci_abar = (volatile uint8_t *)vmm_map_mmio(bar5.address, bar5.size);
+    if (!ahci_abar) {
+        kprintf("AHCI: failed to map ABAR\n");
+        return;
+    }
+    kprintf("AHCI: ABAR mapped at %p\n", (void *)ahci_abar);
+
+    // 5. Read global capabilities register
+    ahci_cap = ahci_read(AHCI_REG_CAP);
+    uint32_t ghc = ahci_read(AHCI_REG_GHC);
+    ahci_pi = ahci_read(AHCI_REG_PI);
+    uint32_t vs = ahci_read(AHCI_REG_VS);
+
+    uint32_t num_ports = (ahci_cap & 0x1F) + 1;      // CAP bits 0-4 + 1
+    uint32_t num_slots = ((ahci_cap >> 8) & 0x1F) + 1;   // CAP bits 8-12 + 1
+    bool s64a = (ahci_cap & (1U << 31)) != 0;   // 64-bit DMA support addressing
+    bool sncq = (ahci_cap & (1U << 30)) != 0;   // NCQ support
+
+    kprintf("AHCI: version %x.%x, CAP=%x, GHC=%x, PI=%x\n",
+              (unsigned int)((vs >> 16) & 0xFFFF), (unsigned int)(vs & 0xFFFF), (unsigned int)ahci_cap, (unsigned int)ghc, (unsigned int)ahci_pi);
+    
+    kprintf("AHCI: %u ports max, %u command slots/port, S64A=%u NCQ=%u\n",
+             (unsigned int)num_ports, (unsigned int)num_slots, (unsigned int)s64a, (unsigned int)sncq);
+    
+    //6. Enable AHCI mode (set GHC.AE)
+    ahci_write(AHCI_REG_GHC, ghc | AHCI_GHC_AE);
+    ghc = ahci_read(AHCI_REG_GHC);
+    kprintf("AHCI: AHCI mode %s (GHC=%x)\n",
+            (ghc & AHCI_GHC_AE) ? "enabled" : "Failed to enable", (unsigned int)ghc);
+    
+    // 7. Enumerate ports
+    port_count = 0;
+    for (uint32_t i = 0; i < num_ports && i < AHCI_MAX_PORTS; i++) {
+        if (!(ahci_pi & (1U << i))) continue; // not Implemented
+
+        uint32_t ssts = ahci_port_read(i, AHCI_PORT_SSTS);
+        uint8_t det = ssts & 0x0F;  
+        uint32_t sig = ahci_port_read(i, AHCI_PORT_SIG);
+        uint32_t tfd = ahci_port_read(i, AHCI_PORT_TFD);
+
+        ports[port_count].port_num = (uint8_t)i;
+        ports[port_count].signature = sig;
+        ports[port_count].det = det;
+        ports[port_count].present = (det == AHCI_DET_READY);
+        port_count++;
+
+        kprintf(" Port %u: SSTS=%x (%s), SIG=%x (%s), TFD=%x\n",
+                     (unsigned int)i, (unsigned int)ssts, det_string(det), (unsigned int)sig, sig_string(sig), (unsigned int)tfd);
+
+    }
+    kprintf("AHCI: %u port(s) implemented\n", (unsigned int)port_count);
+
+    // 8. Set up memory for each port
+    for (uint32_t i = 0; i < port_count; i++) {
+        if (ports[i].present) {
+            port_setup_memory(ports[i].port_num);
+            kprintf("AHCI: Port %u memory set up\n", (unsigned int)ports[i].port_num);
+        }
+    }
+
+        // 8. Set up memory + identify each present port
+    static uint16_t id_buf[256] __attribute__((aligned(4)));
+    for (uint32_t i = 0; i < port_count; i++) {
+        if (ports[i].present) {
+            port_setup_memory(ports[i].port_num);
+
+            // Run IDENTIFY to get the sector count
+            if (ahci_identify_device(ports[i].port_num, id_buf)) {
+                uint64_t lba48 = (uint64_t)id_buf[100]
+                               | ((uint64_t)id_buf[101] << 16)
+                               | ((uint64_t)id_buf[102] << 32)
+                               | ((uint64_t)id_buf[103] << 48);
+                uint32_t lba28 = id_buf[60] | ((uint32_t)id_buf[61] << 16);
+                ports[i].sectors = lba48 ? lba48 : lba28;
+            } else {
+                ports[i].sectors = 0;
+            }
+            kprintf("AHCI: Port %u ready, %u sectors\n",
+                    (unsigned int)ports[i].port_num,
+                    (unsigned int)ports[i].sectors);
+        }
+    }
+}

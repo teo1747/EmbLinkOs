@@ -34,10 +34,13 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/ata.c \
              kernel/drivers/bootanim.c \
              kernel/drivers/ahci.c \
+             kernel/block/block.c \
              kernel/mm/pmm.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
              kernel/mm/kheap.c \
+             kernel/kstring.c \
+             kernel/errno.c \
              kernel/kprintf.c
 
 LINKER      = kernel/linker.ld
