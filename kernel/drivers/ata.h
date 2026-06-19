@@ -1,5 +1,6 @@
 #ifndef __ATA_H__
 #define __ATA_H__
+#include "../block/block.h"
 
 #include "../include/types.h"
 #include <stdint.h>
@@ -40,6 +41,8 @@
 
 #define ATA_MAX_DRIVES          4
 
+
+
 // a detectec ATA drive
 struct ata_drive {
     bool     present;
@@ -68,5 +71,7 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
 int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer);
 
 int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const  void *buffer);
+
+void ata_register_block_devices(void);
 
 #endif  // __ATA_H__

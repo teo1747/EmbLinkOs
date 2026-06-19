@@ -6,6 +6,7 @@
 #include "../drivers/serial.h"
 #include "../cpu/irq.h"
 #include "../cpu/ioapic.h"
+#include "../include/errno.h"
 
 
 #include <stdint.h>
@@ -40,6 +41,11 @@ struct prd{
 } __attribute__((packed));
 
 #define PRD_EOT 0x8000;
+
+
+//Block device structs for each detected ATA drive. The block layer will use these to read/write sectors from/to
+static struct embk_block_device ata_block_devices[ATA_MAX_DRIVES];
+
 
 // A single PRD, 4-bytes aligned. won't cross 4K boundary, (it's 8 bytes in BSS)
 // Static so it has a fixed physical address we can compute with KV2P.
@@ -163,8 +169,8 @@ static bool ata_detect(uint16_t io_base, uint16_t ctrl_base, bool is_slave, stru
     // Model string: words 27 - 46, byte-swapped
     for (int i = 0; i < 20 ; i++) {
         uint16_t w = identify_data[27 + i];
-        out->model[2*i]     = (char) w >> 8;
-        out->model[2*i + 1] = (char) w & 0xFF;
+        out->model[2*i]     = (char) (w >> 8); // High byte first
+        out->model[2*i + 1] = (char) (w & 0xFF); 
     }
     out->model[40] = '\0'; // Null-terminate the string
 
@@ -178,58 +184,6 @@ static bool ata_detect(uint16_t io_base, uint16_t ctrl_base, bool is_slave, stru
 
 }
 
-void ata_init(void) {
-    serial_write_string("\n=== ATA init ===\n");
-    drive_count = 0;
-
-    struct { uint16_t io, ctrl; bool slave; } candidates[4] = {
-        { ATA_PRIMARY_IO, ATA_PRIMARY_CTRL, false },
-        { ATA_PRIMARY_IO, ATA_PRIMARY_CTRL, true },
-        { ATA_SECONDARY_IO, ATA_SECONDARY_CTRL, false },
-        { ATA_SECONDARY_IO, ATA_SECONDARY_CTRL, true }
-    };
-
-    for (int i = 0; i < 4; i++) {
-        struct ata_drive d;
-        if (ata_detect(candidates[i].io, candidates[i].ctrl, candidates[i].slave, &d)) {
-        if (d.present) {
-            drives[drive_count] = d;
-            }
-        kprintf("ATA[%u]: %s %s, %u sectors (%u KB) - %s\n",
-                (unsigned int)drive_count, candidates[i].io == ATA_PRIMARY_IO ? "primary" : "secondary",
-                candidates[i].slave ? "slave" : "master",
-                (unsigned int)d.total_sectors, (unsigned int)(d.total_sectors / 2), d.model);
-        drive_count++;
-        }
-
-    }
-
-    // IDE conntroller is at PCI bus 0, device 1, function 1. Read its BAR4 for bus master registers
-    pci_enable_bus_mastering(0, 1, 1); // Enable bus mastering for the IDE controller
-
-    // Read BAR4 for bus master registers
-    struct pci_bar bar4 = pci_read_bar(0, 1, 1, 4);
-    if (bar4.valid && !bar4.is_mmio) {
-        bmide_base = (uint16_t)bar4.address;
-        kprintf("ATA: bus-master base (BAR4) = %X\n",
-                 (unsigned int)bmide_base);
-
-    } else {
-        kprintf("ATA: invalid BAR4 for bus master registers\n");
-        bmide_base = 0; // fallback to 0, but DMA won't work
-    }
-    kprintf("ATA: Bus Master IDE I/O base at 0x%X\n", (unsigned int)bmide_base);
-
-    if (drive_count == 0) {
-        kprintf("ATA: no drives detected.\n");   
-    } else {
-        kprintf("ATA: %u drive(s) detected.\n", (unsigned int)drive_count);
-    }
-    // Install IRQ handler, routing to IRQ14 via IOAPIC
-    irq_register(ATA_PRIMARY_IRQ, ata_irq_handler);
-    ioapic_route(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0, false); // Route to CPU 0, unmasked
-    kprintf("ATA: IRQ14 routed to vector %u\n", (unsigned int)ATA_PRIMARY_VECTOR);
-}
 
 
 uint32_t ata_drive_count(void) {
@@ -481,3 +435,111 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
 
     return 0;
 }
+
+// Block-layer adapter: read. Pulls the ATA drive index from driver_data,
+// dispatches to the DMA READ PATH.
+static int ata_block_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buffer) {
+    if (!dev || !buffer) return -EMBK_EINVAL;
+    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data; // driver_data holds the ATA drive index
+    
+    // ata_read_dma takes uint8_t count, chuck if needed (count <= 128 for one PRD)
+    uint8_t *ptr = (uint8_t *)buffer;
+    while (count > 0) {
+        uint8_t chunk = (count > 64) ? 64 : (uint8_t)count; // 64 sectors = 32KB, safe for one PRD
+        if (ata_read_dma(drive_index, lba, chunk, ptr) != 0) {
+            return -EMBK_EIO; // I/O error
+        }
+        lba += chunk;
+        ptr += (uint32_t)chunk * ATA_SECTOR_SIZE;
+        count -= chunk;
+    }
+    return EMBK_OK;
+}
+
+
+static int ata_block_write(struct embk_block_device *dev, uint64_t lba, uint32_t count, const void *buffer) {
+    if (!dev || !buffer) return -EMBK_EINVAL;
+    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data; // driver_data holds the ATA drive index
+
+    const uint8_t *ptr = (const uint8_t *)buffer;
+    while (count > 0) {
+        uint8_t chunk = (count > 64) ? 64 : (uint8_t)count; // 64 sectors = 32KB, safe for one PRD
+        if (ata_write_dma(drive_index, lba, chunk, ptr) != 0) {
+            return -EMBK_EIO; // I/O error
+        }
+        lba += chunk;
+        ptr += (uint32_t)chunk * ATA_SECTOR_SIZE;
+        count -= chunk;
+    }
+    return EMBK_OK;
+}
+
+
+void ata_register_block_devices(void) {
+    for (uint32_t i = 0; i < drive_count; i++) {
+        ata_block_devices[i].block_count = drives[i].total_sectors;
+        ata_block_devices[i].block_size = ATA_SECTOR_SIZE;
+        ata_block_devices[i].read = ata_block_read;
+        ata_block_devices[i].write = ata_block_write;
+        ata_block_devices[i].driver_data = (void *)(uintptr_t)i; // Store the drive index
+        embk_block_register(&ata_block_devices[i]);
+    }
+}
+
+
+void ata_init(void) {
+    serial_write_string("\n=== ATA init ===\n");
+    drive_count = 0;
+
+    struct { uint16_t io, ctrl; bool slave; } candidates[4] = {
+        { ATA_PRIMARY_IO, ATA_PRIMARY_CTRL, false },
+        { ATA_PRIMARY_IO, ATA_PRIMARY_CTRL, true },
+        { ATA_SECONDARY_IO, ATA_SECONDARY_CTRL, false },
+        { ATA_SECONDARY_IO, ATA_SECONDARY_CTRL, true }
+    };
+
+    for (int i = 0; i < 4; i++) {
+        struct ata_drive d;
+        if (ata_detect(candidates[i].io, candidates[i].ctrl, candidates[i].slave, &d)) {
+        if (d.present) {
+            drives[drive_count] = d;
+            }
+        kprintf("ATA[%u]: %s %s, %u sectors (%u KB) - %s\n",
+                (unsigned int)drive_count, candidates[i].io == ATA_PRIMARY_IO ? "primary" : "secondary",
+                candidates[i].slave ? "slave" : "master",
+                (unsigned int)d.total_sectors, (unsigned int)(d.total_sectors / 2), d.model);
+        drive_count++;
+        }
+
+    }
+
+    // IDE conntroller is at PCI bus 0, device 1, function 1. Read its BAR4 for bus master registers
+    pci_enable_bus_mastering(0, 1, 1); // Enable bus mastering for the IDE controller
+
+    // Read BAR4 for bus master registers
+    struct pci_bar bar4 = pci_read_bar(0, 1, 1, 4);
+    if (bar4.valid && !bar4.is_mmio) {
+        bmide_base = (uint16_t)bar4.address;
+        kprintf("ATA: bus-master base (BAR4) = %X\n",
+                 (unsigned int)bmide_base);
+
+    } else {
+        kprintf("ATA: invalid BAR4 for bus master registers\n");
+        bmide_base = 0; // fallback to 0, but DMA won't work
+    }
+    kprintf("ATA: Bus Master IDE I/O base at 0x%X\n", (unsigned int)bmide_base);
+
+    if (drive_count == 0) {
+        kprintf("ATA: no drives detected.\n");   
+    } else {
+        kprintf("ATA: %u drive(s) detected.\n", (unsigned int)drive_count);
+    }
+    // Install IRQ handler, routing to IRQ14 via IOAPIC
+    irq_register(ATA_PRIMARY_IRQ, ata_irq_handler);
+    ioapic_route(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0, false); // Route to CPU 0, unmasked
+    kprintf("ATA: IRQ14 routed to vector %u\n", (unsigned int)ATA_PRIMARY_VECTOR);
+
+    // Register block devices for each detected drive
+    ata_register_block_devices();
+}
+

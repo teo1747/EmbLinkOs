@@ -1,246 +1,139 @@
-# include <stdint.h>
-#include "cpu/ioapic.h"
-#include "drivers/ahci.h"
-#include "drivers/ata.h"
+#include <stdint.h>
 #include "include/types.h"
-#include "drivers/serial.h"
-#include "../kernel/cpu/idt.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
 #include "include/kprintf.h"
+#include "include/io.h"
+#include "include/errno.h"
+
+#include "drivers/serial.h"
 #include "drivers/framebuffer.h"
 #include "drivers/console.h"
-#include "cpu/pic.h"
-#include "cpu/irq.h"
-#include "drivers/timer.h"
-#include "cpu/gdt.h"
 #include "drivers/keyboard.h"
-#include "mm/kheap.h"
-#include "acpi/acpi.h"
-#include "cpu/lapic.h"
-#include "include/io.h"
+#include "drivers/timer.h"
 #include "drivers/pci.h"
 #include "drivers/ata.h"
+#include "drivers/ahci.h"
 #include "drivers/bootanim.h"
-// VGA text mode buffer
-#define VGA_ADDR ((volatile uint16_t*) 0xB8000)
-#define VGA_COLS 80
-#define VGA_ROWS 25
 
-static int col = 0;
-static int row = 0;
+#include "cpu/gdt.h"
+#include "cpu/idt.h"
+#include "cpu/pic.h"
+#include "cpu/irq.h"
+#include "cpu/lapic.h"
+#include "cpu/ioapic.h"
 
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "mm/kheap.h"
 
-static void vga_putchar(char c, uint8_t color) {
-    if (c == '\n') {
-        col = 0;
-        row++;
-        return;
-    }
-    VGA_ADDR[row * VGA_COLS + col] = 
-                             (uint16_t)c | (uint16_t)(color << 8);  // Write character and color to VGA buffer
-    col++;
-    if (col >= VGA_COLS) {
-        col = 0;
-        row++;
-    }
-
-}
+#include "acpi/acpi.h"
+#include "block/block.h"
 
 
-static void vga_print(const char* str, uint8_t color) {
-    while (*str) {
-        vga_putchar(*str++, color);
-    }
-}
-
-
-static void vga_clear(void) {
-    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
-        VGA_ADDR[i] = (uint16_t)' ' | (uint16_t)(0x0F << 8);  // Clear screen with spaces
-    }
-    col = 0;
-    row = 0;
-}
+extern uint64_t lapic_timer_get_ticks(void);
 
 
 void kernel_main(void) {
-
+    // --- Core init ---
     serial_init();
     gdt_init();
     idt_init();
-    serial_write_string("IDT loaded\n");
-
     pic_init();
     irq_install();
+
+    // --- Memory ---
     pmm_init();
     vmm_init();
+    kheap_init();
+
+    // --- Interrupt controllers (ACPI -> LAPIC -> IO-APIC) ---
     acpi_init();
     lapic_init();
-    pci_init();
     ioapic_init();
-    ata_init();
-    ahci_init();
-     // Test: IDENTIFY device on AHCI port 0
-    static uint16_t ahci_id_buf[256] __attribute__((aligned(4)));
-    kprintf("Testing AHCI IDENTIFY on port 0...\n");
-    if (ahci_identify_device(0, ahci_id_buf)) {
-        kprintf("AHCI IDENTIFY OK\n");
 
-        // Total sectors: word 60-61 (LBA28) or word 100-103 (LBA48)
-        uint32_t lba28 = ahci_id_buf[60] | ((uint32_t)ahci_id_buf[61] << 16);
-        uint64_t lba48 = (uint64_t)ahci_id_buf[100]
-                       | ((uint64_t)ahci_id_buf[101] << 16)
-                       | ((uint64_t)ahci_id_buf[102] << 32)
-                       | ((uint64_t)ahci_id_buf[103] << 48);
+    // --- Devices ---
+    pci_init();
+    ata_init();    // registers ATA drives as block devices internally
+    ahci_init();   // runs IDENTIFY per port, stores sector counts
 
-        kprintf("AHCI: LBA28 sectors=%u, LBA48 sectors=%u\n",
-                (unsigned int)lba28, (unsigned int)lba48);
+    // Register AHCI drives as block devices (after ahci_init filled sector counts)
+    ahci_register_block_devices();
 
-        // Model string at words 27-46, byte-swapped
-        char model[41];
-        for (int i = 0; i < 20; i++) {
-            uint16_t w = ahci_id_buf[27 + i];
-            model[i * 2]     = (char)(w >> 8);
-            model[i * 2 + 1] = (char)(w & 0xFF);
-        }
-        model[40] = '\0';
-        kprintf("AHCI model: '%s'\n", model);
-    } else {
-        kprintf("AHCI IDENTIFY FAILED\n");
-    }
-    static uint8_t ahci_rbuf[512] __attribute__((aligned(4)));
-    kprintf("Testing AHCI read (sector 5)...\n");
-    if (ahci_read_sectors(0, 5, 1, ahci_rbuf)) {
-        ahci_rbuf[32] = '\0';   // terminate for printing
-        kprintf("AHCI sector 5 says: '%s'\n", (char *)ahci_rbuf);
-    } else {
-        kprintf("AHCI read FAILED\n");
-    }
-    
-    // AHCI write+read round-trip on sector 10
-    static uint8_t ahci_wbuf[512] __attribute__((aligned(4)));
-    static uint8_t ahci_rbuf2[512] __attribute__((aligned(4)));
-    const char *msg = "WRITTEN BY HELIOS VIA AHCI";
-    for (int i = 0; i < 512; i++) ahci_wbuf[i] = 0;
-    for (int i = 0; msg[i]; i++) ahci_wbuf[i] = (uint8_t)msg[i];
-
-    kprintf("Testing AHCI write+read (sector 10)...\n");
-    bool w = ahci_write_sectors(0, 10, 1, ahci_wbuf);
-    bool r = ahci_read_sectors(0, 10, 1, ahci_rbuf2);
-    if (w && r) {
-        bool match = true;
-        for (int i = 0; i < 512; i++) {
-            if (ahci_wbuf[i] != ahci_rbuf2[i]) { match = false; break; }
-        }
-        kprintf("AHCI write+read test: %s\n", match ? "PASS" : "FAIL");
-    } else {
-        kprintf("AHCI write/read failed (w=%u r=%u)\n", (unsigned int)w, (unsigned int)r);
-    }
-    
-    kheap_init();
+    // --- Display + input ---
     fb_init();
     console_init();
+    keyboard_init();
+    ioapic_route(1, 33, 0, false);   // keyboard GSI 1 -> vector 33 -> CPU 0
 
+    // --- Timer (LAPIC) + retire PIC ---
+    lapic_timer_init(48);
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
 
-    // Route keyboard: IRQ 1 = GSI 1 (no override), to vector 33 (keyboard), CPU 0
-    ioapic_route(1, 33, 0, false);
-    keyboard_init();   // keyboard still on PIC IRQ 1
+    __asm__ volatile ("sti");
 
-    __asm__ volatile ("sti");keyboard_init();   // keyboard still on PIC IRQ 1
-    boot_animation();           // play the splash
+    // --- Boot splash ---
+    boot_animation();
 
-
-   
-
-    // Test DMA read
-    kprintf("Testing DMA read...\n");
-    static uint8_t dma_buf[512] __attribute__((aligned(4)));
-    if (ata_read_dma(0, 0, 1, dma_buf) == 0) {
-        kprintf("DMA read sector 0: sig %x %x (expect 55 aa)\n",
-                (unsigned int)dma_buf[510], (unsigned int)dma_buf[511]);
-        kprintf("First 4 bytes: %x %x %x %x\n",
-                (unsigned int)dma_buf[0], (unsigned int)dma_buf[1],
-                (unsigned int)dma_buf[2], (unsigned int)dma_buf[3]);
-    } else {
-        kprintf("DMA read FAILED\n");
+    // ============================================================
+    //  BLOCK LAYER TEST
+    // ============================================================
+    kprintf("\n=== Block devices ===\n");
+    for (uint32_t i = 0; i < embk_block_count(); i++) {
+        struct embk_block_device *dev = embk_block_get(i);
+        kprintf("  %s: %u blocks (%u KB)\n",
+                dev->name,
+                (unsigned int)dev->block_count,
+                (unsigned int)((dev->block_count * dev->block_size) / 1024));
     }
 
-    // Read boot sector from drive 0 (boot disk)
-    uint8_t sector[512];
-    if (ata_read_sectors(0, 0, 1, sector) == 0) {
-        kprintf("Drive 0 sector 0: sig %x %x\n",
-                (unsigned int)sector[510], (unsigned int)sector[511]);
-    }
-
-    // Test DMA write + read on data disk (drive 1)
-    if (ata_drive_count() > 1) {
-        static uint8_t dma_wbuf[512] __attribute__((aligned(4)));
-        static uint8_t dma_rbuf[512] __attribute__((aligned(4)));
-        for (int i = 0; i < 512; i++) dma_wbuf[i] = (uint8_t)(0xA0 + (i & 0x1F));
-
-        kprintf("Testing DMA write+read...\n");
-        int w = ata_write_dma(1, 200, 1, dma_wbuf);
-        int r = ata_read_dma(1, 200, 1, dma_rbuf);
-
-        if (w == 0 && r == 0) {
-            bool match = true;
-            for (int i = 0; i < 512; i++) {
-                if (dma_wbuf[i] != dma_rbuf[i]) { match = false; break; }
-            }
-            kprintf("DMA write+read test: %s\n", match ? "PASS" : "FAIL");
+    // Read sector 0 of sda through the GENERIC interface (don't care which driver)
+    struct embk_block_device *sda = embk_block_get_by_name("sda");
+    if (sda) {
+        static uint8_t buf[512] __attribute__((aligned(4)));
+        int ret = embk_block_read(sda, 0, 1, buf);
+        if (ret == EMBK_OK) {
+            kprintf("sda sector 0 via block layer: sig %x %x (expect 55 aa)\n",
+                    (unsigned int)buf[510], (unsigned int)buf[511]);
         } else {
-            kprintf("DMA write/read failed (w=%d r=%d)\n", w, r);
+            kprintf("sda read failed: %s\n", embk_strerror(ret));
         }
     }
 
-    // Test write+read on the data disk (drive 1) if present
-    if (ata_drive_count() > 1) {
-        uint8_t wbuf[512], rbuf[512];
-        for (int i = 0; i < 512; i++) wbuf[i] = (uint8_t)(i & 0xFF);
+    // Write+read round-trip on the AHCI disk THROUGH THE BLOCK LAYER.
+    // sdc = third device = AHCI disk (sda/sdb are the two IDE drives).
+    struct embk_block_device *sdc = embk_block_get_by_name("sdc");
+    if (sdc) {
+        static uint8_t wbuf[512] __attribute__((aligned(4)));
+        static uint8_t rbuf[512] __attribute__((aligned(4)));
+        const char *msg = "WRITTEN VIA EMBK BLOCK LAYER";
+        for (int i = 0; i < 512; i++) wbuf[i] = 0;
+        for (int i = 0; msg[i]; i++) wbuf[i] = (uint8_t)msg[i];
 
-        if (ata_write_sectors(1, 100, 1, wbuf) == 0 &&
-            ata_read_sectors(1, 100, 1, rbuf) == 0) {
-            // Verify
+        int wr = embk_block_write(sdc, 50, 1, wbuf);
+        int rd = embk_block_read(sdc, 50, 1, rbuf);
+        if (wr == EMBK_OK && rd == EMBK_OK) {
             bool match = true;
             for (int i = 0; i < 512; i++) {
                 if (wbuf[i] != rbuf[i]) { match = false; break; }
             }
-            kprintf("Data disk write/read test: %s\n", match ? "PASS" : "FAIL");
-            
+            kprintf("Block-layer write+read on %s: %s\n",
+                    sdc->name, match ? "PASS" : "FAIL");
+        } else {
+            kprintf("Block-layer w/r failed: write=%s read=%s\n",
+                    embk_strerror(wr), embk_strerror(rd));
         }
     }
-    
-    
-    fb_clear(0, 0, 64);   // dark blue screen — if you see this, framebuffer works
-    kprintf("Helios — framebuffer alive\n");
-    //timer_init();
-   
+    // ============================================================
 
-     // DON'T call timer_init() — replaced by LAPIC timer
-    lapic_timer_init(48);
+    kprintf("\nEmBlink OS ready.\n");
 
-    
-
-    // fully mask the PIC 8259A interrupt controllers
-    outb(PIC1_DATA, 0xFF);
-    outb(PIC2_DATA, 0xFF);
-
-    
-
-
-
-    // Verify LAPIC timer is ticking
-    kprintf("Waiting for LAPIC timer ticks...\n");
-    extern uint64_t lapic_timer_get_ticks(void);
+    // Main loop: keyboard echo + LAPIC tick heartbeat
     uint64_t last = 0;
     for (;;) {
         uint64_t now = lapic_timer_get_ticks();
-        if (now >= last + 100) {   // every ~1 sec at 100 Hz
-            kprintf("LAPIC tick %u\n", (unsigned int)now);
+        if (now >= last + 500) {   // heartbeat every ~5s (quieter than before)
             last = now;
         }
-        // also echo keyboard
         if (keyboard_has_char()) {
             kprintf("%c", keyboard_getchar());
         }
