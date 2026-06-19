@@ -127,6 +127,15 @@ void kernel_main(void) {
 
     kprintf("\nEmBlink OS ready.\n");
 
+    char tbuf[64];
+    int n = snprintf(tbuf, sizeof(tbuf), "sd%c %d blocks @ %p", 'a', 2048, (void*)0x1000);
+    kprintf("snprintf -> \"%s\" (len %d)\n", tbuf, n);
+
+    // truncation test: tiny buffer
+    char small[8];
+    int n2 = snprintf(small, sizeof(small), "abcdefghijklmnop");
+    kprintf("trunc -> \"%s\" (would-be len %d)\n", small, n2);
+
     // Main loop: keyboard echo + LAPIC tick heartbeat
     uint64_t last = 0;
     for (;;) {

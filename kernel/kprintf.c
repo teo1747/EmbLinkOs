@@ -1,26 +1,57 @@
 #include "include/kprintf.h"
-#include "drivers/console.h"
+#include "drivers/serial.h"
 #include <stdint.h>
+#include "include/types.h"   // for size_t
 
 
 // GCC built-in variadic types
-
-typedef __builtin_va_list va_list ;
+typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
-#define va_arg(ap, type) __builtin_va_arg(ap, type)
-#define va_end(ap) __builtin_va_end(ap)
+#define va_arg(ap, type)   __builtin_va_arg(ap, type)
+#define va_end(ap)         __builtin_va_end(ap)
 
 
-// Number to string conversion
+// ============================================================
+//  Output sink: an abstraction over "where do characters go"
+// ============================================================
+// The core formatter calls sink->put(sink, c) for every character.
+// kprintf uses a sink that writes to serial; snprintf uses one that
+// writes to a bounded buffer. Format logic is written ONCE.
 
-static void print_unsigned(uint64_t value, uint8_t base, uint8_t width, uint8_t pad_zero, uint8_t uppercase)
-{
+struct out_sink {
+    void (*put)(struct out_sink *s, char c);
+    // buffer-specific fields (unused by the serial sink)
+    char  *buf;
+    size_t size;     // total buffer size
+    size_t pos;      // next write index
+    size_t written;  // total chars the format produced (for return value)
+};
+
+// Serial sink: write straight to COM1
+static void sink_serial_put(struct out_sink *s, char c) {
+    serial_write_char(c);
+    s->written++;
+}
+
+// Buffer sink: write to buf if room remains (always leave space for '\0')
+static void sink_buffer_put(struct out_sink *s, char c) {
+    if (s->pos + 1 < s->size) {   // +1 keeps room for the null terminator
+        s->buf[s->pos++] = c;
+    }
+    s->written++;   // count even when truncated (standard snprintf semantics)
+}
+
+
+// ============================================================
+//  Number formatting helpers (write through the sink)
+// ============================================================
+
+static void emit_unsigned(struct out_sink *s, uint64_t value, uint8_t base,
+                          uint8_t width, uint8_t pad_zero, uint8_t uppercase) {
     char buffer[32];
     int i = 0;
-    const char *digits_lower =  "0123456789abcdef";
-    const char *digits_upper =  "0123456789ABCDEF";
-    const char *digits = (uppercase)? digits_upper : digits_lower;
-    
+    const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
+
     if (value == 0) {
         buffer[i++] = '0';
     } else {
@@ -29,266 +60,155 @@ static void print_unsigned(uint64_t value, uint8_t base, uint8_t width, uint8_t 
             value /= base;
         }
     }
-    
-    // padding
+
+    // padding to width
     while (width > i) {
-      buffer[i++] = (pad_zero)? '0' :' ';
+        s->put(s, pad_zero ? '0' : ' ');
+        width--;
     }
 
-    // Output in reverse order
+    // digits in reverse
     while (i > 0) {
-        console_putchar(buffer[--i]);
+        s->put(s, buffer[--i]);
     }
 }
 
-static void print_signed(int64_t value, uint8_t width, uint8_t pad_zero) {
+static void emit_signed(struct out_sink *s, int64_t value,
+                        uint8_t width, uint8_t pad_zero) {
     if (value < 0) {
-        console_putchar('-');
+        s->put(s, '-');
         value = -value;
         if (width > 0) width--;
     }
-    print_unsigned((uint64_t)value, 10, width, pad_zero, 0);
+    emit_unsigned(s, (uint64_t)value, 10, width, pad_zero, 0);
 }
 
-// Printing functions
 
-void kprintf(const char *fmt,...)
-{
-    va_list arg;
-    va_start(arg, fmt);
+// ============================================================
+//  The ONE core formatter — used by both kprintf and snprintf
+// ============================================================
+
+static void format_string(struct out_sink *s, const char *fmt, va_list arg) {
     while (*fmt) {
         if (*fmt != '%') {
-        console_putchar(*fmt++);   // print normal char
-        continue;
-    }
-    
-        
-        fmt++; // skip %
+            s->put(s, *fmt++);
+            continue;
+        }
 
-        //parse widht and padding
-        uint8_t width = 0;
+        fmt++; // skip '%'
+
+        // parse zero-pad flag
         uint8_t pad_zero = 0;
         if (*fmt == '0') {
             pad_zero = 1;
             fmt++;
         }
 
+        // parse width
+        uint8_t width = 0;
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
 
-        // parse length modifier
+        // parse length modifier (l, ll)
         int is_long = 0;
         if (*fmt == 'l') {
             is_long = 1;
             fmt++;
             if (*fmt == 'l') {
-                fmt++;  // accept 'll' as well in 64-bit mode
+                fmt++;   // accept 'll' too (same as 'l' in 64-bit)
             }
         }
 
-        // parse type
+        // parse conversion
         switch (*fmt) {
             case 'd':
             case 'i': {
-                int64_t value = (is_long) ? va_arg(arg, int64_t) : va_arg(arg, int);
-                print_signed(value, width, pad_zero);
+                int64_t value = is_long ? va_arg(arg, int64_t) : va_arg(arg, int);
+                emit_signed(s, value, width, pad_zero);
                 break;
             }
             case 'u': {
-                uint64_t value = (is_long) ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
-                print_unsigned(value, 10, width, pad_zero, 0);
+                uint64_t value = is_long ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
+                emit_unsigned(s, value, 10, width, pad_zero, 0);
                 break;
             }
             case 'x': {
-                uint64_t value = (is_long) ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
-                print_unsigned(value, 16, width, pad_zero, 0);
+                uint64_t value = is_long ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
+                emit_unsigned(s, value, 16, width, pad_zero, 0);
                 break;
             }
             case 'X': {
-                uint64_t value = (is_long) ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
-                print_unsigned(value, 16, width, pad_zero, 1);
+                uint64_t value = is_long ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
+                emit_unsigned(s, value, 16, width, pad_zero, 1);
                 break;
             }
             case 'c': {
                 char value = (char)va_arg(arg, int);
-                console_putchar(value);
+                s->put(s, value);
                 break;
             }
             case 'p': {
                 uint64_t value = (uint64_t)va_arg(arg, void *);
-                console_write("0x");
-                print_unsigned(value, 16, 16, 1, 0);   // pad with zeros to 16 chars
+                s->put(s, '0');
+                s->put(s, 'x');
+                emit_unsigned(s, value, 16, 16, 1, 0);   // 16 hex digits, zero-padded
                 break;
             }
             case 's': {
-                const char *string = va_arg(arg,const char*);
-                if (!string) {
-                    string = "(null)";
-                }
-                while (*string) {
-                    console_putchar(*string++);
-                }
-                break;
-            }
-            case '%':
-                console_putchar('%');
-                break;
-            default: {
-                console_putchar('?');
-                break;
-            }
-        }
-        fmt++;
-    }
-    va_end(arg);
-}
-
-void snprintf(char *buffer, size_t size, const char *fmt, ...) {
-    va_list arg;
-    va_start(arg, fmt);
-    size_t i = 0;
-    while (*fmt && i < size - 1) {
-        if (*fmt != '%') {
-            buffer[i++] = *fmt++;
-            continue;
-        }
-        fmt++; // skip %
-
-        //parse widht and padding
-        uint8_t width = 0;
-        uint8_t pad_zero = 0;
-        if (*fmt == '0') {
-            pad_zero = 1;
-            fmt++;
-        }
-
-        while (*fmt >= '0' && *fmt <= '9') {
-            width = width * 10 + (*fmt - '0');
-            fmt++;
-        }
-
-        // parse length modifier
-        int is_long = 0;
-        if (*fmt == 'l') {
-            is_long = 1;
-            fmt++;
-            if (*fmt == 'l') {
-                fmt++;  // accept 'll' as well in 64-bit mode
-            }
-        }
-
-        // parse type
-        switch (*fmt) {
-            case 'd':
-            case 'i': {
-                int64_t value = (is_long) ? va_arg(arg, int64_t) : va_arg(arg, int);
-                // Convert to string and copy to buffer
-                char num_buffer[32];
-                int num_len = 0;
-                if (value < 0) {
-                    buffer[i++] = '-';
-                    value = -value;
-                    if (width > 0) width--;
-                }
-                do {
-                    num_buffer[num_len++] = '0' + (value % 10);
-                    value /= 10;
-                } while (value > 0);
-                while (width > num_len) {   
-                    buffer[i++] = (pad_zero) ? '0' : ' ';
-                    width--;
-                }
-                while (num_len > 0 && i < size - 1) {
-                    buffer[i++] = num_buffer[--num_len];
-                }
-                break;
-            }
-            case 'u': {
-                uint64_t value = (is_long) ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
-                char num_buffer[32];
-                int num_len = 0;
-                do {
-                    num_buffer[num_len++] = '0' + (value % 10);
-                    value /= 10;
-                } while (value > 0);
-                while (width > num_len) {
-                    buffer[i++] = (pad_zero) ? '0' : ' ';
-                    width--;
-                }
-                while (num_len > 0 && i < size - 1) {           
-                    buffer[i++] = num_buffer[--num_len];
-                }
-                break;
-            }
-            case 'x':
-            case 'X': {
-                uint64_t value = (is_long) ? va_arg(arg, uint64_t) : va_arg(arg, unsigned int);
-                char num_buffer[32];
-                int num_len = 0;
-                const char *digits = (*fmt == 'X') ? "0123456789ABC     DEF" : "0123456789abcdef";
-                do {
-                    num_buffer[num_len++] = digits[value % 16];
-                    value /= 16;
-                } while (value > 0);
-                while (width > num_len) {
-                    buffer[i++] = (pad_zero) ? '0' : ' ';
-                    width--;
-                }
-                while (num_len > 0 && i < size - 1) {
-                    buffer[i++] = num_buffer[--num_len];
-                }
-                break;
-            }
-            case 'c': {
-                char value = (char)va_arg(arg, int);
-                buffer[i++] = value;
-                break;
-            }
-            case 'p': {
-                uint64_t value = (uint64_t)va_arg(arg, void *);
-                buffer[i++] = '0';;
-                buffer[i++] = 'x';
-                char num_buffer[32];
-                int num_len = 0;
-                do {    
-                    num_buffer[num_len++] = "0123456789abcdef"[value % 16];
-                    value /= 16;
-                } while (value > 0);
-                while (num_len < 16) { // pad to 16 chars
-                    num_buffer[num_len++] = '0';
-                }
-                while (num_len > 0 && i < size - 1) {
-                    buffer[i++] = num_buffer[--num_len];
-                }
-                break;
-            }
-            case 's': {             
                 const char *string = va_arg(arg, const char *);
                 if (!string) {
                     string = "(null)";
                 }
-                while (*string && i < size - 1) {
-                    buffer[i++] = *string++;
+                while (*string) {
+                    s->put(s, *string++);
                 }
                 break;
             }
             case '%':
-                buffer[i++] = '%';
+                s->put(s, '%');
                 break;
             default:
-                buffer[i++] = '?';
+                s->put(s, '?');
                 break;
         }
         fmt++;
     }
-    buffer[i] = '\0'; // Null-terminate the string
+}
+
+
+// ============================================================
+//  Public API — thin wrappers over the core
+// ============================================================
+
+void kprintf(const char *fmt, ...) {
+    struct out_sink s = { .put = sink_serial_put, .written = 0 };
+    va_list arg;
+    va_start(arg, fmt);
+    format_string(&s, fmt, arg);
     va_end(arg);
-}       
+}
 
+int snprintf(char *buffer, size_t size, const char *fmt, ...) {
+    if (size == 0) {
+        return 0;   // can't even write a null terminator; report nothing written
+    }
 
+    struct out_sink s = {
+        .put     = sink_buffer_put,
+        .buf     = buffer,
+        .size    = size,
+        .pos     = 0,
+        .written = 0,
+    };
 
+    va_list arg;
+    va_start(arg, fmt);
+    format_string(&s, fmt, arg);
+    va_end(arg);
 
+    buffer[s.pos] = '\0';   // always null-terminate (pos < size guaranteed)
 
-
+    return (int)s.written;   // chars that WOULD have been written (standard)
+}
