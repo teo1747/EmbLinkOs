@@ -53,6 +53,7 @@ struct ahci_port_info {
     uint32_t signature;  // Port signature (PxSIG)
     uint8_t  det;  // Device detection status (SSTS det)
     bool present;  // Port is present
+    uint64_t sectors;
 };
 
 // === AHCI Packed structures ===
@@ -149,6 +150,8 @@ bool ahci_read_sectors(uint8_t port_num, uint64_t lba, uint16_t count, void *buf
 bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const void *buffer);
 // Initialize AHCI controller: Discover, map ABAR, enumerate ports
 void ahci_init(void);
+
+void ahci_register_block_devices(void);
 
 
 #endif /* __AHCI_H__ */
