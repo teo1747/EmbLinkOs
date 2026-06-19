@@ -136,6 +136,7 @@ void kernel_main(void) {
     int n2 = snprintf(small, sizeof(small), "abcdefghijklmnop");
     kprintf("trunc -> \"%s\" (would-be len %d)\n", small, n2);
 
+
     // Main loop: keyboard echo + LAPIC tick heartbeat
     uint64_t last = 0;
     for (;;) {
