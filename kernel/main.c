@@ -27,6 +27,7 @@
 
 #include "acpi/acpi.h"
 #include "block/block.h"
+#include "fs/fat32.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
@@ -74,8 +75,8 @@ void kernel_main(void) {
     // --- Boot splash ---
     boot_animation();
 
-    // ============================================================
-    //  BLOCK LAYER TEST
+// ============================================================
+    //  Block device enumeration
     // ============================================================
     kprintf("\n=== Block devices ===\n");
     for (uint32_t i = 0; i < embk_block_count(); i++) {
@@ -86,64 +87,29 @@ void kernel_main(void) {
                 (unsigned int)((dev->block_count * dev->block_size) / 1024));
     }
 
-    // Read sector 0 of sda through the GENERIC interface (don't care which driver)
-    struct embk_block_device *sda = embk_block_get_by_name("sda");
-    if (sda) {
-        static uint8_t buf[512] __attribute__((aligned(4)));
-        int ret = embk_block_read(sda, 0, 1, buf);
-        if (ret == EMBK_OK) {
-            kprintf("sda sector 0 via block layer: sig %x %x (expect 55 aa)\n",
-                    (unsigned int)buf[510], (unsigned int)buf[511]);
-        } else {
-            kprintf("sda read failed: %s\n", embk_strerror(ret));
-        }
-    }
-
-    // Write+read round-trip on the AHCI disk THROUGH THE BLOCK LAYER.
-    // sdc = third device = AHCI disk (sda/sdb are the two IDE drives).
-    struct embk_block_device *sdc = embk_block_get_by_name("sdc");
-    if (sdc) {
-        static uint8_t wbuf[512] __attribute__((aligned(4)));
-        static uint8_t rbuf[512] __attribute__((aligned(4)));
-        const char *msg = "WRITTEN VIA EMBK BLOCK LAYER";
-        for (int i = 0; i < 512; i++) wbuf[i] = 0;
-        for (int i = 0; msg[i]; i++) wbuf[i] = (uint8_t)msg[i];
-
-        int wr = embk_block_write(sdc, 50, 1, wbuf);
-        int rd = embk_block_read(sdc, 50, 1, rbuf);
-        if (wr == EMBK_OK && rd == EMBK_OK) {
-            bool match = true;
-            for (int i = 0; i < 512; i++) {
-                if (wbuf[i] != rbuf[i]) { match = false; break; }
-            }
-            kprintf("Block-layer write+read on %s: %s\n",
-                    sdc->name, match ? "PASS" : "FAIL");
-        } else {
-            kprintf("Block-layer w/r failed: write=%s read=%s\n",
-                    embk_strerror(wr), embk_strerror(rd));
-        }
-    }
     // ============================================================
+    //  Mount FAT32 (probe every disk, mount the first valid one)
+    // ============================================================
+    static struct fat32_volume vol;
+    bool found = false;
+    for (uint32_t i = 0; i < embk_block_count(); i++) {
+        struct embk_block_device *d = embk_block_get(i);
+        if (fat32_mount(d, &vol) == EMBK_OK) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        kprintf("No FAT32 volume found on any disk\n");
+    }
 
-    kprintf("\nEmBlink OS ready.\n");
+    kprintf("\nEmbLink OS ready.\n");
 
-    char tbuf[64];
-    int n = snprintf(tbuf, sizeof(tbuf), "sd%c %d blocks @ %p", 'a', 2048, (void*)0x1000);
-    kprintf("snprintf -> \"%s\" (len %d)\n", tbuf, n);
-
-    // truncation test: tiny buffer
-    char small[8];
-    int n2 = snprintf(small, sizeof(small), "abcdefghijklmnop");
-    kprintf("trunc -> \"%s\" (would-be len %d)\n", small, n2);
-
-
-    // Main loop: keyboard echo + LAPIC tick heartbeat
+    // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;
     for (;;) {
         uint64_t now = lapic_timer_get_ticks();
-        if (now >= last + 500) {   // heartbeat every ~5s (quieter than before)
-            last = now;
-        }
+        if (now >= last + 500) { last = now; }
         if (keyboard_has_char()) {
             kprintf("%c", keyboard_getchar());
         }
