@@ -39,6 +39,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
              kernel/mm/kheap.c \
+             kernel/fs/fat32.c \
              kernel/kstring.c \
              kernel/errno.c \
              kernel/kprintf.c
@@ -82,6 +83,13 @@ $(DISK):
 ahci.img:
 	dd if=/dev/zero of=ahci.img bs=1M count=64
 
+fat32.img:
+	dd if=/dev/zero of=fat32.img bs=1M count=64
+	mkfs.vfat -F 32 -n EMBLINK fat32.img
+	echo "Hello from EmbLink filesystem!" > /tmp/hello.txt
+	mcopy -i fat32.img /tmp/hello.txt ::HELLO.TXT
+
+
 run-ahci: $(IMG) $(DISK) ahci.img
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
@@ -89,6 +97,13 @@ run-ahci: $(IMG) $(DISK) ahci.img
 	    -device ahci,id=ahci0 \
 	    -drive id=satadisk,file=ahci.img,format=raw,if=none \
 	    -device ide-hd,drive=satadisk,bus=ahci0.0 \
+	    -serial stdio -no-reboot -no-shutdown
+
+run-fat: $(IMG) $(DISK) fat32.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=$(DISK),if=ide,index=1 \
+	    -drive format=raw,file=fat32.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 
 run: $(IMG) $(DISK)
@@ -106,7 +121,15 @@ run-bigmem: $(IMG) $(DISK)
 run-kvm: $(IMG) $(DISK)
 	qemu-system-x86_64 -enable-kvm -cpu host -smp 4 $(DRIVES) -serial stdio -no-reboot -no-shutdown
 
+run-all: $(IMG) ahci.img fat32.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=fat32.img,if=ide,index=1 \
+	    -device ahci,id=ahci0 \
+	    -drive id=satadisk,file=ahci.img,format=raw,if=none \
+	    -device ide-hd,drive=satadisk,bus=ahci0.0 \
+	    -serial stdio -no-reboot -no-shutdown
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) $(ISR_OBJ)
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci
+.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all
