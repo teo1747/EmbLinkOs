@@ -32,6 +32,59 @@
 
 extern uint64_t lapic_timer_get_ticks(void);
 
+static void fat32_read_path(struct fat32_volume *vol, const char *path, uint8_t *buffer, uint32_t buffer_size) {
+    int n = fat32_read(vol, path, buffer, buffer_size - 1);
+    if (n >= 0) {
+        buffer[n] = '\0';
+        kprintf("READ %s: %d bytes\n%s\n", path, n, buffer);
+    } else {
+        kprintf("READ %s failed: %s\n", path, embk_strerror(n));
+    }
+}
+
+static void fat32_write_path(struct fat32_volume *vol, const char *path,
+                             const char *content) {
+    uint32_t len = 0;
+    while (content[len]) {
+        len++;
+    }
+    int rc = fat32_write(vol, path, (const uint8_t *)content, len);
+    if (rc >= 0) {
+        kprintf("WROTE %s: %d bytes\n", path, rc);
+    } else {
+        kprintf("WRITE %s failed: %s\n", path, embk_strerror(rc));
+    }
+}
+
+static void fat32_test_all(struct fat32_volume *vol) {
+    static uint8_t buffer[512];
+
+    kprintf("\n=== FAT32 TEST SUITE ===\n");
+    fat32_list_root(vol);
+
+    fat32_read_path(vol, "HELLO.TXT", buffer, sizeof(buffer));
+    fat32_read_path(vol, "/SUBDIR/INSIDE.TXT", buffer, sizeof(buffer));
+
+    fat32_write_path(vol, "/NEWFILE.TXT", "This is a new file written by test.");
+    fat32_read_path(vol, "/NEWFILE.TXT", buffer, sizeof(buffer));
+
+    int rc = fat32_mkdir(vol, "/TESTDIR");
+    if (rc == EMBK_OK) {
+        kprintf("MKDIR /TESTDIR succeeded\n");
+    } else if (rc == -EMBK_EEXIST) {
+        kprintf("MKDIR /TESTDIR skipped: already exists\n");
+    } else {
+        kprintf("MKDIR /TESTDIR failed: %s\n", embk_strerror(rc));
+    }
+
+    fat32_write_path(vol, "/TESTDIR/INNER.TXT", "Inside test dir file.");
+    fat32_read_path(vol, "/TESTDIR/INNER.TXT", buffer, sizeof(buffer));
+
+    fat32_write_path(vol, "/LONG NAME EXAMPLE.TXT", "Long filename test content.");
+    fat32_read_path(vol, "/LONG NAME EXAMPLE.TXT", buffer, sizeof(buffer));
+
+    kprintf("=== FAT32 TEST SUITE COMPLETE ===\n");
+}
 
 void kernel_main(void) {
     // --- Core init ---
@@ -101,49 +154,9 @@ void kernel_main(void) {
     }
     if (!found) {
         kprintf("No FAT32 volume found on any disk\n");
-    }
-
-
-    if (found) {
-        fat32_list_root(&vol);
-
-        static uint8_t filebuf[512];
-        int n = fat32_read(&vol, "HELLO.TXT", filebuf, sizeof(filebuf) - 1);
-        if (n >= 0) {
-            filebuf[n] = '\0';
-            kprintf("\n=== HELLO.TXT (%d bytes) ===\n%s\n", n, (char *)filebuf);
-        } else {
-            kprintf("Failed to read HELLO.TXT: %s\n", embk_strerror(n));
-        }
-    }
-
-    static uint8_t pbuf[512];
-    int pn = fat32_read(&vol, "/SUBDIR/INSIDE.TXT", pbuf, sizeof(pbuf) - 1);
-    if (pn >= 0) {
-        pbuf[pn] = '\0';
-        kprintf("\n=== /SUBDIR/INSIDE.TXT (%d bytes) ===\n%s\n", pn, (char *)pbuf);
     } else {
-        kprintf("path read failed: %s\n", embk_strerror(pn));
+        fat32_test_all(&vol);
     }
-
-    // WRITE TEST — create a new file
-    const char *content = "Written by EmbLink to a real disk!";
-    int wn = fat32_write(&vol, "/NEWFILE.TXT", (const uint8_t *)content, 34);
-    if (wn >= 0) {
-        kprintf("\nWrote NEWFILE.TXT: %d bytes\n", wn);
-    } else {
-        kprintf("\nWrite failed: %s\n", embk_strerror(wn));
-    }
-
-    // Read it back THROUGH EMBLINK to confirm round-trip
-    static uint8_t vbuf[512];
-    int vn = fat32_read(&vol, "/NEWFILE.TXT", vbuf, sizeof(vbuf) - 1);
-    if (vn >= 0) {
-        vbuf[vn] = '\0';
-        kprintf("Read back NEWFILE.TXT (%d bytes): %s\n", vn, (char *)vbuf);
-    }
-
-    kprintf("\nEmbLink OS ready.\n");
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;
