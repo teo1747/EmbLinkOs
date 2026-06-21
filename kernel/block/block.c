@@ -103,7 +103,7 @@ int embk_block_read(struct embk_block_device *dev,
         uint32_t chunk = (count > max_blocks) ? max_blocks : count;
         int rc = dev->read(dev, lba, chunk, block_bounce);
         if (rc != EMBK_OK) return rc;
-        memcpy(dst, block_bounce, chunk * dev->block_size);
+        memcpy(dst, block_bounce, (size_t)chunk * (size_t)dev->block_size);
         lba   += chunk;
         count -= chunk;
         dst   += chunk * dev->block_size;
