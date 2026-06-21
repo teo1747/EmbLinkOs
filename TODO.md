@@ -144,6 +144,11 @@ left to do.
   (the path wasn't exercised yet); else cast to uint64_t / unsigned int.
 - [ ] No partition support — devices are whole disks (sda, sdb…). Partition
   naming convention (sdaN) needed once we parse partition tables / MBR/GPT.
+- [ ] Block-layer reads/writes on IDE secondary channel hang — DMA + IRQ
+  are only wired for the primary channel (IRQ 14, primary BMIDE base).
+  Secondary needs IRQ 15 + BMIDE offset 0x08 + per-channel state. Until
+  then, mountable disks must be on IDE primary or AHCI. (FAT32 test disk
+  is on IDE primary slave = sdb for this reason.)
 
 ---
 

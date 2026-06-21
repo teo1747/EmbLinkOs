@@ -35,7 +35,13 @@ struct embk_block_device {
 
     // Driver-specific data (e.g., ATA drive info, etc.)
     void *driver_data;
+
+    // DMA constraints (filled by the driver at registration)
+    uint64_t dma_max_phys;   // highest physical address the controller can DMA to
+                             // (e.g. 0xFFFFFFFF for 32-bit ATA, UINT64_MAX for 64-bit AHCI)
+    bool needs_kernel_range;  // true if buffer must be KV2P-able (both, for now)
 };
+
 
 
 // Register a block device with the layer. The layer assigns the next
