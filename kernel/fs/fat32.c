@@ -120,38 +120,555 @@ static uint32_t cluster_to_sector(struct fat32_volume *vol, uint32_t cluster) {
     return vol->data_start_sector + (cluster - 2) * vol->sectors_per_cluster;
 }
 
-// Read the FAT entry for `cluster` - i.e. The next cluster in the chain.
-// Returns the next cluster number (low 28 bits), or a value >= FAT32_EOC_MIN
-// if this is the end of the chain. Returns 0 on read error (caller should
-// treat 0 / errors carefully - 0 is also "free", but you won't be walking a free cluster chain).
+// Get the next cluster in a chain. Wraps fat32_read_fat_entry (which
+// correctly handles the byte-offset within the FAT sector). Returns the
+// next cluster, or a value >= FAT32_EOC_MIN for end-of-chain, or 0 on error.
 static uint32_t fat_get_next_cluster(struct fat32_volume *vol, uint32_t cluster) {
-    // 1. byte offset of this entry within the entire FAT region
-    uint32_t fat_offset = cluster * 4; // 4 bytes per entry
-
-    // 2. wich sector of the FAT, and byte offset within the FAT region
-    uint32_t fat_sector = vol->fat_start_sector + (fat_offset / vol->bytes_per_sector);
-    uint32_t offset_in_sector = fat_offset % vol->bytes_per_sector;
-
-    // 3. read the entry from the disk
-    static uint8_t fatbuf[4] __attribute__((aligned(4)));
-
-    int rc = embk_block_read(vol->dev, fat_sector, 1, fatbuf);
+    uint32_t next = 0;
+    int rc = fat32_read_fat_entry(vol, cluster, &next);
     if (rc != EMBK_OK) {
-        kprintf("FAT32: failed to read FAT entry %u: %s\n", cluster, embk_strerror(rc));
-        return 0;
+        return 0;   // error — caller treats 0 as broken chain
+    }
+    return next;
+}
+
+static uint32_t fat32_cluster_count(struct fat32_volume *vol) {
+    uint32_t data_sectors = vol->total_sectors - vol->data_start_sector;
+    return data_sectors / vol->sectors_per_cluster;
+}
+
+static bool fat32_valid_cluster(struct fat32_volume *vol, uint32_t cluster) {
+    if (!vol) {
+        return false;
+    }
+    if (cluster < 2) {
+        return false;
+    }
+    uint32_t max_cluster = fat32_cluster_count(vol) + 1;
+    return cluster <= max_cluster;
+}
+
+static int fat32_read_fat_entry(struct fat32_volume *vol, uint32_t cluster,
+                                uint32_t *out_value) {
+    if (!fat32_valid_cluster(vol, cluster)) {
+        return -EMBK_EINVAL;
     }
 
-    // 4. extract the 4 byte little-endian value at offset_in_sector
-    uint32_t entry = (fatbuf[0]) | (fatbuf[1] << 8) | (fatbuf[2] << 16) | ((uint32_t)fatbuf[3] << 24);
+    uint32_t fat_offset = cluster * 4;
+    uint32_t sector_index = fat_offset / vol->bytes_per_sector;
+    uint32_t offset_in_sector = fat_offset % vol->bytes_per_sector;
+    uint32_t fat_sector = vol->fat_start_sector + sector_index;
+    uint32_t sectors = (offset_in_sector <= vol->bytes_per_sector - 4) ? 1 : 2;
 
-    // 5. mask out the high 4 bits (0x0F) to get the actual cluster number
-    uint32_t next_cluster = entry & FAT32_ENTRY_MASK;
-
-    if (next_cluster >= FAT32_EOC_MIN) {
-        return next_cluster;
+    uint8_t fatbuf[1024] __attribute__((aligned(4)));
+    int rc = embk_block_read(vol->dev, fat_sector, sectors, fatbuf);
+    if (rc != EMBK_OK) {
+        return rc;
     }
 
-    return next_cluster;
+    uint32_t value = fatbuf[offset_in_sector] |
+                     (fatbuf[offset_in_sector + 1] << 8) |
+                     (fatbuf[offset_in_sector + 2] << 16) |
+                     ((uint32_t)fatbuf[offset_in_sector + 3] << 24);
+    if (out_value) {
+        *out_value = value & FAT32_ENTRY_MASK;
+    }
+    return EMBK_OK;
+}
+
+static int fat32_write_fat_entry(struct fat32_volume *vol, uint32_t cluster,
+                                 uint32_t value) {
+    if (!fat32_valid_cluster(vol, cluster)) {
+        return -EMBK_EINVAL;
+    }
+
+    uint32_t fat_offset = cluster * 4;
+    uint32_t sector_index = fat_offset / vol->bytes_per_sector;
+    uint32_t offset_in_sector = fat_offset % vol->bytes_per_sector;
+    uint32_t sectors = (offset_in_sector <= vol->bytes_per_sector - 4) ? 1 : 2;
+    uint32_t masked_value = value & FAT32_ENTRY_MASK;
+
+    uint8_t fatbuf[1024] __attribute__((aligned(4)));
+
+    for (uint8_t fat = 0; fat < vol->num_fats; fat++) {
+        uint32_t fat_sector = vol->fat_start_sector + fat * vol->sectors_per_fat + sector_index;
+        int rc = embk_block_read(vol->dev, fat_sector, sectors, fatbuf);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        fatbuf[offset_in_sector] = (uint8_t)(masked_value & 0xFF);
+        fatbuf[offset_in_sector + 1] = (uint8_t)((masked_value >> 8) & 0xFF);
+        fatbuf[offset_in_sector + 2] = (uint8_t)((masked_value >> 16) & 0xFF);
+        fatbuf[offset_in_sector + 3] = (uint8_t)((masked_value >> 24) & 0xFF);
+
+        rc = embk_block_write(vol->dev, fat_sector, sectors, fatbuf);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+    }
+
+    return EMBK_OK;
+}
+
+// Update the FSInfo sector (sector 1) free-cluster count and optional
+// next-free hint. `delta_free` is added to the current free count
+// (positive to increase, negative to decrease). If `set_next` is true,
+// `next_free_hint` is written to the FSInfo next-free field.
+static int fat32_update_fsinfo_delta(struct fat32_volume *vol,
+                                     int32_t delta_free,
+                                     uint32_t next_free_hint,
+                                     bool set_next) {
+    if (!vol || !vol->dev) return -EMBK_EINVAL;
+
+    uint32_t sector = 1; // FSInfo is at sector 1
+    uint8_t *buf = kmalloc(vol->bytes_per_sector);
+    if (!buf) return -EMBK_ENOMEM;
+
+    int rc = embk_block_read(vol->dev, sector, 1, buf);
+    if (rc != EMBK_OK) {
+        kfree(buf);
+        return rc;
+    }
+
+    // Read current free count (little-endian at offset 0x1E8)
+    uint32_t free_count = (uint32_t)buf[0x1E8] |
+                          ((uint32_t)buf[0x1E9] << 8) |
+                          ((uint32_t)buf[0x1EA] << 16) |
+                          ((uint32_t)buf[0x1EB] << 24);
+
+    if (delta_free != 0) {
+        int64_t new_count = (int64_t)free_count + (int64_t)delta_free;
+        if (new_count < 0) new_count = 0;
+        free_count = (uint32_t)new_count;
+
+        buf[0x1E8] = (uint8_t)(free_count & 0xFF);
+        buf[0x1E9] = (uint8_t)((free_count >> 8) & 0xFF);
+        buf[0x1EA] = (uint8_t)((free_count >> 16) & 0xFF);
+        buf[0x1EB] = (uint8_t)((free_count >> 24) & 0xFF);
+    }
+
+    if (set_next) {
+        uint32_t hint = next_free_hint;
+        buf[0x1EC] = (uint8_t)(hint & 0xFF);
+        buf[0x1ED] = (uint8_t)((hint >> 8) & 0xFF);
+        buf[0x1EE] = (uint8_t)((hint >> 16) & 0xFF);
+        buf[0x1EF] = (uint8_t)((hint >> 24) & 0xFF);
+    }
+
+    rc = embk_block_write(vol->dev, sector, 1, buf);
+    if (rc != EMBK_OK) {
+        kfree(buf);
+        return rc;
+    }
+
+    kfree(buf);
+    return EMBK_OK;
+}
+
+static int fat32_find_free_cluster(struct fat32_volume *vol, uint32_t start,
+                                   uint32_t *out_cluster) {
+    uint32_t cluster_count = fat32_cluster_count(vol);
+    uint32_t max_cluster = cluster_count + 1;
+    if (start < 2) {
+        start = 2;
+    }
+    if (start > max_cluster) {
+        start = 2;
+    }
+
+    for (uint32_t cluster = start; cluster <= max_cluster; cluster++) {
+        uint32_t value;
+        int rc = fat32_read_fat_entry(vol, cluster, &value);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+        if (value == FAT32_FREE) {
+            *out_cluster = cluster;
+            return EMBK_OK;
+        }
+    }
+
+    for (uint32_t cluster = 2; cluster < start; cluster++) {
+        uint32_t value;
+        int rc = fat32_read_fat_entry(vol, cluster, &value);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+        if (value == FAT32_FREE) {
+            *out_cluster = cluster;
+            return EMBK_OK;
+        }
+    }
+
+    return -EMBK_ENOSPC;
+}
+
+static int fat32_alloc_cluster_chain(struct fat32_volume *vol, uint32_t count,
+                                     uint32_t *out_head, uint32_t *out_tail) {
+    if (count == 0) {
+        return -EMBK_EINVAL;
+    }
+
+    uint32_t first = 0;
+    uint32_t prev = 0;
+    uint32_t search_start = 2;
+    uint32_t cluster_count = fat32_cluster_count(vol);
+    uint32_t max_cluster = cluster_count + 1;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t free_cluster;
+        int rc = fat32_find_free_cluster(vol, search_start, &free_cluster);
+        if (rc != EMBK_OK) {
+            if (first) {
+                fat32_free_cluster_chain(vol, first);
+            }
+            return rc;
+        }
+
+        if (!first) {
+            first = free_cluster;
+        }
+
+        if (prev) {
+            rc = fat32_write_fat_entry(vol, prev, free_cluster);
+            if (rc != EMBK_OK) {
+                fat32_free_cluster_chain(vol, first);
+                return rc;
+            }
+        }
+
+        prev = free_cluster;
+        search_start = free_cluster + 1;
+    }
+
+    int rc = fat32_write_fat_entry(vol, prev, FAT32_EOC_MIN);
+    if (rc != EMBK_OK) {
+        fat32_free_cluster_chain(vol, first);
+        return rc;
+    }
+
+    // Update FSInfo: decrease free count by number of allocated clusters,
+    // and set the next-free hint to the cluster just after the last
+    // search start (a reasonable hint). Ignore FSInfo errors.
+    uint32_t next_hint = (search_start <= max_cluster) ? search_start : 2;
+    int rc2 = fat32_update_fsinfo_delta(vol, -((int32_t)count), next_hint, true);
+    if (rc2 != EMBK_OK) {
+        kprintf("FAT32: warning - failed to update FSInfo after alloc: %s\n", embk_strerror(rc2));
+    }
+
+    if (out_head) {
+        *out_head = first;
+    }
+    if (out_tail) {
+        *out_tail = prev;
+    }
+    return EMBK_OK;
+}
+
+static int fat32_free_cluster_chain(struct fat32_volume *vol, uint32_t cluster) {
+    if (!(cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE)) {
+        return EMBK_OK;
+    }
+
+    uint32_t freed_head = cluster;
+    uint32_t freed_count = 0;
+
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        uint32_t next;
+        int rc = fat32_read_fat_entry(vol, cluster, &next);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        rc = fat32_write_fat_entry(vol, cluster, FAT32_FREE);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        freed_count++;
+
+        if (next >= FAT32_EOC_MIN || next == FAT32_FREE) {
+            break;
+        }
+
+        cluster = next;
+    }
+
+    // Update FSInfo: increase free count and set next-free hint to the
+    // first freed cluster. Ignore FSInfo errors.
+    int rc2 = fat32_update_fsinfo_delta(vol, (int32_t)freed_count, freed_head, true);
+    if (rc2 != EMBK_OK) {
+        kprintf("FAT32: warning - failed to update FSInfo after free: %s\n", embk_strerror(rc2));
+    }
+
+    return EMBK_OK;
+}
+
+static int fat32_find_dir_entry_location(struct fat32_volume *vol,
+                                        uint32_t dir_cluster,
+                                        const char *name,
+                                        uint32_t *out_cluster,
+                                        uint32_t *out_index,
+                                        struct fat_dir_entry *out_entry) {
+    char target[11];
+    name_to_fat83(name, target);
+
+    uint32_t sectors_per_cluster = vol->sectors_per_cluster;
+    uint32_t cluster_size = vol->bytes_per_sector * sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+
+    uint8_t *buffer = kmalloc(cluster_size);
+    if (!buffer) {
+        return -EMBK_ENOMEM;
+    }
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        uint32_t first_sector = cluster_to_sector(vol, cluster);
+        int rc = embk_block_read(vol->dev, first_sector,
+                                 sectors_per_cluster, buffer);
+        if (rc != EMBK_OK) {
+            kfree(buffer);
+            return rc;
+        }
+
+        struct fat_dir_entry *entries = (struct fat_dir_entry *)buffer;
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            struct fat_dir_entry *entry = &entries[i];
+            if (entry->name[0] == 0x00) {
+                kfree(buffer);
+                return -EMBK_ENOENT;
+            }
+            if (entry->name[0] == 0xE5) {
+                continue;
+            }
+            if ((entry->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN) {
+                continue;
+            }
+            if (entry->attr & FAT32_ATTR_VOLUME_ID) {
+                continue;
+            }
+
+            if (memcmp(entry->name, target, 11) == 0) {
+                if (out_cluster) *out_cluster = cluster;
+                if (out_index) *out_index = i;
+                if (out_entry) *out_entry = *entry;
+                kfree(buffer);
+                return EMBK_OK;
+            }
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0) {
+            kfree(buffer);
+            return -EMBK_EIO;
+        }
+    }
+
+    kfree(buffer);
+    return -EMBK_ENOENT;
+}
+
+static int fat32_find_free_dir_slot(struct fat32_volume *vol,
+                                    uint32_t dir_cluster,
+                                    uint32_t *out_cluster,
+                                    uint32_t *out_index,
+                                    uint8_t *cluster_buffer) {
+    uint32_t sectors_per_cluster = vol->sectors_per_cluster;
+    uint32_t cluster_size = vol->bytes_per_sector * sectors_per_cluster;
+
+    uint32_t cluster = dir_cluster;
+    uint32_t last_cluster = 0;
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        last_cluster = cluster;
+        uint32_t first_sector = cluster_to_sector(vol, cluster);
+        int rc = embk_block_read(vol->dev, first_sector,
+                                 sectors_per_cluster, cluster_buffer);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        struct fat_dir_entry *entries = (struct fat_dir_entry *)cluster_buffer;
+        uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            struct fat_dir_entry *entry = &entries[i];
+            if (entry->name[0] == 0x00 || entry->name[0] == 0xE5) {
+                *out_cluster = cluster;
+                *out_index = i;
+                return EMBK_OK;
+            }
+        }
+
+        uint32_t next = fat_get_next_cluster(vol, cluster);
+        if (next == 0) {
+            return -EMBK_EIO;
+        }
+        cluster = next;
+    }
+
+    // No free slot found; allocate one more cluster for the directory.
+    uint32_t new_cluster;
+    int rc = fat32_alloc_cluster_chain(vol, 1, &new_cluster, NULL);
+    if (rc != EMBK_OK) {
+        return rc;
+    }
+
+    rc = fat32_write_fat_entry(vol, last_cluster, new_cluster);
+    if (rc != EMBK_OK) {
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    memset(cluster_buffer, 0, cluster_size);
+    uint32_t first_sector = cluster_to_sector(vol, new_cluster);
+    rc = embk_block_write(vol->dev, first_sector,
+                          sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    *out_cluster = new_cluster;
+    *out_index = 0;
+    return EMBK_OK;
+}
+
+static int fat32_find_parent_dir(struct fat32_volume *vol,
+                                 const char *path,
+                                 uint32_t *out_parent_cluster,
+                                 char *out_name) {
+    if (!vol || !path || !*path || !out_name) {
+        return -EMBK_EINVAL;
+    }
+
+    uint32_t cluster = vol->root_cluster;
+    const char *p = path;
+    if (*p == '/') {
+        p++;
+    }
+
+    const char *segment = p;
+    while (true) {
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            return -EMBK_EINVAL;
+        }
+
+        segment = p;
+        while (*p != '/' && *p != '\0') {
+            p++;
+        }
+
+        size_t len = p - segment;
+        if (len == 0) {
+            return -EMBK_EINVAL;
+        }
+        if (len >= 12) {
+            return -EMBK_EINVAL;
+        }
+
+        if (*p == '\0') {
+            memcpy(out_name, segment, len);
+            out_name[len] = '\0';
+            *out_parent_cluster = cluster;
+            return EMBK_OK;
+        }
+
+        char component[256];
+        if (len >= sizeof(component)) {
+            return -EMBK_EINVAL;
+        }
+        memcpy(component, segment, len);
+        component[len] = '\0';
+
+        struct fat_dir_entry entry;
+        int rc = fat32_find_in_dir(vol, cluster, component, &entry);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+        if (!(entry.attr & FAT32_ATTR_DIRECTORY)) {
+            return -EMBK_ENOTDIR;
+        }
+
+        cluster = ((uint32_t)entry.first_cluster_high << 16) |
+                  entry.first_cluster_low;
+        if (!fat32_valid_cluster(vol, cluster)) {
+            return -EMBK_EIO;
+        }
+
+        if (*p == '/') {
+            p++;
+        }
+    }
+}
+
+static int fat32_find_path(struct fat32_volume *vol, const char *path,
+                           struct fat_dir_entry *out_entry) {
+    if (!vol || !path || !*path) {
+        return -EMBK_EINVAL;
+    }
+
+    uint32_t cluster = vol->root_cluster;
+    const char *p = path;
+    if (*p == '/') {
+        p++;
+    }
+
+    while (true) {
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            return -EMBK_EINVAL;
+        }
+
+        const char *segment = p;
+        while (*p != '/' && *p != '\0') {
+            p++;
+        }
+
+        size_t len = p - segment;
+        if (len == 0) {
+            return -EMBK_EINVAL;
+        }
+        if (len >= 256) {
+            return -EMBK_EINVAL;
+        }
+
+        char component[256];
+        memcpy(component, segment, len);
+        component[len] = '\0';
+
+        struct fat_dir_entry entry;
+        int rc = fat32_find_in_dir(vol, cluster, component, &entry);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        if (*p == '\0') {
+            if (out_entry) {
+                *out_entry = entry;
+            }
+            return EMBK_OK;
+        }
+
+        if (!(entry.attr & FAT32_ATTR_DIRECTORY)) {
+            return -EMBK_ENOTDIR;
+        }
+
+        cluster = ((uint32_t)entry.first_cluster_high << 16) |
+                  entry.first_cluster_low;
+        if (!fat32_valid_cluster(vol, cluster)) {
+            return -EMBK_EIO;
+        }
+
+        if (*p == '/') {
+            p++;
+        }
+    }
 }
 
 // List the entries in the root directory.
@@ -340,13 +857,195 @@ static int fat32_read_file_data(struct fat32_volume *vol,
 }
 
 
+static int fat32_write_data_to_chain(struct fat32_volume *vol,
+                                     uint32_t start_cluster,
+                                     const uint8_t *buffer, uint32_t size) {
+    if (!vol || !buffer) {
+        return -EMBK_EINVAL;
+    }
+    if (size == 0) {
+        return EMBK_OK;
+    }
+
+    uint32_t sectors_per_cluster = vol->sectors_per_cluster;
+    uint32_t cluster_size = vol->bytes_per_sector * sectors_per_cluster;
+    uint32_t bytes_written = 0;
+    uint32_t cluster = start_cluster;
+
+    uint8_t *clusbuf = kmalloc(cluster_size);
+    if (!clusbuf) {
+        return -EMBK_ENOMEM;
+    }
+
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE
+           && bytes_written < size) {
+        uint32_t first_sector = cluster_to_sector(vol, cluster);
+        uint32_t remaining = size - bytes_written;
+        uint32_t write_len = (remaining < cluster_size) ? remaining : cluster_size;
+
+        memcpy(clusbuf, buffer + bytes_written, write_len);
+        if (write_len < cluster_size) {
+            memset(clusbuf + write_len, 0, cluster_size - write_len);
+        }
+
+        int rc = embk_block_write(vol->dev, first_sector,
+                                  sectors_per_cluster, clusbuf);
+        if (rc != EMBK_OK) {
+            kfree(clusbuf);
+            return rc;
+        }
+
+        bytes_written += write_len;
+        if (bytes_written >= size) {
+            break;
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0) {
+            kfree(clusbuf);
+            return -EMBK_EIO;
+        }
+    }
+
+    kfree(clusbuf);
+    return (int)bytes_written;
+}
+
 int fat32_read(struct fat32_volume *vol, const char *name,
                uint8_t *buffer, uint32_t max_size) {
     if (!vol || !vol->mounted || !name || !buffer) return -EMBK_EINVAL;
 
     struct fat_dir_entry entry;
-    int rc = fat32_find_in_dir(vol, vol->root_cluster, name, &entry);
+    int rc = fat32_find_path(vol, name, &entry);
     if (rc != EMBK_OK) return rc;
 
+    if (entry.attr & FAT32_ATTR_DIRECTORY) {
+        return -EMBK_EISDIR;
+    }
+
     return fat32_read_file_data(vol, &entry, buffer, max_size);
+}
+
+int fat32_write(struct fat32_volume *vol, const char *path,
+                const uint8_t *buffer, uint32_t size) {
+    if (!vol || !vol->mounted || !path || !buffer) {
+        return -EMBK_EINVAL;
+    }
+
+    uint32_t parent_cluster;
+    char filename[256];
+    int rc = fat32_find_parent_dir(vol, path, &parent_cluster, filename);
+    if (rc != EMBK_OK) {
+        return rc;
+    }
+
+    uint32_t entry_cluster = 0;
+    uint32_t entry_index = 0;
+    struct fat_dir_entry existing_entry;
+    bool exists = true;
+    rc = fat32_find_dir_entry_location(vol, parent_cluster, filename,
+                                       &entry_cluster, &entry_index,
+                                       &existing_entry);
+    if (rc == -EMBK_ENOENT) {
+        exists = false;
+    } else if (rc != EMBK_OK) {
+        return rc;
+    }
+
+    uint32_t old_head = 0;
+    if (exists) {
+        old_head = ((uint32_t)existing_entry.first_cluster_high << 16) |
+                   existing_entry.first_cluster_low;
+        if (existing_entry.attr & FAT32_ATTR_DIRECTORY) {
+            return -EMBK_EISDIR;
+        }
+    }
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint32_t clusters_needed = (size == 0) ? 0 :
+        ((size + cluster_size - 1) / cluster_size);
+
+    uint32_t new_head = 0;
+    if (clusters_needed > 0) {
+        rc = fat32_alloc_cluster_chain(vol, clusters_needed, &new_head, NULL);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+    }
+
+    if (exists && old_head >= 2) {
+        rc = fat32_free_cluster_chain(vol, old_head);
+        if (rc != EMBK_OK) {
+            if (new_head) {
+                fat32_free_cluster_chain(vol, new_head);
+            }
+            return rc;
+        }
+    }
+
+    if (size > 0 && new_head) {
+        rc = fat32_write_data_to_chain(vol, new_head, buffer, size);
+        if (rc < 0) {
+            if (new_head) {
+                fat32_free_cluster_chain(vol, new_head);
+            }
+            return rc;
+        }
+    }
+
+    uint8_t *cluster_buffer = kmalloc(cluster_size);
+    if (!cluster_buffer) {
+        if (new_head) {
+            fat32_free_cluster_chain(vol, new_head);
+        }
+        return -EMBK_ENOMEM;
+    }
+
+    uint32_t dir_cluster = parent_cluster;
+    if (!exists) {
+        rc = fat32_find_free_dir_slot(vol, parent_cluster,
+                                      &dir_cluster, &entry_index,
+                                      cluster_buffer);
+        if (rc != EMBK_OK) {
+            kfree(cluster_buffer);
+            if (new_head) {
+                fat32_free_cluster_chain(vol, new_head);
+            }
+            return rc;
+        }
+    }
+
+    uint32_t first_sector = cluster_to_sector(vol, dir_cluster);
+    rc = embk_block_read(vol->dev, first_sector,
+                         vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        if (!exists && new_head) {
+            fat32_free_cluster_chain(vol, new_head);
+        }
+        return rc;
+    }
+
+    struct fat_dir_entry *entries = (struct fat_dir_entry *)cluster_buffer;
+    if (!exists) {
+        memset(&entries[entry_index], 0, sizeof(*entries));
+        name_to_fat83(filename, (char *)entries[entry_index].name);
+        entries[entry_index].attr = FAT32_ATTR_ARCHIVE;
+    }
+
+    entries[entry_index].first_cluster_high = (uint16_t)(new_head >> 16);
+    entries[entry_index].first_cluster_low = (uint16_t)(new_head & 0xFFFF);
+    entries[entry_index].file_size = size;
+
+    rc = embk_block_write(vol->dev, first_sector,
+                          vol->sectors_per_cluster, cluster_buffer);
+    kfree(cluster_buffer);
+    if (rc != EMBK_OK) {
+        if (new_head) {
+            fat32_free_cluster_chain(vol, new_head);
+        }
+        return rc;
+    }
+
+    return (int)size;
 }

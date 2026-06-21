@@ -118,6 +118,36 @@ void fat32_list_root(struct fat32_volume *vol);
 int fat32_read(struct fat32_volume *vol, const char *name, uint8_t *buffer, uint32_t max_size);
 int fat32_write(struct fat32_volume *vol, const char *name, const uint8_t *buffer, uint32_t size);
 
-
+static uint32_t fat32_cluster_count(struct fat32_volume *vol);
+static bool fat32_valid_cluster(struct fat32_volume *vol, uint32_t cluster);
+static int fat32_read_fat_entry(struct fat32_volume *vol, uint32_t cluster,
+                                uint32_t *out_value);
+static int fat32_write_fat_entry(struct fat32_volume *vol, uint32_t cluster,
+                                 uint32_t value);
+static int fat32_free_cluster_chain(struct fat32_volume *vol, uint32_t cluster);
+static int fat32_alloc_cluster_chain(struct fat32_volume *vol, uint32_t count,
+                                     uint32_t *out_head, uint32_t *out_tail);
+static int fat32_find_dir_entry_location(struct fat32_volume *vol,
+                                        uint32_t dir_cluster,
+                                        const char *name,
+                                        uint32_t *out_cluster,
+                                        uint32_t *out_index,
+                                        struct fat_dir_entry *out_entry);
+static int fat32_find_free_dir_slot(struct fat32_volume *vol,
+                                    uint32_t dir_cluster,
+                                    uint32_t *out_cluster,
+                                    uint32_t *out_index,
+                                    uint8_t *cluster_buffer);
+static int fat32_find_parent_dir(struct fat32_volume *vol,
+                                 const char *path,
+                                 uint32_t *out_parent_cluster,
+                                 char *out_name);
+static int fat32_find_path(struct fat32_volume *vol, const char *path,
+                           struct fat_dir_entry *out_entry);
+static int fat32_find_in_dir(struct fat32_volume *vol, uint32_t dir_cluster,
+                             const char *name, struct fat_dir_entry *out);
+static int fat32_write_data_to_chain(struct fat32_volume *vol,
+                                     uint32_t start_cluster,
+                                     const uint8_t *buffer, uint32_t size);
 
 #endif /*__FAST32_H__*/ 
