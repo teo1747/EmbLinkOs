@@ -90,6 +90,9 @@ fat32.img:
 	mcopy -i fat32.img /tmp/hello.txt ::HELLO.TXT
 	echo "second file for testing the directory walk" > /tmp/test.txt
 	mcopy -i fat32.img /tmp/test.txt ::TEST.TXT
+	mmd -i fat32.img ::SUBDIR
+	echo "file inside a subdirectory" > /tmp/sub.txt
+	mcopy -i fat32.img /tmp/sub.txt ::SUBDIR/INSIDE.TXT
 
 
 run-ahci: $(IMG) $(DISK) ahci.img

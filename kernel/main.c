@@ -117,6 +117,32 @@ void kernel_main(void) {
         }
     }
 
+    static uint8_t pbuf[512];
+    int pn = fat32_read(&vol, "/SUBDIR/INSIDE.TXT", pbuf, sizeof(pbuf) - 1);
+    if (pn >= 0) {
+        pbuf[pn] = '\0';
+        kprintf("\n=== /SUBDIR/INSIDE.TXT (%d bytes) ===\n%s\n", pn, (char *)pbuf);
+    } else {
+        kprintf("path read failed: %s\n", embk_strerror(pn));
+    }
+
+    // WRITE TEST — create a new file
+    const char *content = "Written by EmbLink to a real disk!";
+    int wn = fat32_write(&vol, "/NEWFILE.TXT", (const uint8_t *)content, 34);
+    if (wn >= 0) {
+        kprintf("\nWrote NEWFILE.TXT: %d bytes\n", wn);
+    } else {
+        kprintf("\nWrite failed: %s\n", embk_strerror(wn));
+    }
+
+    // Read it back THROUGH EMBLINK to confirm round-trip
+    static uint8_t vbuf[512];
+    int vn = fat32_read(&vol, "/NEWFILE.TXT", vbuf, sizeof(vbuf) - 1);
+    if (vn >= 0) {
+        vbuf[vn] = '\0';
+        kprintf("Read back NEWFILE.TXT (%d bytes): %s\n", vn, (char *)vbuf);
+    }
+
     kprintf("\nEmbLink OS ready.\n");
 
     // Main loop: keyboard echo + tick heartbeat
