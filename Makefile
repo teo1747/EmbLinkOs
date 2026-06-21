@@ -88,6 +88,8 @@ fat32.img:
 	mkfs.vfat -F 32 -n EMBLINK fat32.img
 	echo "Hello from EmbLink filesystem!" > /tmp/hello.txt
 	mcopy -i fat32.img /tmp/hello.txt ::HELLO.TXT
+	echo "second file for testing the directory walk" > /tmp/test.txt
+	mcopy -i fat32.img /tmp/test.txt ::TEST.TXT
 
 
 run-ahci: $(IMG) $(DISK) ahci.img

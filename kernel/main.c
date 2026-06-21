@@ -102,6 +102,9 @@ void kernel_main(void) {
     if (!found) {
         kprintf("No FAT32 volume found on any disk\n");
     }
+    if (found) {
+        fat32_list_root(&vol);
+    }
 
     kprintf("\nEmbLink OS ready.\n");
 

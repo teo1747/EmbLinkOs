@@ -74,6 +74,23 @@ struct fat32_volume {
     bool     mounted;                       // true once successfully parsed
 };
 
+// A 32-byte FAT directory entry (on-disk layout)
+struct fat_dir_entry {
+    uint8_t  name[11];            // 0x00  8.3 name, space-padded
+    uint8_t  attr;                // 0x0B  attribute bits
+    uint8_t  nt_reserved;         // 0x0C  reserved for Windows NT
+    uint8_t  create_time_tenth;   // 0x0D  creation time, tenths of a second
+    uint16_t create_time;         // 0x0E  creation time
+    uint16_t create_date;         // 0x10  creation date
+    uint16_t access_date;         // 0x12  last access date
+    uint16_t first_cluster_high;  // 0x14  high 16 bits of first cluster
+    uint16_t write_time;          // 0x16  last write time
+    uint16_t write_date;          // 0x18  last write date
+    uint16_t first_cluster_low;   // 0x1A  low 16 bits of first cluster
+    uint32_t file_size;           // 0x1C  file size in bytes
+} __attribute__((packed));        // total = 32 bytes
+
+
 // FAT entries special values (mask off the top 4 bits - they're reserved))  
 #define FAT32_EOC_MIN        0x0FFFFFF8     // >= this means end of chain
 #define FAT32_BAD            0xFFFFFFF7     // bad cluster
@@ -95,5 +112,7 @@ struct fat32_volume {
 // negative EMBK_* error on failure. Fills *vol.
 int fat32_mount(struct embk_block_device *dev, struct fat32_volume *vol);
 
+// List the root directory entries on a mounted FAT32 volume.
+void fat32_list_root(struct fat32_volume *vol);
 
 #endif /*__FAST32_H__*/ 
