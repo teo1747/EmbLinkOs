@@ -7,7 +7,6 @@
 
 
 void kprintf(const char *fmt, ...); // variadic function
-void snprintf(char *buffer, size_t size, const char *fmt, ...);  // variadic function
-
+int  snprintf(char *buffer, size_t size, const char *fmt, ...);
 
 #endif /* _KPRINTF_H_ */

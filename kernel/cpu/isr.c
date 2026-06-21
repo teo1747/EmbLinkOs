@@ -78,6 +78,28 @@ void isr_handler(struct registers *regs) {
     serial_write_hex(regs->rbp);
     serial_write_string("\n");
 
+    // Page Fault (vector 14): CR2 holds the faulting address, and the
+    // error code's low bits explain the cause.
+    if (regs->vector == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+        serial_write_string("CR2 (fault addr): ");
+        serial_write_hex(cr2);
+        serial_write_string("\n");
+
+        // Decode the error code bits (Intel SDM Vol 3A, 4.7 "Page-Fault
+        // Exceptions"). Each bit explains one aspect of the fault.
+        uint64_t e = regs->error_code;
+        serial_write_string("Cause: ");
+        serial_write_string((e & 0x1) ? "protection-violation" : "not-present");
+        serial_write_string((e & 0x2) ? ", write" : ", read");
+        serial_write_string((e & 0x4) ? ", user-mode" : ", kernel-mode");
+        if (e & 0x8)  serial_write_string(", reserved-bit-set");
+        if (e & 0x10) serial_write_string(", instruction-fetch");
+        serial_write_string("\n");
+    }
+
     serial_write_string("system halted.\n");
 
     // In a real kernel, you would likely halt the system or attempt recovery here

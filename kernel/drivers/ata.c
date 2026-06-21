@@ -482,6 +482,8 @@ void ata_register_block_devices(void) {
         ata_block_devices[i].read = ata_block_read;
         ata_block_devices[i].write = ata_block_write;
         ata_block_devices[i].driver_data = (void *)(uintptr_t)i; // Store the drive index
+        ata_block_devices[i].dma_max_phys      = 0xFFFFFFFF;   // 32-bit DMA
+        ata_block_devices[i].needs_kernel_range = true;
         embk_block_register(&ata_block_devices[i]);
     }
 }

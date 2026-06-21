@@ -462,6 +462,8 @@ void ahci_register_block_devices(void) {
         ahci_block_devs[i].read        = ahci_block_read;
         ahci_block_devs[i].write       = ahci_block_write;
         ahci_block_devs[i].driver_data = (void *)(uintptr_t)port;
+        ahci_block_devs[i].dma_max_phys      = 0xFFFFFFFFFFFFFFFFULL;  // 64-bit (S64A=1)
+        ahci_block_devs[i].needs_kernel_range = true;  // still need KV2P validity
         embk_block_register(&ahci_block_devs[i]);
     }
 }
