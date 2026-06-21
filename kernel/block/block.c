@@ -131,7 +131,7 @@ int embk_block_write(struct embk_block_device *dev,
     const uint8_t *src = (const uint8_t *)buffer;
     while (count > 0) {
         uint32_t chunk = (count > max_blocks) ? max_blocks : count;
-        memcpy(block_bounce, src, chunk * dev->block_size);
+        memcpy(block_bounce, src, (size_t)chunk * (size_t)dev->block_size);
         int rc = dev->write(dev, lba, chunk, block_bounce);
         if (rc != EMBK_OK) return rc;
         lba   += chunk;
