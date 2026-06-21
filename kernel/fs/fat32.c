@@ -1,9 +1,44 @@
 #include "fat32.h"
+#include "../include/ctype.h"
 #include "../include/errno.h"
 #include "../include/kprintf.h"
+#include "../include/kstring.h"
 #include "../mm/kheap.h"
 
 #include <stdint.h>
+
+
+
+
+// Convert a human filename ("HELLO.TXT") into the 11-byte on-disk FAT
+// 8.3 form ("HELLO   TXT"): uppercase, space-padded, no dot.
+// `out` must be at least 11 bytes. Does NOT null-terminate (it's a
+// fixed 11-byte field, not a C string).
+static void name_to_fat83(const char *name, char out[11]) {
+    // 1. Fill all 11 bytes with spaces first.
+    for (int i = 0; i < 11; i++) {
+        out[i] = ' ';
+    }
+
+    // 2. Copy the name part (up to 8 chars) into out[0..7], uppercasing,
+    //    until you hit a '.' or end-of-string.
+    int dst = 0;
+    while (*name && *name != '.' && dst < 8) {
+        out[dst++] = (char)toupper((unsigned char)*name);
+        name++;
+    }
+
+    // 3. If there was a '.', copy the extension (up to 3 chars) into
+    //    out[8..10], uppercasing.
+    if (*name == '.') {
+        name++;
+        dst = 8;
+        while (*name && *name != '.' && dst < 11) {
+            out[dst++] = (char)toupper((unsigned char)*name);
+            name++;
+        }
+    }
+}
 
 
 int fat32_mount(struct embk_block_device *dev, struct fat32_volume *vol) {
@@ -216,4 +251,102 @@ void fat32_list_root(struct fat32_volume *vol) {
     }
 
     kfree(dir_buffer);   // single cleanup point — every exit path reaches it
+}
+
+
+static int fat32_find_in_dir(struct fat32_volume *vol, uint32_t dir_cluster,
+                             const char *name, struct fat_dir_entry *out) {
+    // Convert target name to on-disk 8.3 form.
+    char target[11];
+    name_to_fat83(name, target);
+
+    uint32_t sectors_per_cluster = vol->sectors_per_cluster;
+    uint32_t cluster_size        = vol->bytes_per_sector * sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+
+    static uint8_t dir_buffer[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(dir_buffer)) return -EMBK_EINVAL;
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        uint32_t first_sector = cluster_to_sector(vol, cluster);
+        int rc = embk_block_read(vol->dev, first_sector, sectors_per_cluster, dir_buffer);
+        if (rc != EMBK_OK) return rc;
+
+        struct fat_dir_entry *entries = (struct fat_dir_entry *)dir_buffer;
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            struct fat_dir_entry *entry = &entries[i];
+
+            if (entry->name[0] == 0x00) return -EMBK_ENOENT;   // end of dir, not found
+            if (entry->name[0] == 0xE5) continue;              // deleted
+            if ((entry->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN) continue;
+            if (entry->attr & FAT32_ATTR_VOLUME_ID) continue;
+
+            if (memcmp(entry->name, target, 11) == 0) {
+                *out = *entry;
+                return EMBK_OK;
+            }
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0) return -EMBK_EIO;   // broken chain
+    }
+    return -EMBK_ENOENT;
+}
+
+
+static int fat32_read_file_data(struct fat32_volume *vol,
+                                struct fat_dir_entry *entry,
+                                uint8_t *buffer, uint32_t max_size) {
+    uint32_t cluster = ((uint32_t)entry->first_cluster_high << 16)
+                     | entry->first_cluster_low;
+    uint32_t file_size = entry->file_size;
+
+    // Read at most the file's size, and at most the buffer's capacity.
+    uint32_t to_read = (file_size < max_size) ? file_size : max_size;
+
+    uint32_t sectors_per_cluster = vol->sectors_per_cluster;
+    uint32_t cluster_size = vol->bytes_per_sector * sectors_per_cluster;
+    uint32_t bytes_read = 0;
+
+    static uint8_t clusbuf[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(clusbuf)) return -EMBK_EINVAL;
+
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE
+           && bytes_read < to_read) {
+        uint32_t first_sector = cluster_to_sector(vol, cluster);
+        int rc = embk_block_read(vol->dev, first_sector,
+                                 sectors_per_cluster, clusbuf);
+        if (rc != EMBK_OK) {
+            return rc;
+        }
+
+        uint32_t remaining = to_read - bytes_read;
+        uint32_t copy_len = (remaining < cluster_size) ? remaining : cluster_size;
+        memcpy(buffer + bytes_read, clusbuf, copy_len);
+        bytes_read += copy_len;
+
+        if (bytes_read >= to_read) {
+            break;
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0) {
+            return -EMBK_EIO;
+        }
+    }
+
+    return (int)bytes_read;
+}
+
+
+int fat32_read(struct fat32_volume *vol, const char *name,
+               uint8_t *buffer, uint32_t max_size) {
+    if (!vol || !vol->mounted || !name || !buffer) return -EMBK_EINVAL;
+
+    struct fat_dir_entry entry;
+    int rc = fat32_find_in_dir(vol, vol->root_cluster, name, &entry);
+    if (rc != EMBK_OK) return rc;
+
+    return fat32_read_file_data(vol, &entry, buffer, max_size);
 }

@@ -102,8 +102,19 @@ void kernel_main(void) {
     if (!found) {
         kprintf("No FAT32 volume found on any disk\n");
     }
+
+
     if (found) {
         fat32_list_root(&vol);
+
+        static uint8_t filebuf[512];
+        int n = fat32_read(&vol, "HELLO.TXT", filebuf, sizeof(filebuf) - 1);
+        if (n >= 0) {
+            filebuf[n] = '\0';
+            kprintf("\n=== HELLO.TXT (%d bytes) ===\n%s\n", n, (char *)filebuf);
+        } else {
+            kprintf("Failed to read HELLO.TXT: %s\n", embk_strerror(n));
+        }
     }
 
     kprintf("\nEmbLink OS ready.\n");

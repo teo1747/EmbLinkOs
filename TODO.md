@@ -149,6 +149,11 @@ left to do.
   Secondary needs IRQ 15 + BMIDE offset 0x08 + per-channel state. Until
   then, mountable disks must be on IDE primary or AHCI. (FAT32 test disk
   is on IDE primary slave = sdb for this reason.)
+- [ ] Block-layer DMA bounce buffer is shared global state — needs a lock
+  once transfers can be concurrent (IRQ-driven / multi-threaded). Fine while
+  synchronous. Also: bounce always copies; multi-PRD scatter-gather (page-walk
+  via vmm_get_phys) would be the zero-copy alternative (already on TODO).
+
 
 ---
 
