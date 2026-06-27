@@ -72,6 +72,10 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
 
 int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const  void *buffer);
 
+// Drain the drive's write-back cache (FLUSH CACHE) without issuing a write.
+// Return 0 on success, -1 on error.
+int ata_flush(uint32_t drive_index);
+
 void ata_register_block_devices(void);
 
 #endif  // __ATA_H__

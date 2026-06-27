@@ -3,6 +3,7 @@
 #include "include/kprintf.h"
 #include "include/io.h"
 #include "include/errno.h"
+#include "include/kstring.h"
 
 #include "drivers/serial.h"
 #include "drivers/framebuffer.h"
@@ -28,6 +29,7 @@
 #include "acpi/acpi.h"
 #include "block/block.h"
 #include "fs/fat32.h"
+#include "fs/embkfs/embkfs.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
@@ -86,6 +88,35 @@ static void fat32_test_all(struct fat32_volume *vol) {
     kprintf("=== FAT32 TEST SUITE COMPLETE ===\n");
 }
 
+static void kernel_handle_line_command(const char *cmd)
+{
+    if (strcmp(cmd, "embkfs-test") == 0) {
+        int rc_path = embkfs_run_path_selftests();
+        int rc_alloc = embkfs_run_allocator_selftests();
+        int rc_tree = embkfs_run_tree_selftests();
+        int rc_obj = embkfs_run_object_selftests();
+        int rc_ns = embkfs_run_namespace_selftests();
+        if (rc_path == EMBK_OK && rc_alloc == EMBK_OK && rc_tree == EMBK_OK && rc_obj == EMBK_OK && rc_ns == EMBK_OK) {
+            kprintf("\n[cmd] embkfs-test: OK\n");
+        } else {
+            if (rc_path != EMBK_OK)
+                kprintf("\n[cmd] embkfs-test path failed: %s\n", embk_strerror(rc_path));
+            if (rc_alloc != EMBK_OK)
+                kprintf("\n[cmd] embkfs-test allocator failed: %s\n", embk_strerror(rc_alloc));
+            if (rc_tree != EMBK_OK)
+                kprintf("\n[cmd] embkfs-test tree failed: %s\n", embk_strerror(rc_tree));
+            if (rc_obj != EMBK_OK)
+                kprintf("\n[cmd] embkfs-test object failed: %s\n", embk_strerror(rc_obj));
+            if (rc_ns != EMBK_OK)
+                kprintf("\n[cmd] embkfs-test namespace failed: %s\n", embk_strerror(rc_ns));
+        }
+        return;
+    }
+
+    if (cmd[0])
+        kprintf("\n[cmd] unknown command: %s\n", cmd);
+}
+
 void kernel_main(void) {
     // --- Core init ---
     serial_init();
@@ -105,6 +136,7 @@ void kernel_main(void) {
     ioapic_init();
 
     // --- Devices ---
+    
     pci_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
@@ -143,6 +175,7 @@ void kernel_main(void) {
     // ============================================================
     //  Mount FAT32 (probe every disk, mount the first valid one)
     // ============================================================
+    embkfs_init();
     static struct fat32_volume vol;
     bool found = false;
     for (uint32_t i = 0; i < embk_block_count(); i++) {
@@ -160,11 +193,25 @@ void kernel_main(void) {
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;
+    char cmd_buf[128];
+    uint32_t cmd_len = 0;
     for (;;) {
         uint64_t now = lapic_timer_get_ticks();
         if (now >= last + 500) { last = now; }
         if (keyboard_has_char()) {
-            kprintf("%c", keyboard_getchar());
+            char c = keyboard_getchar();
+            kprintf("%c", c);
+
+            if (c == '\r' || c == '\n') {
+                cmd_buf[cmd_len] = '\0';
+                kernel_handle_line_command(cmd_buf);
+                cmd_len = 0;
+            } else if ((c == '\b' || c == 127) && cmd_len > 0) {
+                cmd_len--;
+            } else if (c >= 32 && c <= 126) {
+                if (cmd_len + 1 < sizeof cmd_buf)
+                    cmd_buf[cmd_len++] = c;
+            }
         }
         __asm__ volatile ("hlt");
     }

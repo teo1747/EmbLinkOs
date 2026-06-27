@@ -140,3 +140,11 @@ int embk_block_write(struct embk_block_device *dev,
     }
     return EMBK_OK;
 }
+
+// Drain the device's write-back cache. A device with no flush op is assumed to
+// have no cache to drain, so the barrier is a no-op (success) there.
+int embk_block_flush(struct embk_block_device *dev) {
+    if (!dev)        return -EMBK_ENODEV;
+    if (!dev->flush) return EMBK_OK;
+    return dev->flush(dev);
+}
