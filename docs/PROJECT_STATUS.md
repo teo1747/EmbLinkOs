@@ -113,6 +113,57 @@ with the OS eventually self-hosting and supporting ARM64 + SMP.
 - Verified: 3 disks (2 IDE + 1 AHCI) enumerate through one interface; reads and
   writes dispatch to the correct driver with no driver-specific call-site code.
 
+### Phase 13 — FAT32 (read + write) ✅
+- On-disk structures: boot sector / BPB parse, FAT mirroring, FSInfo.
+- Cluster-chain traversal; directory iteration handling both 8.3 short names and
+  LFN (long-file-name) entries, with LFN checksum validation.
+- Read path: resolve by path, read file data across cluster chains.
+- Write path: file create + write, directory-entry allocation, `mkdir`, cluster
+  allocation + FAT update, FSInfo free-count maintenance.
+- Oracle-validated: images verified clean by `fsck.vfat`, and files round-tripped
+  against host `mcopy` (mtools) byte-for-byte.
+- Mounts on the block layer; FAT32 test disk is on IDE primary slave (= sdb),
+  because block-layer DMA is only wired for the IDE primary channel (see TODO).
+
+### Phase 14 — EMBKFS read-only mount ✅
+A custom copy-on-write, Merkle-checksummed filesystem with its own on-disk
+format (see `EMBKFS_Specification`, plus `EMBKFS_spec_corrections.md` for the
+v2.0→v2.1 fixes found during this work). The read side was built and validated
+**oracle-first**: a Python formatter (`mkfs_embkfs.py`) writes known-good images
+and a verifier (`verify_embkfs.py`) is the ground truth; the kernel C reader is
+checked against them, never the reverse.
+- **Format structs**: byte-exact, `_Static_assert`-sized (block ptr 32, key 24,
+  node header 40, internal slot 56, item header 32, inode 128, extent 64,
+  superblock 160).
+- **CRC32C** (Castagnoli): dependency-free software port of the Python oracle;
+  gate vector `crc32c("123456789") == 0xE3069283`.
+- **Superblock**: read at a fixed *byte* offset (65536) to break the bootstrap
+  cycle (block size itself lives in the superblock); magic + version + body
+  checksum verified.
+- **Node integrity, every read**: a node's own checksum over its block, AND the
+  Merkle link against the parent pointer's stored checksum, plus generation and
+  self-block-number. The superblock is the root of trust; the check is generic
+  over leaf and internal nodes alike.
+- **Field-wise key order**: keys compare as the integer tuple (object_id, type,
+  offset) — not raw little-endian bytes. Strictly-increasing-key invariant
+  enforced within a leaf.
+- **Path resolution**: root directory inode → directory entry by CRC32C
+  name-hash → authoritative byte-for-byte name compare → file inode + extent →
+  read and checksum the data over its logical size.
+- **Hash-collision handling**: a real same-length CRC32C collision was found
+  ("wgyehkb.txt" / "illoeuw.txt", both 0xC38842AB). Colliding names share one
+  directory-entry item as a chain of records (bounded by the item size, no count
+  field), walked and distinguished by name; both resolve to distinct objects.
+  Validated end-to-end (formatter, verifier, kernel) and kept as a regression.
+- **B-tree descent**: the reader handles internal nodes (level > 0), not only a
+  single root leaf. Descent picks the rightmost slot whose key is ≤ the target
+  (upper-bound search, so an exact boundary key descends right), follows the
+  child pointer, and recurses — node verification extending the Merkle chain to
+  full tree depth. Validated on a 2-level image whose split lands a key exactly
+  on a slot boundary (the ≤-not-< trap).
+- Both a flat image and a 2-level tree image boot green; all files resolve with
+  end-to-end data integrity verified. (Write path is the next build — see below.)
+
 ### Supporting infrastructure ✅
 - **errno**: EMBK_* error codes (POSIX-aligned values) + embk_strerror().
   Convention: int + error codes for fallible ops, bool for true/false questions.
@@ -126,15 +177,23 @@ with the OS eventually self-hosting and supporting ARM64 + SMP.
 ---
 
 ## Current State
-- Boots cleanly in QEMU (`make run`, `make run-ahci`).
-- Kernel at 0xFFFFFFFF80100000; ~270 sectors.
-- Full memory management, interrupts, storage stack, block layer operational.
+- Boots cleanly in QEMU (`make run`, `make run-ahci`, `make run-embkfs`,
+  `make run-embkfs-tree`).
+- Kernel at 0xFFFFFFFF80100000.
+- Full memory management, interrupts, storage stack, and block layer operational.
+- Filesystems: FAT32 (read + write) and EMBKFS (read-only mount — multi-level
+  B-tree, Merkle-verified, collision-handling) both mount and read on the block
+  layer.
 - Debug output via COM1 serial + framebuffer console.
 
 ## Next Steps (roadmap to Level 4 — run real software)
 Dependency order:
-1. **Filesystem** (FAT32 first — simplest, real-world compatible) on the block
-   layer — turns sectors into files. ← NEXT
+1. **Filesystem** on the block layer — turns sectors into files. ✅ FAT32
+   (read + write) and EMBKFS read-only mount are done. **Active build:** the
+   EMBKFS *write* path — snapshot-aware block allocator, copy-on-write (new
+   nodes bottom-up), and propagation of fresh checksums up the Merkle spine to
+   an atomically installed, generation-bumped superblock
+   (EMBKFS spec §11, phases 2–3). ← NEXT
 2. **VFS** layer (generic file operations, mountable filesystems).
 3. **User mode (ring 3)** + TSS.
 4. **System calls** (syscall/sysret ABI).
@@ -146,6 +205,12 @@ Dependency order:
 9. **Shell** (= Level 2), then coreutils/busybox (Level 3→4), then self-hosting
    toolchain (tcc), then mouse + compositor + GUI.
 
+Smaller near-term loose ends:
+- Wire B-tree descent recursion into `verify_embkfs.py` so the 2-level tree
+  image has a host-side oracle (the kernel currently outruns the verifier there).
+- `readdir` for EMBKFS (walk all DIR_ENTRY items + their chains) — a clean,
+  immediately testable lap on the existing images.
+
 ---
 
 ## Build Environment
@@ -155,11 +220,13 @@ Dependency order:
 
 ## Build / Run Commands
 ```bash
-make            # build everything
-make run        # boot in QEMU (serial → stdio)
-make run-ahci   # boot with an extra AHCI SATA disk attached
-make debug      # GDB server on :1234 (paused)
-make clean      # remove binaries (preserves disk.img / ahci.img)
+make                 # build everything
+make run             # boot in QEMU (serial → stdio)
+make run-ahci        # boot with an extra AHCI SATA disk attached
+make run-embkfs      # boot with a flat EMBKFS image as sdb
+make run-embkfs-tree # boot with a 2-level EMBKFS tree image as sdb
+make debug           # GDB server on :1234 (paused)
+make clean           # remove binaries (preserves disk.img / ahci.img)
 ```
 
 ## Memory Layout (physical, low region)
@@ -191,3 +258,5 @@ Virtual: kernel at 0xFFFFFFFF80000000; direct map at DIRECT_MAP_BASE
 - Page tables constrained to first 2 MB physical (KP2V) → ~32 GB RAM hard limit.
 - Stack hardcoded at 0x200000; no NX usage yet; single-core; BIOS-only (no UEFI).
 - Bootloader loads a fixed 512 sectors (no ELF-aware sizing yet).
+- Block-layer DMA/IRQ wired for the IDE primary channel only; mountable disks
+  must be IDE primary or AHCI. No partition support (whole disks: sda, sdb…).

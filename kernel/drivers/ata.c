@@ -436,6 +436,36 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     return 0;
 }
 
+// Issue FLUSH CACHE (0xE7) as a STANDALONE barrier — drain the drive's
+// write-back cache to the platter without issuing a write. The PIO/DMA write
+// paths above already flush per write, but exposing the command on its own lets
+// the block layer (and filesystems) order durability explicitly, independent of
+// that incidental per-write behaviour.
+int ata_flush(uint32_t drive_index) {
+    if (drive_index >= drive_count) return -1;
+    const struct ata_drive *d = &drives[drive_index];
+
+    if (ata_wait_not_busy(d->io_base) < 0) return -1;
+
+    // Select the drive; FLUSH CACHE ignores the LBA/count registers.
+    outb(d->io_base + ATA_REG_DRIVE, d->is_slave ? 0xF0 : 0xE0);
+    ata_io_wait(d->ctrl_base);
+
+    ata_irq_fired = false;
+    outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+    if (ata_wait_irq() < 0) {
+        if (ata_wait_not_busy(d->io_base) < 0) return -1;  // fallback if no flush IRQ
+    }
+    return 0;
+}
+
+// Block-layer adapter: flush. Maps the device back to its ATA drive index.
+static int ata_block_flush(struct embk_block_device *dev) {
+    if (!dev) return -EMBK_EINVAL;
+    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data;
+    return (ata_flush(drive_index) == 0) ? EMBK_OK : -EMBK_EIO;
+}
+
 // Block-layer adapter: read. Pulls the ATA drive index from driver_data,
 // dispatches to the DMA READ PATH.
 static int ata_block_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buffer) {
@@ -481,6 +511,7 @@ void ata_register_block_devices(void) {
         ata_block_devices[i].block_size = ATA_SECTOR_SIZE;
         ata_block_devices[i].read = ata_block_read;
         ata_block_devices[i].write = ata_block_write;
+        ata_block_devices[i].flush = ata_block_flush;
         ata_block_devices[i].driver_data = (void *)(uintptr_t)i; // Store the drive index
         ata_block_devices[i].dma_max_phys      = 0xFFFFFFFF;   // 32-bit DMA
         ata_block_devices[i].needs_kernel_range = true;

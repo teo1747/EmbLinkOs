@@ -1,0 +1,37 @@
+# EmbLink OS — .gitattributes
+#
+# Primary job: guard binary artifacts so Git NEVER applies text or end-of-line
+# conversion to raw bytes. A filesystem image silently "normalized" as if it
+# were UTF-8/CRLF text is exactly what corrupted an EMBKFS image once — the
+# magic and CRC32C checksums no longer matched on read, and it looked like a
+# reader bug for far too long. This file makes that class of failure impossible.
+
+# Default: let Git auto-detect text vs binary, and store text with LF endings.
+* text=auto eol=lf
+
+# --- Raw images & disk blobs — always binary, never converted ---------------
+*.img   binary
+*.bin   binary
+*.iso   binary
+*.dd    binary
+*.raw   binary
+
+# --- Compiled / linked output -----------------------------------------------
+*.elf   binary
+*.o     binary
+*.a     binary
+
+# --- Embedded binary assets (fonts, etc.) -----------------------------------
+*.psf   binary
+*.fnt   binary
+
+# --- Sources pinned to LF (defensive; matches the auto default above) -------
+*.c     text eol=lf
+*.h     text eol=lf
+*.asm   text eol=lf
+*.s     text eol=lf
+*.S     text eol=lf
+*.ld    text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+Makefile text eol=lf
