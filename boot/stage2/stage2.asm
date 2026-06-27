@@ -1,6 +1,8 @@
 [BITS 16]
 [ORG 0x7E00]
 
+%define KERNEL_LOAD_SECTORS 1024
+
 start:
     
     cli
@@ -19,16 +21,14 @@ start:
     call e820_query
     call enable_a20
 
-    ; Load kernel: 9 sectors, one at a time, starting at LBA 9
-    
-    ; Load kernel: 90 sectors, one at a time, starting at LBA 9
+    ; Load kernel one sector at a time, starting at LBA 9.
     mov word  [dap + 2], 1          ; 1 sector per read
     mov word  [dap + 4], 0x0000     ; offset
     mov word  [dap + 6], 0x1000     ; segment (= phys 0x10000)
     mov dword [dap + 8], 9          ; initial LBA
     mov dword [dap + 12], 0
 
-    mov cx, 512
+    mov cx, KERNEL_LOAD_SECTORS
 
 .read_loop:
     mov si, dap
@@ -60,7 +60,7 @@ start:
 dap:
     db 0x10                  ; Packet size (16 bytes)
     db 0                     ; Reserved
-    dw 30                  ; number of sectors to read (60 for stage 2)
+    dw 1                   ; number of sectors per INT 13h read (patched above too)
     dw 0x0000                ; Starting head
     dw 0x1000                ; Starting segment (loads to 0x10000)
     dq 9                     ; Starting LBA (sector 10, 0-indexed = LDA 9)

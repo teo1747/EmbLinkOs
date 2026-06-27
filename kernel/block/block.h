@@ -21,6 +21,11 @@ typedef int (*embk_block_read_fn)(struct embk_block_device *dev,
 typedef int (*embk_block_write_fn)(struct embk_block_device *dev,
                                          uint64_t lba, uint32_t count, const void *buffer);
 
+// Drain the device's write-back cache so every previously-completed write is
+// durable on the medium (ATA FLUSH CACHE, or an FUA equivalent). Optional: a
+// driver leaves this NULL if it has no cache to flush.
+typedef int (*embk_block_flush_fn)(struct embk_block_device *dev);
+
 
 // A generic block device: anything that reads/writes fixed-size blocks
 // addressed by block number (LBA). Driveers fill this in and register it.
@@ -32,6 +37,7 @@ struct embk_block_device {
     // Function pointers for read/write operations
     embk_block_read_fn read;
     embk_block_write_fn write;
+    embk_block_flush_fn flush;   // optional: make prior writes durable; NULL = no cache
 
     // Driver-specific data (e.g., ATA drive info, etc.)
     void *driver_data;
@@ -68,6 +74,14 @@ int embk_block_read(struct embk_block_device *dev,
 
 int embk_block_write(struct embk_block_device *dev,
                             uint64_t lba, uint32_t count, const void *buffer);
+
+// Force all previously-completed writes to durable media. Filesystems call this
+// as a WRITE BARRIER: e.g. EMBKFS flushes the new metadata tree before writing
+// the superblock that points at it, so a power loss can't expose a committed
+// superblock whose targets never reached the platter (a drive's write cache can
+// make writes durable out of the order they were issued). Returns EMBK_OK if the
+// device exposes no flush op (it is then assumed to have no write-back cache).
+int embk_block_flush(struct embk_block_device *dev);
 
 
 

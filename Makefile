@@ -39,7 +39,10 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
              kernel/mm/kheap.c \
+             kernel/mm/kmalloc.c \
              kernel/fs/fat32.c \
+			 kernel/fs/embkfs/embkfs.c \
+			 kernel/fs/embkfs/crc32c.c \
              kernel/kstring.c \
              kernel/errno.c \
              kernel/kprintf.c
@@ -48,6 +51,7 @@ LINKER      = kernel/linker.ld
 STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
+STAGE2_LOAD_SECTORS = 1024
 
 # QEMU drive args: boot disk (master) + data disk (slave)
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
@@ -71,8 +75,8 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
 	truncate -s 1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_ELF)) + 511) / 512 )); \
-	echo "Kernel is $$kernel_sectors sectors; stage2 loads 512"; \
-	if [ $$kernel_sectors -gt 512 ]; then \
+	echo "Kernel is $$kernel_sectors sectors; stage2 loads $(STAGE2_LOAD_SECTORS)"; \
+	if [ $$kernel_sectors -gt $(STAGE2_LOAD_SECTORS) ]; then \
 	    echo "*** WARNING: kernel exceeds stage2 load size! Bump cx in stage2.asm ***"; \
 	fi
 # Create the 64 MB data disk only if it doesn't already exist
@@ -93,6 +97,42 @@ fat32.img:
 	mmd -i fat32.img ::SUBDIR
 	echo "file inside a subdirectory" > /tmp/sub.txt
 	mcopy -i fat32.img /tmp/sub.txt ::SUBDIR/INSIDE.TXT
+
+
+embkfs.img:
+	python3 embkfs_mkfs/mkfs_embkfs.py   # adjust path if mkfs writes elsewhere
+
+
+embkfs_tree.img:
+	python3 embkfs_mkfs/mkfs_embkfs.py     # writes embkfs.img AND embkfs_tree.img
+
+
+# COW mutates the disk — boot a PRISTINE copy each run, then grade it.
+EMBKFS_MASTER  := embkfs_tree.img       # pristine, never written by QEMU
+EMBKFS_SCRATCH := embkfs_scratch.img
+
+run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
+	@echo "--- grading the post-COW image ---"
+	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
+
+
+run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs_tree.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
+
+
+run-embkfs: $(IMG) $(DISK) embkfs.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
 
 
 run-ahci: $(IMG) $(DISK) ahci.img
@@ -137,4 +177,4 @@ run-all: $(IMG) ahci.img fat32.img
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) $(ISR_OBJ)
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all
+.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow

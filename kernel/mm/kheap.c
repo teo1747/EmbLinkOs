@@ -129,7 +129,7 @@ void kheap_init(void) {
 }
 
 
-static void *kmalloc_locked(uint64_t size) {
+static void *kheap_alloc_locked(uint64_t size) {
     if (size == 0) {
         return 0; // Don't allocate zero bytes
     }
@@ -182,7 +182,7 @@ static void *kmalloc_locked(uint64_t size) {
         return 0; // Failed to grow heap
     }
 
-    // Append the new region as a free block, then recursively call kmalloc to allocate from it (this will handle splitting if the new block is larger than needed)
+    // Append the new region as a free block, then recursively call kheap_alloc to allocate from it (this will handle splitting if the new block is larger than needed)
     // first find the last block to link this on.
     block_t *last = heap_head;
     while (last->next) {
@@ -195,17 +195,17 @@ static void *kmalloc_locked(uint64_t size) {
     new_block->flags = BLOCK_FREE;
     new_block->prev = last;
     new_block->next = 0;
-    new_block->canary = 0; // will be set in kmalloc call
+    new_block->canary = 0; // will be set in kheap_alloc call
     *block_tail_canary(new_block) = KHEAP_CANARY_TAIL;
     last->next = new_block;
     block_count++;  
 
-    // Recursively call kmalloc to allocate from the new block (this will handle splitting if the new block is larger than needed)
-    return kmalloc_locked(size);
+    // Recursively call kheap_alloc to allocate from the new block (this will handle splitting if the new block is larger than needed)
+    return kheap_alloc_locked(size);
 }
 
 
-static void kfree_locked(void *ptr) {
+static void kheap_free_locked(void *ptr) {
     if (!ptr) {
         return; // No operation on NULL pointer
     }
@@ -257,25 +257,25 @@ static void kfree_locked(void *ptr) {
     }
 }
 
-void *kmalloc(uint64_t size) {
+void *kheap_alloc(uint64_t size) {
     spin_lock(&heap_lock);
-    void *ptr = kmalloc_locked(size);
+    void *ptr = kheap_alloc_locked(size);
     spin_unlock(&heap_lock);
     return ptr;
 }
 
 
-void kfree(void *ptr) {
+void kheap_free(void *ptr) {
     spin_lock(&heap_lock);
-    kfree_locked(ptr);
+    kheap_free_locked(ptr);
     spin_unlock(&heap_lock);
 }
 
 
 
-void *kcalloc(uint64_t count, uint64_t size) {
+void *kheap_calloc(uint64_t count, uint64_t size) {
     uint64_t total_size = count * size;
-    void *ptr = kmalloc(total_size);
+    void *ptr = kheap_alloc(total_size);
     if (ptr) {
         // Zero-initialize the allocated memory
         for (uint64_t i = 0; i < total_size; i++) {
@@ -286,12 +286,12 @@ void *kcalloc(uint64_t count, uint64_t size) {
 }
 
 
-void *krealloc(void *ptr, uint64_t new_size) {
+void *kheap_realloc(void *ptr, uint64_t new_size) {
     if (!ptr) {
-        return kmalloc(new_size); // realloc with NULL ptr is just malloc
+        return kheap_alloc(new_size); // realloc with NULL ptr is just malloc
     }
     if (new_size == 0) {
-        kfree(ptr); // realloc to size 0 is just free
+        kheap_free(ptr); // realloc to size 0 is just free
         return 0;
     }
 
@@ -303,7 +303,7 @@ void *krealloc(void *ptr, uint64_t new_size) {
         return ptr;
     }
     // Need to grow the block. Check if we can expand into the next block if it's free and has enough space.
-    void *new_ptr = kmalloc(new_size);
+    void *new_ptr = kheap_alloc(new_size);
     if (!new_ptr) {
         return 0; // Failed to allocate new block
     }
@@ -314,7 +314,7 @@ void *krealloc(void *ptr, uint64_t new_size) {
     for (uint64_t i = 0; i < old_user_size ; i++) {
         dst[i] = src[i];
     }
-    kfree(ptr); // Free the old block
+    kheap_free(ptr); // Free the old block
     return new_ptr;
 }
 
