@@ -314,6 +314,9 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
 
 
 
+
+
+
 /* kernel/fs/vfs.c — boot-time selftest, append at end of file */
 
 /* Capture the first directory entry readdir hands us, so the selftest can
@@ -424,3 +427,59 @@ int vfs_run_selftests(void)
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
+
+/* kernel/fs/vfs.c — a VFS consumer: `ls`. Touches no filesystem internals,
+ * only the public vfs_* surface. The same code lists any mounted fs. */
+
+static const char *vfs_type_tag(uint8_t t)
+{
+    switch (t) {
+        case VFS_DT_DIR: return "<DIR> ";
+        case VFS_DT_REG: return "<FILE>";
+        case VFS_DT_LNK: return "<LINK>";
+        default:         return "<?>   ";
+    }
+}
+
+struct vfs_ls_ctx {
+    uint64_t count;
+};
+
+static int vfs_ls_cb(const char *name, uint8_t name_len, uint8_t type,
+                     uint64_t ino, void *ctx)
+{
+    struct vfs_ls_ctx *c = (struct vfs_ls_ctx *)ctx;
+
+    /* readdir's name is NOT NUL-terminated and only valid during this call,
+     * so copy it into a local terminated buffer before printing. name_len is
+     * <= 255 (the fs enforces it), so 256 always fits. */
+    char namebuf[256];
+    for (uint8_t i = 0; i < name_len; i++)
+        namebuf[i] = name[i];
+    namebuf[name_len] = '\0';
+
+    kprintf("  %s  %s  (ino %lu)\n", vfs_type_tag(type), namebuf, ino);
+    c->count++;
+    return EMBK_OK;   /* EMBK_OK = keep iterating, per the readdir contract */
+}
+
+int vfs_ls(const char *path)
+{
+    if (!path)
+        return -EMBK_EINVAL;
+
+    kprintf("ls %s:\n", path);
+
+    struct vfs_ls_ctx c = { .count = 0 };
+    int rc = vfs_readdir(path, vfs_ls_cb, &c);
+    if (rc != EMBK_OK) {
+        /* One line covers them all: ENOENT (no such path), ENOTDIR (it's a
+         * file, not a dir), ENOSYS (fs has no readdir). The fs op produced the
+         * right code; ls just reports it — no type-checking duplicated here. */
+        kprintf("ls: %s: %s\n", path, embk_strerror(rc));
+        return rc;
+    }
+
+    kprintf("ls: %lu entr%s\n", c.count, (c.count == 1) ? "y" : "ies");
+    return EMBK_OK;
+}

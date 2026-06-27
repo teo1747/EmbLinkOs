@@ -118,7 +118,7 @@ int  vfs_write(const char *path, uint64_t off, const void *buf, size_t len, size
 int  vfs_readdir(const char *path, vfs_readdir_cb cb, void *ctx);
 int  vfs_stat(const char *path, struct vfs_stat *out);
 
-
+int vfs_ls(const char *path);
 int vfs_run_selftests(void);
 
 #endif /* _VFS_H */
