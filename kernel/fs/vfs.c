@@ -175,6 +175,144 @@ int vfs_resolve(const char *path, struct vnode *out) {
 }
 
 
+/* Public wrappers*/
+
+/* The surface the rest of the kernel uses to interact with the VFS. 
+ * Each is the same three steps - resolve, check the op, dispatch. A successful
+ * vfs_resolve GUARANTEES vn.mnt and vn.mnt->ops are valid (the root carries
+ * them and ->lookup copies them forward), so each wrapper only has to check the
+ * one op slot it cares about. A NULL op slot means the fs doesn't support that operation. */
+
+ int vfs_read(const char *path, uint64_t off, void *buf, size_t len, size_t *out_read) {
+    
+    if (!buf || !out_read)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int err = vfs_resolve(path, &vn);
+    if (err)
+        return err;
+
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->read)
+        return -EMBK_ENOSYS;
+
+    // Reading a directory path is rejected downstream: the read op returns -EMBK_EISDIR
+    // (the adapter checks vn->type). we don't pre-check here
+    return vn.mnt->ops->read(&vn, off, buf, len, out_read);
+}
+
+int vfs_write(const char *path, uint64_t off, const void *buf, size_t len, size_t *out_written) {
+    
+    if ((!buf && len) || !out_written)
+        return -EMBK_EINVAL;
+    /* Struct: the file must already exist. A missing path resolves to -EMBK_ENOENT 
+     * and we propagate it. Creation is NOT done here - this function has no `mode`
+     * and create needs one. Creat-on-open (O_CREAT) is the open()/fd layer's responsibility. 
+     * composing create + write. */
+    struct vnode vn;
+    int err = vfs_resolve(path, &vn);
+    if (err)
+        return err;
+
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->write)
+        return -EMBK_ENOSYS;
+
+    // Writing a directory path is rejected downstream: the write op returns -EMBK_EISDIR
+    // (the adapter checks vn->type). we don't pre-check here
+    return vn.mnt->ops->write(&vn, off, buf, len, out_written);
+}
+
+
+int vfs_readdir(const char *path, vfs_readdir_cb cb, void *ctx){
+    
+    if (!cb)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int err = vfs_resolve(path, &vn);
+    if (err)
+        return err;
+
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->readdir)
+        return -EMBK_ENOSYS;
+
+    if (vn.type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+
+    // A non-directory path is rejected downstream: the readdir op returns -EMBK_ENOTDIR
+    return vn.mnt->ops->readdir(&vn, cb, ctx);
+}
+
+
+int vfs_stat(const char *path, struct vfs_stat *out) {
+    
+    if (!out)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int err = vfs_resolve(path, &vn);
+    if (err)
+        return err;
+
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+
+    return vn.mnt->ops->stat(&vn, out);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* kernel/fs/vfs.c — boot-time selftest, append at end of file */
 
