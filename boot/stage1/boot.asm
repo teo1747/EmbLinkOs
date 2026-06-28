@@ -1,6 +1,14 @@
 [BITS 16]
 
-[ORG 0x7C00]    
+[ORG 0x7C00]
+
+; Number of sectors to load for Stage 2.
+; Injected by the Makefile as -D STAGE2_LOAD_SECTORS=<n>.
+; The default keeps a plain `nasm boot.asm` working for quick experiments.
+%ifndef STAGE2_LOAD_SECTORS
+%define STAGE2_LOAD_SECTORS 8
+%endif
+
 ; Set up the stack
 
 
@@ -19,7 +27,7 @@ start:
     
     ; load stage 2 from disk 
     mov ah, 0x02            ; BIOS read sector function
-    mov al, 8               ; read 8 sectors
+    mov al, STAGE2_LOAD_SECTORS  ; exact stage2 size, computed by Makefile
     mov ch, 0               ; Cylinder 0
     mov cl, 2               ; Sector 2 (first sector is 1)
     mov dh, 0               ; Head 0

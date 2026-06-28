@@ -10,6 +10,7 @@
 #include "drivers/console.h"
 #include "drivers/keyboard.h"
 #include "drivers/timer.h"
+#include "drivers/hpet.h"
 #include "drivers/pci.h"
 #include "drivers/ata.h"
 #include "drivers/ahci.h"
@@ -32,97 +33,15 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
+#include "selftests.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
 
-static void fat32_read_path(struct fat32_volume *vol, const char *path, uint8_t *buffer, uint32_t buffer_size) {
-    int n = fat32_read(vol, path, buffer, buffer_size - 1);
-    if (n >= 0) {
-        buffer[n] = '\0';
-        kprintf("READ %s: %d bytes\n%s\n", path, n, buffer);
-    } else {
-        kprintf("READ %s failed: %s\n", path, embk_strerror(n));
-    }
-}
-
-static void fat32_write_path(struct fat32_volume *vol, const char *path,
-                             const char *content) {
-    uint32_t len = 0;
-    while (content[len]) {
-        len++;
-    }
-    int rc = fat32_write(vol, path, (const uint8_t *)content, len);
-    if (rc >= 0) {
-        kprintf("WROTE %s: %d bytes\n", path, rc);
-    } else {
-        kprintf("WRITE %s failed: %s\n", path, embk_strerror(rc));
-    }
-}
-
-static void fat32_test_all(struct fat32_volume *vol) {
-    static uint8_t buffer[512];
-
-    kprintf("\n=== FAT32 TEST SUITE ===\n");
-    fat32_list_root(vol);
-
-    fat32_read_path(vol, "HELLO.TXT", buffer, sizeof(buffer));
-    fat32_read_path(vol, "/SUBDIR/INSIDE.TXT", buffer, sizeof(buffer));
-
-    fat32_write_path(vol, "/NEWFILE.TXT", "This is a new file written by test.");
-    fat32_read_path(vol, "/NEWFILE.TXT", buffer, sizeof(buffer));
-
-    int rc = fat32_mkdir(vol, "/TESTDIR");
-    if (rc == EMBK_OK) {
-        kprintf("MKDIR /TESTDIR succeeded\n");
-    } else if (rc == -EMBK_EEXIST) {
-        kprintf("MKDIR /TESTDIR skipped: already exists\n");
-    } else {
-        kprintf("MKDIR /TESTDIR failed: %s\n", embk_strerror(rc));
-    }
-
-    fat32_write_path(vol, "/TESTDIR/INNER.TXT", "Inside test dir file.");
-    fat32_read_path(vol, "/TESTDIR/INNER.TXT", buffer, sizeof(buffer));
-
-    fat32_write_path(vol, "/LONG NAME EXAMPLE.TXT", "Long filename test content.");
-    fat32_read_path(vol, "/LONG NAME EXAMPLE.TXT", buffer, sizeof(buffer));
-
-    kprintf("=== FAT32 TEST SUITE COMPLETE ===\n");
-}
-
 static void kernel_handle_line_command(const char *cmd)
 {
-    if (strcmp(cmd, "embkfs-test") == 0) {
-        int rc_path = embkfs_run_path_selftests();
-        int rc_alloc = embkfs_run_allocator_selftests();
-        int rc_tree = embkfs_run_tree_selftests();
-        int rc_obj = embkfs_run_object_selftests();
-        int rc_ns = embkfs_run_namespace_selftests();
-        if (rc_path == EMBK_OK && rc_alloc == EMBK_OK && rc_tree == EMBK_OK && rc_obj == EMBK_OK && rc_ns == EMBK_OK) {
-            kprintf("\n[cmd] embkfs-test: OK\n");
-        } else {
-            if (rc_path != EMBK_OK)
-                kprintf("\n[cmd] embkfs-test path failed: %s\n", embk_strerror(rc_path));
-            if (rc_alloc != EMBK_OK)
-                kprintf("\n[cmd] embkfs-test allocator failed: %s\n", embk_strerror(rc_alloc));
-            if (rc_tree != EMBK_OK)
-                kprintf("\n[cmd] embkfs-test tree failed: %s\n", embk_strerror(rc_tree));
-            if (rc_obj != EMBK_OK)
-                kprintf("\n[cmd] embkfs-test object failed: %s\n", embk_strerror(rc_obj));
-            if (rc_ns != EMBK_OK)
-                kprintf("\n[cmd] embkfs-test namespace failed: %s\n", embk_strerror(rc_ns));
-        }
+    if (selftests_handle_command(cmd))
         return;
-    }
-
-    if (strcmp(cmd, "fd-test") == 0) {
-        int rc = vfs_fd_run_selftests();
-        if (rc == EMBK_OK)
-            kprintf("\n[cmd] fd-test: OK\n");
-        else
-            kprintf("\n[cmd] fd-test failed: %s\n", embk_strerror(rc));
-        return;
-    }
 
     if (cmd[0])
         kprintf("\n[cmd] unknown command: %s\n", cmd);
@@ -146,6 +65,9 @@ void kernel_main(void) {
     lapic_init();
     ioapic_init();
 
+    // --- HPET: must come after acpi_init + vmm (for MMIO map) ---
+    hpet_init();
+
     // --- Devices ---
     
     pci_init();
@@ -168,10 +90,14 @@ void kernel_main(void) {
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
 
+    // --- TSC calibration (uses HPET if available, else PIT fallback) ---
+    tsc_calibrate();
+
     __asm__ volatile ("sti");
 
     // --- Boot splash ---
     boot_animation();
+    console_clear();
 
 // ============================================================
     //  Block device enumeration
@@ -198,27 +124,52 @@ void kernel_main(void) {
             break;
         }
     }
+    selftests_init(&vol, found);
     if (!found) {
         kprintf("No FAT32 volume found on any disk\n");
-    } else {
-        fat32_test_all(&vol);
     }
 
     vfs_init();
+    bool vfs_ready = false;
     struct embkfs_volume *embk_live = embkfs_live_volume();
-    if (!embk_live) {
-        kprintf("VFS: EMBKFS not mounted, skipping VFS register/selftests\n");
-    } else {
+
+    if (embk_live) {
         int rc = embkfs_vfs_register("/", embk_live);
         if (rc != EMBK_OK) {
             kprintf("VFS: EMBKFS register failed: %s\n", embk_strerror(rc));
         } else {
-            vfs_fd_init();
-            vfs_run_selftests();
+            vfs_ready = true;
         }
     }
 
+    if (found) {
+        const char *fat_mp = vfs_ready ? "/fat32" : "/";
+        int rc = fat32_vfs_register(fat_mp, &vol);
+        if (rc != EMBK_OK) {
+            kprintf("VFS: FAT32 register at %s failed: %s\n", fat_mp, embk_strerror(rc));
+        } else {
+            vfs_ready = true;
+        }
+    }
+
+    if (!vfs_ready)
+        kprintf("VFS: no filesystem mounted\n");
+
+    selftests_set_vfs_ready(vfs_ready);
+    if (vfs_ready)
+        vfs_fd_init();
+
     vfs_ls("/");
+
+    void enter_user_mode(void);   /* or include usermode.h */
+
+    serial_write_string("\n=== Ring 3 test ===\n");
+    enter_user_mode();
+
+    /* execution does not return here — the stub faults in ring 3 and the
+    #GP handler takes over */
+    serial_write_string("UNREACHABLE: returned from ring 3?!\n");
+    for (;;) { __asm__ volatile("hlt"); }
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;

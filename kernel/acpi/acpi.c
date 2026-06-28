@@ -182,6 +182,9 @@ const struct acpi_info *acpi_init(void) {
     info.local_apic_address = 0;
     info.cpu_count = 0;
     info.io_apic_count = 0;
+    info.hpet_found = false;
+    info.hpet_address = 0;
+    info.hpet_minimum_tick = 0;
 
 
     struct rsdp *r = find_rsdp();
@@ -207,6 +210,23 @@ const struct acpi_info *acpi_init(void) {
 
     
     parse_madt((struct madt *)madt_hdr);
+
+    /* Look for the HPET table (optional). */
+    struct acpi_sdt_header *hpet_hdr = find_table(r, "HPET");
+    if (hpet_hdr && checksum_ok(hpet_hdr, hpet_hdr->length) &&
+        hpet_hdr->length >= sizeof(struct acpi_hpet)) {
+        struct acpi_hpet *ht = (struct acpi_hpet *)hpet_hdr;
+        if (ht->base_address && ht->gas_addr_space == 0 /* memory */) {
+            info.hpet_found       = true;
+            info.hpet_address     = ht->base_address;
+            info.hpet_minimum_tick = ht->minimum_tick;
+            kprintf("ACPI: HPET at phys %p, minimum_tick=%u\n",
+                    (void *)info.hpet_address,
+                    (unsigned int)info.hpet_minimum_tick);
+        }
+    } else {
+        kprintf("ACPI: no valid HPET table\n");
+    }
 
     info.found = true;
     kprintf("ACPI: found %u CPU(s), %u IO-APIC(s)\n",

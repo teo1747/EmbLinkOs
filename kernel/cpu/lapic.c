@@ -1,5 +1,6 @@
 #include "lapic.h"
 #include "../drivers/serial.h"
+#include "../drivers/hpet.h"
 #include "../acpi/acpi.h"
 #include "../include/kprintf.h"
 #include "../mm/vmm.h"
@@ -86,9 +87,8 @@ uint32_t lapic_get_id(void) {
 void lapic_timer_init(uint8_t vector) {
 
     serial_write_string("\n=== LAPIC timer calibration ===\n");
-    // Calibrate the LAPIC timer against the PIT to determine ticks per ms
-    const uint32_t calibration_time_ms = 10; // Calibrate over 100 ms for better accuracy
-    
+    // Calibrate the LAPIC timer against the HPET (preferred) or PIT
+    const uint32_t calibration_time_ms = 10;
 
     // Start the LAPIC timer in one-shot mode with a large initial count
     lapic_write(LAPIC_REG_TIMER_DIVIDE, LAPIC_REG_TIMER_DIVIDE); // Divide by 16
@@ -96,7 +96,13 @@ void lapic_timer_init(uint8_t vector) {
     lapic_write(LAPIC_REG_TIMER_INIT, 0XFFFFFFFF); // Set the interrupt vector (unmasked, one-shot)
 
     // Wait for the timer to count down for the calibration time
-    pit_delay_ms(calibration_time_ms);
+    if (hpet_available()) {
+        hpet_delay_ms(calibration_time_ms);
+        kprintf("LAPIC timer: calibrating against HPET\n");
+    } else {
+        pit_delay_ms(calibration_time_ms);
+        kprintf("LAPIC timer: calibrating against PIT (HPET unavailable)\n");
+    }
 
     // Stop the timer by masking, read how far it counted
     uint32_t current = lapic_read(LAPIC_REG_TIMER_CURRENT);

@@ -9,10 +9,10 @@ left to do.
 ## Bootloader
 
 ### Stage 1
-- [ ] Hardcoded Stage 2 sector count (8 sectors) — should be dynamic.
+- [x] Hardcoded Stage 2 sector count (8 sectors) — should be dynamic.
 
 ### Stage 2
-- [ ] Loads a fixed 512 sectors for the kernel regardless of actual size.
+- [x] Loads a fixed 512 sectors for the kernel regardless of actual size.
   - LESSON (learned the hard way): when the kernel outgrew the old 90-sector
     limit, the tail wasn't loaded. Symptoms were truncated MMIO addresses and
     garbled E820 — looked like a pointer bug, was actually missing code/data
@@ -64,7 +64,7 @@ left to do.
     * Then switch VMM table access from KP2V to P2V.
 
 ### vmm_map_mmio
-- [x] Uses VMM_NOCACHE (PCD) — correct for register MMIO.
+
 - [ ] Add vmm_map_mmio_wc() for write-combining (framebuffer, large buffers).
   Requires PAT setup in IA32_PAT (MSR 0x277); then PWT + PAT bits in the PTE
   select the WC slot. See Intel SDM Vol 3, §11.12.
@@ -110,7 +110,7 @@ left to do.
   per Intel SDM Vol 3A §4.7.
 
 ### Timer / Time
-- [ ] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
+- [x] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
   both discovered via ACPI.
 - [ ] Tick handler only does counter++ — eventually: preemption check +
   scheduler invocation (once there are processes).
@@ -140,8 +140,6 @@ left to do.
   ports if multiple SATA disks appear.
 
 ### Block layer
-- [ ] `%llu` used in out-of-range error messages — verify kprintf handles it
-  (the path wasn't exercised yet); else cast to uint64_t / unsigned int.
 - [ ] No partition support — devices are whole disks (sda, sdb…). Partition
   naming convention (sdaN) needed once we parse partition tables / MBR/GPT.
 - [ ] Block-layer reads/writes on IDE secondary channel hang — DMA + IRQ
@@ -202,7 +200,66 @@ left to do.
   Configure via port 0x64: disable mouse port, set scancode set, enable IRQs.
 - [ ] Migrate to USB HID once there's a USB stack.
 
+
 ---
+
+## Filesystem
+
+### EMBKFS
+- [ ] Crash while a file is unlinked-but-open LEAKS its inode. Deferred-free
+  keeps the object alive (links==0, no dirent) until last close, but the
+  open-ref table is in-memory/per-boot — a crash in that window loses the
+  reclaim. Non-corrupting (no fd survives reboot to dangle), just lost space.
+  - FIX: mount-time sweep — scan for inodes with links==0 and free them
+    (orphan reclaim). Cheap, runs once at mount.
+  - STRONGER (later): an on-disk orphan list for crash-safe deferred delete,
+    replayed on mount. Bigger; only if crash-safety of unlinked-open matters.
+- [ ] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
+  array with linear scan and NO lock. Fine single-core/synchronous; needs a
+  lock once opens can race (SMP / preemption) — same class as the block-layer
+  bounce buffer.
+- [ ] `embkfs_parent_dir_oid` resolves `..` by a full-tree scan (O(tree) per
+  `..`). VFS now does dot-dot itself with a breadcrumb stack, so this path is
+  only hit by EMBKFS-internal callers — but if those stay, a stored parent
+  back-ref would make it O(1). Low priority.
+
+### VFS
+- [ ] Single mount only. `vfs_find_mount` ignores `path` and returns the one
+  used slot. Real multi-mount = longest-prefix match (deepest mount point that
+  prefixes the path) + hand back the path remainder relative to that mount.
+  The op table and resolve loop are already ready; only this function changes.
+- [ ] No `.readlink` op. Symlinks resolve to the LINK vnode but can't be
+  followed; EMBKFS already has `embkfs_readlink_object`.
+  - FIX: add `.readlink` to vfs_ops + adapter, follow links inside
+    `vfs_resolve` with a hop-count bound (ELOOP). NOTE: true `..` then differs
+    from the lexical breadcrumb `..` (a symlink's real parent vs its path
+    parent) — revisit the stack semantics when this lands.
+- [ ] No `.truncate` op → O_TRUNC can't be honored at open(). EMBKFS has
+  `embkfs_truncate_object`.
+  - FIX: add `.truncate` op + adapter; wire O_TRUNC in vfs_open.
+- [ ] stat() simplifications: directory nlink hardcoded to 2 (real = 2 +
+  subdir count); directory size reported as ENTRY COUNT, not bytes (ls tags it
+  'e'). Decide whether anything depends on either before "fixing."
+- [ ] `unlink` op has remove(3) semantics — it rmdirs an empty directory.
+  POSIX unlink(2) must return EISDIR on a directory; rmdir(2) is dirs-only.
+  - FIX (syscall layer): split unlink(2)/rmdir(2), either via a separate
+    `.rmdir` op or a stat-and-dispatch in the syscall handler.
+- [ ] Absolute paths only — no cwd / relative resolution (arrives with
+  per-process context).
+- [ ] `vfs_mount` duplicate-mount check is a raw strcmp on `at` (not a
+  normalized path). Fine for the single "/" mount.
+
+### File descriptors
+- [ ] fd table is fixed (64), global, per-boot. No per-process fd tables and no
+  open-file-description sharing (fork / dup / dup2) — arrives with processes.
+  The open-file-description vs fd distinction (shared cursor across dup'd fds)
+  isn't modeled yet; each fd entry currently owns its own cursor.
+- [ ] g_fds is unlocked global mutable state — needs a lock under SMP /
+  preemption (same note as the open-ref and mount tables).
+- [ ] O_TRUNC reserved but not honored (blocked on the VFS truncate op above).
+- [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
+  stat per write, and a TOCTOU window if writes can race. Acceptable while
+  single-threaded; revisit with concurrency.
 
 ## Core / Library
 

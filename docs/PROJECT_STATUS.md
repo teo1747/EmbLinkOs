@@ -174,28 +174,94 @@ checked against them, never the reverse.
   by an output-sink callback (serial sink vs bounded-buffer sink). snprintf is
   bounds-safe and returns the would-be length (truncation detectable).
 
+### EMBKFS write path ✅
+- **Transactional CoW**: every mutation rebuilds the affected B-tree spine
+  bottom-up into fresh blocks, rewrites checksums up the Merkle chain, and
+  installs an atomically swapped, generation-bumped superblock — superblock
+  write is always last, in-memory state updated only on success.
+- **Snapshot-aware allocator**: a per-transaction free delta; superseded nodes
+  and freed data runs are reclaimed into the in-memory bitmap on commit.
+- **Namespace ops**: create, mkdir (with leaf split when an item overflows a
+  node), unlink, rmdir (ENOTEMPTY-guarded), rename (loop-safe across dirs),
+  hard link, symlink + readlink. Directory entries are hash-keyed with
+  collision chains; `.`/`..` are NOT stored on disk (resolved above the entry
+  layer).
+- **Object I/O**: write_object_at (sparse, allocates extents on demand),
+  read_object_at, append, truncate, resize, seek (SET/CUR/END).
+- **Validated** by object-I/O and namespace stress selftests (create/write/
+  seek/truncate/resize/append; link/unlink/rename/symlink roundtrips;
+  collision-chain shrink; leaf split/merge), all green in QEMU.
+
+### EMBKFS unlink-while-open safety ✅
+- **Unix delete-on-last-close**: an in-memory open-reference table tracks how
+  many handles hold each object alive. Free condition is `links == 0 AND
+  opens == 0`; `unlink` owns on-disk `links`, the fd layer drives `opens` via
+  `embkfs_object_get`/`_put`.
+- **Deferred free**: `unlink` on a held-open file drops the name and sets
+  `links = 0` but keeps the inode + extents; the orphan is reclaimed by the
+  last `object_put`, which consults on-disk `links` as the single source of
+  truth (no duplicated "unlinked" flag).
+- **Crash-recovery sweep at mount**: on read-write mount, EMBKFS scans the
+  live tree for inodes with `links == 0` and reclaims orphan files/symlinks,
+  closing the leak window from crashes that happen between unlink and last
+  close.
+- **Proven**: a file stays readable through its open fd after its name is
+  unlinked; blocks are reclaimed only on final close (selftest asserts the
+  read-back matches the payload, so an early-free cannot pass).
+
+### VFS layer ✅
+- **Filesystem-neutral op table** (`struct vfs_ops`): lookup, readdir, read,
+  write, create, mkdir, unlink, stat, vget, obj_get/obj_put. A NULL op means
+  unsupported → the VFS returns -EMBK_ENOSYS. The rest of the kernel never
+  calls embkfs_* / fat32_* directly.
+- **vnode = stateless value type** `{mnt, ino, type}` — owns nothing, copied
+  freely; the VFS core allocates vnode storage, the fs ops only populate it.
+- **Mount registry**: static table; `vfs_mount` records an already-open volume
+  and wires its root vnode self-referentially (`root.mnt = &slot`). Borrows
+  fs_data, never owns it. v1 = single mount at "/".
+- **`vfs_resolve` is the sole path parser**: component-by-component walk via
+  ->lookup; `.`/`..` handled in the path layer with a value-vnode breadcrumb
+  stack (`..` bounded at root, no underflow), depth-bounded. So every fs gets
+  dot-dot for free, including ones whose own walker can't.
+- **Public surface**: vfs_read/write/readdir/stat (resolve-then-dispatch),
+  `vfs_ls` consumer (lists any fs; sizes via vget+stat, dir size tagged as
+  entry-count not bytes), boot selftest (6 checks: empty walk, `.`/`..`,
+  relative rejection, ENOENT propagation, live readdir-discovered resolve).
+
+### File-descriptor layer ✅
+- **First stateful layer above the fs**: static fd table (fds start at FD_BASE
+  = 3, leaving 0/1/2 for stdio); each entry = vnode copy + cursor + flags +
+  used. An fd is bound to the OBJECT, not the name → survives rename/unlink.
+- **open()**: resolves once; create-on-open under O_CREAT via VFS-level
+  parent/leaf split (creates the leaf only, no mkdir -p); O_EXCL → EEXIST;
+  obj_get on the convergent path so create and existing-file both register the
+  open. O_APPEND honored; O_TRUNC reserved (needs a truncate op).
+- **close()**: obj_put BEFORE freeing the slot — this is what triggers reclaim
+  of an unlinked-but-open file.
+- **read/write** are cursor-driven (advance pos by bytes moved); seek SET/CUR/
+  END; fstat; access-mode checks return EBADF. Selftest covers the full round
+  trip plus the unlink-while-open invariant end to end through the public fd
+  surface.
+
 ---
 
 ## Current State
-- Boots cleanly in QEMU (`make run`, `make run-ahci`, `make run-embkfs`,
-  `make run-embkfs-tree`).
-- Kernel at 0xFFFFFFFF80100000.
-- Full memory management, interrupts, storage stack, and block layer operational.
-- Filesystems: FAT32 (read + write) and EMBKFS (read-only mount — multi-level
-  B-tree, Merkle-verified, collision-handling) both mount and read on the block
-  layer.
-- Debug output via COM1 serial + framebuffer console.
+- Filesystems: FAT32 (read + write) and EMBKFS (read + write, multi-level
+  B-tree, Merkle-verified, collision-handling, unlink-while-open safe) mount on
+  the block layer.
+- VFS layer operational (single mount at "/", sole path parser, `.`/`..`,
+  vget); `ls` works over the public surface.
+- File-descriptor layer operational: open/close/read/write/seek/fstat,
+  create-on-open, Unix delete-on-last-close. (These are the backends a future
+  syscall layer will wrap.)
 
 ## Next Steps (roadmap to Level 4 — run real software)
 Dependency order:
-1. **Filesystem** on the block layer — turns sectors into files. ✅ FAT32
-   (read + write) and EMBKFS read-only mount are done. **Active build:** the
-   EMBKFS *write* path — snapshot-aware block allocator, copy-on-write (new
-   nodes bottom-up), and propagation of fresh checksums up the Merkle spine to
-   an atomically installed, generation-bumped superblock
-   (EMBKFS spec §11, phases 2–3). ← NEXT
-2. **VFS** layer (generic file operations, mountable filesystems).
-3. **User mode (ring 3)** + TSS.
+1. **Filesystem** on the block layer — ✅ FAT32 (read+write) and EMBKFS
+   (read+write, unlink-while-open safe).
+2. **VFS** layer — ✅ neutral op table, sole path parser, fd/open() layer
+   (create-on-open, delete-on-last-close).
+3. **User mode (ring 3)** + TSS. ← NEXT
 4. **System calls** (syscall/sysret ABI).
 5. **Per-process address spaces** (VMM already has the primitives).
 6. **ELF loader** → run a program from disk (= Level 1).
@@ -216,7 +282,7 @@ Smaller near-term loose ends:
 ## Build Environment
 - OS: Ubuntu Linux. Toolchain: x86_64-elf cross compiler at /usr/local/cross/bin.
 - NASM, QEMU, GNU Make, VS Code, GDB.
-- Repository: github.com/teo1747/Helios (rename to EmbLink pending).
+- Repository: github.com/teo1747/EmbLinkOs.
 
 ## Build / Run Commands
 ```bash
@@ -245,18 +311,17 @@ Virtual: kernel at 0xFFFFFFFF80000000; direct map at DIRECT_MAP_BASE
 (0xFFFF800000000000); MMIO at MMIO_BASE (0xFFFFC00000000000); heap at
 0xFFFFFF8000000000.
 
-## Teaching Style Preferences
-- Go slow, line by line; explain every SDM section involved.
-- Ask questions to verify understanding before moving on; don't skip the "why".
-- User answers questions, then writes the code, then we debug together.
-- User is electronics/embedded background, junior engineer level.
-- Deliver code directly, then explain. Tell the user when to commit + a message.
 
 ## Known Limitations (see TODO.md for the full, current list)
-- VMM kernel mapping hardcoded to first 2 MB — will break when the kernel
-  crosses 2 MB (page-fault). Fix: map up to rounded-up KV2P(kernel_end).
 - Page tables constrained to first 2 MB physical (KP2V) → ~32 GB RAM hard limit.
 - Stack hardcoded at 0x200000; no NX usage yet; single-core; BIOS-only (no UEFI).
 - Bootloader loads a fixed 512 sectors (no ELF-aware sizing yet).
 - Block-layer DMA/IRQ wired for the IDE primary channel only; mountable disks
   must be IDE primary or AHCI. No partition support (whole disks: sda, sdb…).
+- VFS: single mount only (no multi-mount / longest-prefix). No symlink
+  resolution yet (no `.readlink` op, though EMBKFS supports it). stat reports
+  directory nlink=2 (not 2+subdirs) and directory size=entry-count (not bytes).
+  O_TRUNC reserved but not honored (needs a truncate op). The `unlink` op has
+  remove(3) semantics (rmdirs empty dirs); the POSIX unlink(2)/rmdir(2) split is
+  deferred to the syscall layer. Absolute paths only (no cwd).
+- fd table is fixed (64 entries), per-boot, no fork/dup sharing yet.

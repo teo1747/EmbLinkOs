@@ -70,8 +70,16 @@ void isr_handler(struct registers *regs) {
     serial_write_hex(regs->rip);
     serial_write_string("\n");
 
+    serial_write_string("CS: ");
+    serial_write_hex(regs->cs);
+    serial_write_string("\n");
+
     serial_write_string("RSP: ");
     serial_write_hex(regs->rsp);
+    serial_write_string("\n");
+
+    serial_write_string("SS: ");
+    serial_write_hex(regs->ss);
     serial_write_string("\n");
 
     serial_write_string("RBP: ");

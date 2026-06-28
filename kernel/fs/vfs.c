@@ -83,15 +83,42 @@ int vfs_mount(const char *path, const struct vfs_ops *ops, void *fs_data,
  * longest-prefix match (the deepest mount point that is a prefix of path wins),
  * and it would also hand back the path remainder relative to that mount. */
 
-static struct vfs_mount *vfs_find_mount(const char *path) {
+static bool vfs_mount_is_prefix(const char *path, const char *mount_at)
+{
+    size_t mlen = strlen(mount_at);
 
-    (void)path;  // unused in v1
+    if (mlen == 0)
+        return false;
+
+    if (strcmp(mount_at, "/") == 0)
+        return path[0] == '/';
+
+    for (size_t i = 0; i < mlen; i++)
+        if (path[i] != mount_at[i])
+            return false;
+
+    return path[mlen] == '\0' || path[mlen] == '/';
+}
+
+static struct vfs_mount *vfs_find_mount(const char *path) {
+    struct vfs_mount *best = NULL;
+    size_t best_len = 0;
+
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-        if (g_mounts[i].used) {
-            return &g_mounts[i];
+        if (!g_mounts[i].used)
+            continue;
+
+        if (!vfs_mount_is_prefix(path, g_mounts[i].at))
+            continue;
+
+        size_t cur_len = strlen(g_mounts[i].at);
+        if (!best || cur_len > best_len) {
+            best = &g_mounts[i];
+            best_len = cur_len;
         }
     }
-    return NULL;
+
+    return best;
 }
 
 /* Max path depth breadcrumb stack can hold. A path with more nested
@@ -121,8 +148,9 @@ int vfs_resolve(const char *path, struct vnode *out) {
 
     stack[depth++] = m->root;                               // a value coppy - vnode own nothing
 
-    const char *s = path ;  
-    while (*s == '/') s++;                                  // skip the leading slash(es)
+    size_t mlen = strlen(m->at);
+    const char *s = path + mlen;
+    while (*s == '/') s++;                                  // walk relative to mount root
 
     while (*s != '\0') {
         /* Carve out one component [comp, comp+len]. */
@@ -259,61 +287,6 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
 
     return vn.mnt->ops->stat(&vn, out);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -2496,6 +2496,110 @@ static int embkfs_destroy_object(struct embkfs_volume *vol, uint64_t oid)
     return EMBK_OK;
 }
 
+/* Return the first orphan inode (links==0) reachable from the current root.
+ * Mount-time sweep only reclaims non-directories via embkfs_destroy_object,
+ * which deletes inode+extents and data runs in one transaction. */
+static int embkfs_find_orphan_inode_rec(struct embkfs_volume *vol,
+                                        const struct embk_block_ptr *ptr,
+                                        uint64_t *out_oid, bool *out_found)
+{
+    uint8_t *buf = kmalloc(vol->block_size);
+    if (!buf) return -EMBK_ENOMEM;
+
+    int rc = embkfs_read_node(vol, ptr, buf, vol->block_size);
+    if (rc != EMBK_OK) {
+        kfree(buf);
+        return rc;
+    }
+
+    const struct embk_node_header *h = (const struct embk_node_header *)buf;
+    if (h->level == 0) {
+        for (uint32_t i = 0; i < h->nritems; i++) {
+            const struct embk_item_header *it = embk_leaf_item(buf, i);
+            if (it->key.type != EMBK_TYPE_INODE)
+                continue;
+            if (it->key.object_id == EMBKFS_ROOT_OBJECT_ID)
+                continue;
+
+            const struct embk_inode_item *ino =
+                embk_item_data(buf, vol->block_size, it, sizeof *ino);
+            if (!ino) {
+                kfree(buf);
+                return -EMBK_EINVAL;
+            }
+            if (ino->links != 0)
+                continue;
+            if ((ino->mode & EMBKFS_S_IFMT) == EMBKFS_S_IFDIR)
+                continue;
+
+            *out_oid = it->key.object_id;
+            *out_found = true;
+            kfree(buf);
+            return EMBK_OK;
+        }
+
+        kfree(buf);
+        *out_found = false;
+        return EMBK_OK;
+    }
+
+    if (h->nritems == 0 || h->nritems > EMBKFS_MAX_SLOTS) {
+        kfree(buf);
+        return -EMBK_EINVAL;
+    }
+
+    const struct embk_internal_slot *slots =
+        (const struct embk_internal_slot *)(buf + sizeof(struct embk_node_header));
+    for (uint32_t i = 0; i < h->nritems; i++) {
+        struct embk_block_ptr child;
+        memcpy(&child, &slots[i].ptr, sizeof child);
+        rc = embkfs_find_orphan_inode_rec(vol, &child, out_oid, out_found);
+        if (rc != EMBK_OK) {
+            kfree(buf);
+            return rc;
+        }
+        if (*out_found) {
+            kfree(buf);
+            return EMBK_OK;
+        }
+    }
+
+    kfree(buf);
+    *out_found = false;
+    return EMBK_OK;
+}
+
+/* Crash-recovery sweep: reclaim unreachable, unlinked files/symlinks left by a
+ * previous crash in the unlink-while-open window (links==0, no dirent). */
+static int embkfs_mount_orphan_sweep(struct embkfs_volume *vol)
+{
+    if (!vol) return -EMBK_EINVAL;
+    if (vol->read_only) return EMBK_OK;
+
+    uint32_t reclaimed = 0;
+    for (;;) {
+        uint64_t oid = 0;
+        bool found = false;
+
+        int rc = embkfs_find_orphan_inode_rec(vol, &vol->root, &oid, &found);
+        if (rc != EMBK_OK)
+            return rc;
+        if (!found)
+            break;
+
+        rc = embkfs_destroy_object(vol, oid);
+        if (rc != EMBK_OK)
+            return rc;
+        reclaimed++;
+    }
+
+    if (reclaimed) {
+        kprintf("EMBKFS: %s: mount sweep reclaimed %u orphan object(s)\n",
+                vol->dev->name, (unsigned)reclaimed);
+    }
+    return EMBK_OK;
+}
+
 /* fd layer calls this when a handle opens. */
 int embkfs_object_get(struct embkfs_volume *vol, uint64_t oid)
 {
@@ -4375,6 +4479,22 @@ void embkfs_init(void)
     
     embkfs_alloc_init(&vol);
 
+    {
+        int sweep_rc = embkfs_mount_orphan_sweep(&vol);
+        if (sweep_rc != EMBK_OK) {
+            kprintf("EMBKFS: %s: mount orphan sweep failed: %s\n",
+                    vol.dev->name, embk_strerror(sweep_rc));
+            return;
+        }
+    }
+
+    /* Boot path now does init/mount only. Demo and stress routines are
+     * command-driven via the selftest command module. */
+    return;
+
+}
+
+#if 0
     if (h->level == 0)                 /* flat-image diagnostic only */
         embkfs_leaf_dump(&vol, rootbuf);
     
@@ -4673,4 +4793,40 @@ void embkfs_init(void)
         }
     }
 
+}
+#endif
+
+int embkfs_run_boot_diagnostics(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted)
+        return -EMBK_ENODEV;
+
+    struct embkfs_volume *vol = g_embkfs_live;
+    static uint8_t rootbuf[4096];
+
+    int rc = embkfs_read_node(vol, &vol->root, rootbuf, sizeof rootbuf);
+    if (rc != EMBK_OK)
+        return rc;
+
+    const struct embk_node_header *h = (const struct embk_node_header *)rootbuf;
+    kprintf("EMBKFS: %s: diag root level %u (%s) nritems %u\n",
+            vol->dev->name, (unsigned int)h->level,
+            h->level == 0 ? "LEAF" : "internal", (unsigned int)h->nritems);
+
+    if (h->level == 0)
+        embkfs_leaf_dump(vol, rootbuf);
+
+    static const char *const names[] = { "hello.txt", "wgyehkb.txt", "illoeuw.txt" };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        uint64_t oid;
+        if (embkfs_lookup(vol, EMBKFS_ROOT_OBJECT_ID, names[i], &oid) == EMBK_OK) {
+            kprintf("EMBKFS: %s: /%s -> object %lu\n", vol->dev->name, names[i], oid);
+            embkfs_dump_file(vol, oid, names[i]);
+        } else {
+            kprintf("EMBKFS: %s: /%s not found\n", vol->dev->name, names[i]);
+        }
+    }
+
+    embkfs_path_norm_smoke(vol);
+    return EMBK_OK;
 }
