@@ -431,6 +431,25 @@ int vfs_run_selftests(void)
 /* kernel/fs/vfs.c — a VFS consumer: `ls`. Touches no filesystem internals,
  * only the public vfs_* surface. The same code lists any mounted fs. */
 
+ /* in embkfs_vfs.c, add op + table entry */
+
+static int embkfs_vfs_vget(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
+                           struct vnode *out)
+{
+    if (!mnt || !mnt->fs_data || !out)
+        return -EMBK_EINVAL;
+
+    /* No disk I/O: an EMBKFS vnode is just (mnt, oid, type). The oid is the
+     * object id readdir already resolved; type is the dirent type. We package,
+     * we don't look anything up. */
+    out->mnt  = mnt;
+    out->ino  = ino;
+    out->type = type;
+    return EMBK_OK;
+}
+
+
+
 static const char *vfs_type_tag(uint8_t t)
 {
     switch (t) {
@@ -441,7 +460,11 @@ static const char *vfs_type_tag(uint8_t t)
     }
 }
 
+
+/* revised ls in vfs.c — size via vget+stat, no re-resolve by path */
+
 struct vfs_ls_ctx {
+    struct vfs_mount *mnt;   /* the dir's mount, so children can be vget'd */
     uint64_t count;
 };
 
@@ -450,17 +473,53 @@ static int vfs_ls_cb(const char *name, uint8_t name_len, uint8_t type,
 {
     struct vfs_ls_ctx *c = (struct vfs_ls_ctx *)ctx;
 
-    /* readdir's name is NOT NUL-terminated and only valid during this call,
-     * so copy it into a local terminated buffer before printing. name_len is
-     * <= 255 (the fs enforces it), so 256 always fits. */
     char namebuf[256];
     for (uint8_t i = 0; i < name_len; i++)
         namebuf[i] = name[i];
     namebuf[name_len] = '\0';
 
-    kprintf("  %s  %s  (ino %lu)\n", vfs_type_tag(type), namebuf, ino);
+    /* Turn the id readdir gave us into a vnode (no disk I/O, no name search),
+     * then stat THAT vnode. Falls back gracefully if either op is absent. */
+    uint64_t size = 0;
+    bool have_size = false;
+
+    const struct vfs_ops *ops = c->mnt->ops;
+    if (ops->vget && ops->stat) {
+        struct vnode child;
+        int rc = ops->vget(c->mnt, ino, type, &child);
+        if (rc == EMBK_OK) {
+            struct vfs_stat st;
+            rc = ops->stat(&child, &st);
+            if (rc == EMBK_OK) {
+                size = st.size;
+                have_size = true;
+            }
+        }
+    }
+
+    /* Present the size honestly. For files st.size is bytes. For directories
+     * EMBKFS reports ENTRY COUNT, not bytes (the stat choice from way back),
+     * so tag it 'e' instead of letting a count masquerade as a byte size. */
+    if (have_size && type == VFS_DT_DIR) {
+        /* count + 'e' suffix, built into a small local field */
+        char szbuf[24];
+        int n = snprintf(szbuf, sizeof szbuf, "%lue", size);
+        if (n < 0 || (size_t)n >= sizeof szbuf)
+            szbuf[0] = '?', szbuf[1] = '\0';
+        kprintf("  %s  %-20s  %10s  (ino %lu)\n",
+                vfs_type_tag(type), namebuf, szbuf, ino);
+    }
+    else if (have_size) {
+        kprintf("  %s  %-20s  %10lu  (ino %lu)\n",
+                vfs_type_tag(type), namebuf, size, ino);
+    }
+    else {
+        kprintf("  %s  %-20s  %10s  (ino %lu)\n",
+                vfs_type_tag(type), namebuf, "?", ino);
+    }
+
     c->count++;
-    return EMBK_OK;   /* EMBK_OK = keep iterating, per the readdir contract */
+    return EMBK_OK;
 }
 
 int vfs_ls(const char *path)
@@ -468,14 +527,20 @@ int vfs_ls(const char *path)
     if (!path)
         return -EMBK_EINVAL;
 
+    /* We need the directory's own mount to vget its children. Resolve the dir
+     * once, up front, and carry its mount into the callback. */
+    struct vnode dir;
+    int rc = vfs_resolve(path, &dir);
+    if (rc != EMBK_OK) {
+        kprintf("ls: %s: %s\n", path, embk_strerror(rc));
+        return rc;
+    }
+
     kprintf("ls %s:\n", path);
 
-    struct vfs_ls_ctx c = { .count = 0 };
-    int rc = vfs_readdir(path, vfs_ls_cb, &c);
+    struct vfs_ls_ctx c = { .mnt = dir.mnt, .count = 0 };
+    rc = vfs_readdir(path, vfs_ls_cb, &c);
     if (rc != EMBK_OK) {
-        /* One line covers them all: ENOENT (no such path), ENOTDIR (it's a
-         * file, not a dir), ENOSYS (fs has no readdir). The fs op produced the
-         * right code; ls just reports it — no type-checking duplicated here. */
         kprintf("ls: %s: %s\n", path, embk_strerror(rc));
         return rc;
     }

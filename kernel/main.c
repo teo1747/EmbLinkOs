@@ -30,6 +30,8 @@
 #include "block/block.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
+#include "fs/vfs.h"
+#include "fs/fd.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
@@ -113,6 +115,15 @@ static void kernel_handle_line_command(const char *cmd)
         return;
     }
 
+    if (strcmp(cmd, "fd-test") == 0) {
+        int rc = vfs_fd_run_selftests();
+        if (rc == EMBK_OK)
+            kprintf("\n[cmd] fd-test: OK\n");
+        else
+            kprintf("\n[cmd] fd-test failed: %s\n", embk_strerror(rc));
+        return;
+    }
+
     if (cmd[0])
         kprintf("\n[cmd] unknown command: %s\n", cmd);
 }
@@ -143,6 +154,8 @@ void kernel_main(void) {
 
     // Register AHCI drives as block devices (after ahci_init filled sector counts)
     ahci_register_block_devices();
+
+    
 
     // --- Display + input ---
     fb_init();
@@ -190,6 +203,22 @@ void kernel_main(void) {
     } else {
         fat32_test_all(&vol);
     }
+
+    vfs_init();
+    struct embkfs_volume *embk_live = embkfs_live_volume();
+    if (!embk_live) {
+        kprintf("VFS: EMBKFS not mounted, skipping VFS register/selftests\n");
+    } else {
+        int rc = embkfs_vfs_register("/", embk_live);
+        if (rc != EMBK_OK) {
+            kprintf("VFS: EMBKFS register failed: %s\n", embk_strerror(rc));
+        } else {
+            vfs_fd_init();
+            vfs_run_selftests();
+        }
+    }
+
+    vfs_ls("/");
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;

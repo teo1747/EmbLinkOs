@@ -2677,8 +2677,10 @@ static int embkfs_unlink(struct embkfs_volume *vol, uint64_t dir_oid, const char
     kfree(old_ext);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: unlink \"%s\" failed: %s\n", dev, name, embk_strerror(rc)); return rc; }
 
+    
     kprintf("EMBKFS: %s: unlinked /%s (object %lu, %s), gen now %lu, free %lu\n",
-            dev, name, target, last_link ? "freed" : "link remains",
+            dev, name, target,
+            defer ? "deferred, held open" : (last_link ? "freed" : "link remains"),
             vol->generation, vol->free_blocks);
     return EMBK_OK;
 }

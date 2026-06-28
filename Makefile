@@ -43,6 +43,9 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/fat32.c \
 			 kernel/fs/embkfs/embkfs.c \
 			 kernel/fs/embkfs/crc32c.c \
+			 kernel/fs/embkfs/embk_vfs.c \
+			 kernel/fs/fd.c \
+			 kernel/fs/vfs.c \
              kernel/kstring.c \
              kernel/errno.c \
              kernel/kprintf.c

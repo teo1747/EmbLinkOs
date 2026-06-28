@@ -88,6 +88,15 @@ struct vfs_ops {
 
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);
+    int (*vget)(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
+                struct vnode *out);
+    
+    /* Open-handle refcounting hooks. the fd layer calls obj_get when a handle
+    * opens, and obj_put when it closes. The filesystem can use this to defer
+    * to keep an unlinked but-open object alive until the last handle closes. 
+    * A fs without unlink-while-open semantics (e.g. FAT32) leaves both NULL - the fd layer then no-ops. */
+    int (*obj_get)(struct vfs_mount *mnt, uint64_t ino);
+    int (*obj_put)(struct vfs_mount *mnt, uint64_t ino);
 };
 
 /* ---- a mounted filesystem instance ---------------------------------- */
@@ -98,6 +107,7 @@ struct vfs_mount {
     char                  at[64];  /* mount point, e.g. "/" (one for now)*/
     bool                  used;
 };
+
 
 /* ---- public VFS surface (what the rest of the kernel calls) --------- */
 void vfs_init(void);
@@ -117,6 +127,8 @@ int  vfs_read(const char *path, uint64_t off, void *buf, size_t len, size_t *out
 int  vfs_write(const char *path, uint64_t off, const void *buf, size_t len, size_t *out_written);
 int  vfs_readdir(const char *path, vfs_readdir_cb cb, void *ctx);
 int  vfs_stat(const char *path, struct vfs_stat *out);
+
+
 
 int vfs_ls(const char *path);
 int vfs_run_selftests(void);
