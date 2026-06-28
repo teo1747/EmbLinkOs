@@ -1,10 +1,21 @@
 #include "gdt.h"
+#include "../include/kprintf.h"
 #include "../drivers/serial.h"
 
-#define GDT_ENTRIES 3
+
+
 
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr gp_ptr;
+static struct tss g_tss;  // TSS structure
+
+
+/* Dedicated Kernel stacks for ring-3 -> ring-0 transitions. 16 KiB each,
+ * 16 bytes alignment. rsp0_stack is the normal kernel stack for interrupt handling 
+ * taken from user mode: df_stack is IST1 for the double fault handler (loaded
+ * unconventionally, so #DF survives even a broken RSP0)*/
+static uint8_t rsp0_stack[16 * 1024] __attribute__((aligned(16)));
+static uint8_t df_stack[16 * 1024] __attribute__((aligned(16)));
 
 
 // Econde one GDT entry and set it in the GDT table at the given index
@@ -19,6 +30,28 @@ static void set_gdt_entry(int index, uint8_t access, uint8_t flags) {
     gdt[index].base_high = 0;
 }
 
+
+/* Write the 16-byte TSS descriptor across gdt[index] and gdt[index + 1].
+ * Unlike code/data, the base MATTTERS here - it points the CPU at g_tss.*/
+static void set_tss_descriptor(int index, struct tss *tss) {
+    uint64_t base = (uint64_t)tss;
+    gdt[index].limit_low = sizeof(struct tss) - 1;
+    gdt[index].base_low = (uint16_t)(base & 0xFFFF);
+    gdt[index].base_mid = (uint8_t)((base >> 16) & 0xFF);
+    gdt[index].access = 0x89; // Present, ring 0, type=9 (available 64-bit TSS)
+    gdt[index].granularity = 0x00; // Flags: 0 for TSS
+    gdt[index].base_high = (uint8_t)((base >> 24) & 0xFF);
+
+    // Upper 32 bits of the base address go into the next GDT entry
+    struct tss_descriptor *tss_desc = (struct tss_descriptor *)&gdt[index];
+    tss_desc->base_upper = (uint32_t)(base >> 32);
+    tss_desc->reserved = 0;
+}
+
+
+void tss_set_rsp0(uint64_t rsp0) {
+    g_tss.rsp0 = rsp0;
+}
 
 void gdt_init(void) {
     serial_write_string("\n=== GDT init ===\n");
@@ -50,6 +83,19 @@ void gdt_init(void) {
     // Flags = 0x00 = 0000 0000b
     set_gdt_entry(2, 0x92, 0x00);
 
+    // Entry 3: user data segment (selector 0x18). Access byte 0xF2 = 11110010b (present, ring 3, data segment, writable), Flags 0x00 (not a code segment)
+    set_gdt_entry(3, 0xF2, 0x00);
+
+    // Entry 4: User code segment (selector 0x20). Access byte 0xFA = 11111010b (present, ring 3, code segment, executable, readable), Flags 0x20 = 00100000b (long mode)
+    set_gdt_entry(4, 0xFA, 0x20);
+
+    /* TSS: stacks grow DOWN, so RSP starts at the TOP of each buffer. */
+    g_tss.rsp0 = (uint64_t)(rsp0_stack + sizeof(rsp0_stack));
+    g_tss.ist1 = (uint64_t)(df_stack + sizeof(df_stack));
+    g_tss.iomap_base = sizeof(struct tss); // No I/O permission bitmap
+
+    set_tss_descriptor(5, &g_tss);
+
     // Set up the GDT pointer
     gp_ptr.limit = sizeof(gdt) - 1;
     gp_ptr.base = (uint64_t)&gdt;
@@ -76,7 +122,13 @@ void gdt_init(void) {
         : : : "rax", "memory"
     );
 
-    serial_write_string("GDT loaded at virtual address: ");
-    serial_write_hex((uint64_t)&gdt);
-    serial_write_string("\nSegment reloaded\n");
+    /* Load the TASK Register with the TSS selector (index 5 << 3) = 0x28 */
+    __asm__ volatile ("ltr %%ax" : : "a"((uint16_t)(0x28)) : "memory");
+
+    kprintf("GDT + TSS loaded at virtual address: ");
+    kprintf("%p", &gdt);
+    kprintf("\nSegment reloaded\n");
+    uint16_t tr;
+    __asm__ volatile ("str %0" : "=r"(tr));   /* read the Task Register back */
+    serial_write_string("TR="); serial_write_hex(tr); serial_write_string("\n");
 }
