@@ -8,6 +8,13 @@
 
 static struct embkfs_volume *g_embkfs_live = NULL;
 
+struct embkfs_volume *embkfs_live_volume(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted)
+        return NULL;
+    return g_embkfs_live;
+}
+
 
 static inline void embk_bm_set (uint8_t *bm, uint64_t b) { bm[b >> 3] |= (uint8_t)(1u << (b & 7)); }
 static inline bool embk_bm_test(uint8_t *bm, uint64_t b) { return (bm[b >> 3] >> (b & 7)) & 1u; }
@@ -2386,6 +2393,158 @@ static int embkfs_rename(struct embkfs_volume *vol,
     return EMBK_OK;
 }
 
+
+/* ===================================================================
+ * Open-handle reference counting — unlink-while-open safety.
+ *
+ * In-memory ONLY: records how many open handles (fds) currently hold each
+ * object alive. The fd layer brackets each open file with get...put. An
+ * object is reclaimed only when BOTH counts are zero:
+ *     links > 0  OR  opens > 0   -> object stays
+ *     links == 0 AND opens == 0  -> free inode + extents + blocks
+ * EMBKFS owns this because unlink (below the fd layer) must consult it; the
+ * fd layer drives it from above and never learns what an "fd" is.
+ *
+ * Not on disk: a crash while a file is unlinked-but-open leaks that inode's
+ * space (links==0, no dirent) — a space leak, not corruption. A future
+ * mount-time sweep ("free every inode with links==0") reclaims it. =========*/
+#define EMBKFS_MAX_OPEN_OBJECTS 64
+struct embk_open_ref {
+    struct embkfs_volume *vol;
+    uint64_t              oid;
+    uint32_t              count;   /* slot is free when count == 0 */
+};
+static struct embk_open_ref g_open_refs[EMBKFS_MAX_OPEN_OBJECTS];
+
+static bool embkfs_object_is_open(struct embkfs_volume *vol, uint64_t oid)
+{
+    for (uint32_t i = 0; i < EMBKFS_MAX_OPEN_OBJECTS; i++)
+        if (g_open_refs[i].count && g_open_refs[i].vol == vol &&
+            g_open_refs[i].oid == oid)
+            return true;
+    return false;
+}
+
+/* Reclaim an ORPHAN object: no directory entry, links already 0. Frees its
+ * inode + extents + data blocks in one transaction. Idempotent (a missing
+ * inode is a no-op). Mirrors unlink's last-link free path, standalone. */
+static int embkfs_destroy_object(struct embkfs_volume *vol, uint64_t oid)
+{
+    const char *dev = vol->dev->name;
+    static uint8_t probe[4096];
+    if (vol->read_only) return -EMBK_EROFS;
+
+    uint64_t new_gen = vol->generation + 1;
+
+    const struct embk_item_header *ti =
+        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
+    if (!ti) return EMBK_OK;                       /* already gone */
+    const struct embk_inode_item *tino =
+        embk_item_data(probe, vol->block_size, ti, sizeof *tino);
+    if (!tino) return -EMBK_EINVAL;
+    struct embk_inode_item ino = *tino;
+    if (ino.links != 0) return -EMBK_EINVAL;       /* caller bug: not an orphan */
+
+    struct embk_extref *old_ext = NULL;
+    uint32_t old_n = 0;
+    int rc = embkfs_count_extents(vol, oid, &old_n);
+    if (rc != EMBK_OK) return rc;
+    if (old_n) {
+        old_ext = kmalloc((uint64_t)old_n * sizeof *old_ext);
+        if (!old_ext) return -EMBK_ENOMEM;
+        uint32_t got = 0; bool over = false;
+        rc = embkfs_collect_extents(vol, oid, old_ext, old_n, &got, &over);
+        if (rc != EMBK_OK || over || got != old_n) { kfree(old_ext); return -EMBK_EINVAL; }
+        rc = embkfs_validate_extent_map(vol, old_ext, old_n, ino.size, "destroy old map");
+        if (rc != EMBK_OK) { kfree(old_ext); return rc; }
+    }
+
+    struct embk_put *ops = kmalloc((uint64_t)(1 + old_n) * sizeof *ops);
+    if (!ops) { kfree(old_ext); return -EMBK_ENOMEM; }
+    uint32_t nops = 0;
+    ops[nops++] = (struct embk_put){
+        .key = { .object_id = oid, .type = EMBK_TYPE_INODE, .offset = 0 }, .del = true };
+    for (uint32_t i = 0; i < old_n; i++)
+        ops[nops++] = (struct embk_put){
+            .key = { .object_id = oid, .type = EMBK_TYPE_EXTENT, .offset = old_ext[i].offset },
+            .del = true };
+
+    struct embk_txn txn;
+    rc = embkfs_txn_begin(vol, &txn);
+    if (rc != EMBK_OK) { kfree(ops); kfree(old_ext); return rc; }
+    for (uint32_t i = 0; i < old_n; i++)
+        embkfs_note_freed_run(vol, old_ext[i].disk_block, old_ext[i].length);
+
+    struct embk_block_ptr new_root;
+    rc = embkfs_cow_apply(vol, &vol->root, ops, nops, new_gen, &new_root);
+    if (rc == EMBK_OK) {
+        uint64_t new_free;
+        rc = embkfs_txn_new_free(vol, &new_free);
+        if (rc == EMBK_OK)
+            rc = embkfs_commit(vol, &new_root, new_gen, new_free);
+    }
+    embkfs_txn_end(vol, &txn, rc == EMBK_OK);
+
+    kfree(ops);
+    kfree(old_ext);
+    if (rc != EMBK_OK) {
+        kprintf("EMBKFS: %s: destroy object %lu failed: %s\n", dev, oid, embk_strerror(rc));
+        return rc;
+    }
+    kprintf("EMBKFS: %s: reclaimed orphan object %lu, gen now %lu, free %lu\n",
+            dev, oid, vol->generation, vol->free_blocks);
+    return EMBK_OK;
+}
+
+/* fd layer calls this when a handle opens. */
+int embkfs_object_get(struct embkfs_volume *vol, uint64_t oid)
+{
+    if (!vol) return -EMBK_EINVAL;
+    for (uint32_t i = 0; i < EMBKFS_MAX_OPEN_OBJECTS; i++)
+        if (g_open_refs[i].count && g_open_refs[i].vol == vol && g_open_refs[i].oid == oid) {
+            g_open_refs[i].count++;
+            return EMBK_OK;
+        }
+    for (uint32_t i = 0; i < EMBKFS_MAX_OPEN_OBJECTS; i++)
+        if (g_open_refs[i].count == 0) {
+            g_open_refs[i].vol = vol;
+            g_open_refs[i].oid = oid;
+            g_open_refs[i].count = 1;
+            return EMBK_OK;
+        }
+    return -EMBK_ENOSPC;                            /* too many open objects */
+}
+
+/* fd layer calls this when a handle closes. On the LAST close, if the object
+ * was unlinked while open (on-disk links == 0), reclaim it now. */
+int embkfs_object_put(struct embkfs_volume *vol, uint64_t oid)
+{
+    if (!vol) return -EMBK_EINVAL;
+    static uint8_t probe[4096];
+
+    for (uint32_t i = 0; i < EMBKFS_MAX_OPEN_OBJECTS; i++) {
+        if (g_open_refs[i].count && g_open_refs[i].vol == vol && g_open_refs[i].oid == oid) {
+            if (--g_open_refs[i].count > 0)
+                return EMBK_OK;                     /* other handles remain */
+            g_open_refs[i].vol = NULL;
+            g_open_refs[i].oid = 0;
+
+            /* Last handle closed. Read the AUTHORITATIVE on-disk link count. */
+            const struct embk_item_header *ti =
+                embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
+            if (!ti) return EMBK_OK;                /* inode already gone */
+            const struct embk_inode_item *tino =
+                embk_item_data(probe, vol->block_size, ti, sizeof *tino);
+            if (!tino) return -EMBK_EINVAL;
+            if (tino->links == 0)
+                return embkfs_destroy_object(vol, oid);
+            return EMBK_OK;                         /* still linked: keep it */
+        }
+    }
+    return -EMBK_ENOENT;                            /* put with no matching get */
+}
+
+
 /* Remove the name `name` from directory `dir_oid`, as ONE atomic COW transaction.
  * Files only — a directory returns -EMBK_EISDIR (use rmdir).
  *
@@ -2427,11 +2586,15 @@ static int embkfs_unlink(struct embkfs_volume *vol, uint64_t dir_oid, const char
         return -EMBK_EISDIR;
     }
     bool last_link = (ino.links <= 1);
+    
+    /* If a handle holds this file open, defer the actual free to last close. */
+    bool defer = last_link && embkfs_object_is_open(vol, target);
+
 
     /* 3. if this is the last link, collect all extents to free/delete. */
     struct embk_extref *old_ext = NULL;
     uint32_t old_n = 0;
-    if (last_link) {
+    if (last_link && !defer) {
         rc = embkfs_count_extents(vol, target, &old_n);
         if (rc != EMBK_OK) return rc;
         if (old_n) {
@@ -2453,19 +2616,33 @@ static int embkfs_unlink(struct embkfs_volume *vol, uint64_t dir_oid, const char
     if (rc != EMBK_OK) { kfree(old_ext); return rc; }
 
     /* 5. assemble the ops for one atomic commit. */
-    uint32_t ops_cap = last_link ? (2 + old_n) : 2;
+    uint32_t ops_cap = (last_link && !defer) ? (2 + old_n) : 2;
     struct embk_put *ops = kmalloc((uint64_t)ops_cap * sizeof *ops);
     if (!ops) { kfree(chain_buf); kfree(old_ext); return -EMBK_ENOMEM; }
     uint32_t nops = 0;
-    struct embk_inode_item dec_ino;
 
-    if (last_link) {                                   /* the file disappears */
+    struct embk_inode_item dec_ino;
+    struct embk_inode_item orphan;                 /* NEW */
+
+    if (defer) {                                   /* NEW arm */
+        /* Name goes now; object stays. Write links=0 but keep inode+extents.
+         * The blocks are reclaimed at last close, in embkfs_object_put. */
+        orphan = ino;
+        orphan.links = 0;
+        orphan.generation = new_gen;
+        ops[nops++] = (struct embk_put){
+            .key = { .object_id = target, .type = EMBK_TYPE_INODE, .offset = 0 },
+            .data = (const uint8_t *)&orphan, .size = sizeof orphan };
+    } else if (last_link) {
+        /* ... existing free path, unchanged ... */
         ops[nops++] = (struct embk_put){
             .key = { .object_id = target, .type = EMBK_TYPE_INODE, .offset = 0 }, .del = true };
         for (uint32_t i = 0; i < old_n; i++)
             ops[nops++] = (struct embk_put){
                 .key = { .object_id = target, .type = EMBK_TYPE_EXTENT, .offset = old_ext[i].offset }, .del = true };
-    } else {                                           /* a hard link remains */
+
+    } else {
+        /* ... existing hard-link-remains path, unchanged ... */
         dec_ino = ino;
         dec_ino.links     -= 1;
         dec_ino.generation = new_gen;
@@ -2473,7 +2650,9 @@ static int embkfs_unlink(struct embkfs_volume *vol, uint64_t dir_oid, const char
             .key = { .object_id = target, .type = EMBK_TYPE_INODE, .offset = 0 },
             .data = (const uint8_t *)&dec_ino, .size = sizeof dec_ino };
     }
-    ops[nops++] = dirent_op;
+    ops[nops++] = dirent_op;                        /* unchanged: name removal */
+
+
 
     /* Transaction: the rebuilt tree path's old nodes, plus the freed file's data
      * run, are reclaimed once committed. */
@@ -4323,6 +4502,38 @@ void embkfs_init(void)
                     vol.dev->name,
                     look == -EMBK_ENOENT ? "ENOENT (gone)" : "STILL PRESENT?!",
                     free_before, vol.free_blocks);
+        }
+    }
+
+    /* --- unlink-while-open: a held-open file survives unlink; its blocks are
+     *     retained until last close, then reclaimed. */
+    {
+        uint64_t oid;
+        if (embkfs_create(&vol, EMBKFS_ROOT_OBJECT_ID, "openlink.tmp", &oid) == EMBK_OK) {
+            static const uint8_t s[] = "held open across unlink\n";
+            embkfs_write_file(&vol, oid, s, sizeof s - 1);
+
+            embkfs_object_get(&vol, oid);                 /* simulate fd open */
+            uint64_t free_held = vol.free_blocks;
+
+            embkfs_unlink(&vol, EMBKFS_ROOT_OBJECT_ID, "openlink.tmp");
+
+            uint64_t gone;
+            bool name_gone   = (embkfs_lookup(&vol, EMBKFS_ROOT_OBJECT_ID, "openlink.tmp", &gone) == -EMBK_ENOENT);
+            bool blocks_held = (vol.free_blocks == free_held);   /* NOT freed yet */
+
+            uint8_t rb[64]; uint64_t got = 0;
+            int rd = embkfs_read_object_at(&vol, oid, 0, rb, sizeof rb, &got);
+
+            embkfs_object_put(&vol, oid);                 /* simulate last close */
+            bool blocks_freed = (vol.free_blocks > free_held);   /* now reclaimed */
+
+            kprintf("EMBKFS: %s: unlink-while-open: name=%s held=%s read=%s freed-on-close=%s\n",
+                    vol.dev->name,
+                    name_gone    ? "gone"            : "PRESENT?!",
+                    blocks_held  ? "blocks retained" : "FREED EARLY?!",
+                    (rd == EMBK_OK && got > 0) ? "readable" : "LOST?!",
+                    blocks_freed ? "yes"             : "NO?!");
         }
     }
 
