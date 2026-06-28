@@ -22,12 +22,14 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/spinlock.c \
              kernel/cpu/lapic.c \
              kernel/cpu/ioapic.c \
+			 kernel/cpu/usermode.c \
              kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
              kernel/drivers/font_8x16.c \
              kernel/drivers/console.c \
              kernel/drivers/timer.c \
+             kernel/drivers/hpet.c \
              kernel/drivers/keyboard.c \
              kernel/drivers/pit.c \
              kernel/drivers/pci.c \
@@ -46,6 +48,7 @@ KERNEL_SRC = kernel/main.c \
 			 kernel/fs/embkfs/embk_vfs.c \
 			 kernel/fs/fd.c \
 			 kernel/fs/vfs.c \
+			 kernel/selftests.c \
              kernel/kstring.c \
              kernel/errno.c \
              kernel/kprintf.c
@@ -54,7 +57,6 @@ LINKER      = kernel/linker.ld
 STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
-STAGE2_LOAD_SECTORS = 1024
 
 # QEMU drive args: boot disk (master) + data disk (slave)
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
@@ -62,11 +64,15 @@ DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
 
 all: $(IMG)
 
-$(STAGE1_BIN): $(STAGE1_SRC)
-	$(ASM) $(ASM_FLAGS) $< -o $@
+$(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
+	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
+	echo "Building stage1 with STAGE2_LOAD_SECTORS=$$stage2_sectors"; \
+	$(ASM) $(ASM_FLAGS) -D STAGE2_LOAD_SECTORS=$$stage2_sectors $< -o $@
 
-$(STAGE2_BIN): $(STAGE2_SRC)
-	$(ASM) $(ASM_FLAGS) $< -o $@
+$(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_ELF)
+	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_ELF)) + 511) / 512 )); \
+	echo "Building stage2 with KERNEL_LOAD_SECTORS=$$kernel_sectors"; \
+	$(ASM) $(ASM_FLAGS) -D KERNEL_LOAD_SECTORS=$$kernel_sectors $< -o $@
 
 $(ISR_OBJ): $(ISR_ASM)
 	$(ASM) -f elf64 $< -o $@
@@ -78,10 +84,7 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
 	truncate -s 1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_ELF)) + 511) / 512 )); \
-	echo "Kernel is $$kernel_sectors sectors; stage2 loads $(STAGE2_LOAD_SECTORS)"; \
-	if [ $$kernel_sectors -gt $(STAGE2_LOAD_SECTORS) ]; then \
-	    echo "*** WARNING: kernel exceeds stage2 load size! Bump cx in stage2.asm ***"; \
-	fi
+	echo "Kernel is $$kernel_sectors sectors; stage2 loads exact size"
 # Create the 64 MB data disk only if it doesn't already exist
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=64

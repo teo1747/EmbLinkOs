@@ -118,6 +118,7 @@ void fat32_list_root(struct fat32_volume *vol);
 int fat32_read(struct fat32_volume *vol, const char *name, uint8_t *buffer, uint32_t max_size);
 int fat32_write(struct fat32_volume *vol, const char *name, const uint8_t *buffer, uint32_t size);
 int fat32_mkdir(struct fat32_volume *vol, const char *path);
+int fat32_vfs_register(const char *path, struct fat32_volume *vol);
 
 static uint32_t fat32_cluster_count(struct fat32_volume *vol);
 static bool fat32_valid_cluster(struct fat32_volume *vol, uint32_t cluster);

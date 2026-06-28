@@ -5,6 +5,8 @@
 
 
 static uint64_t *kernel_pml4 = 0;
+extern uint8_t kernel_end[];
+extern uint8_t BOOT_STACK_TOP_PHYS[];
 
 
 // helper functions
@@ -197,10 +199,20 @@ void vmm_init(void) {
     serial_write_string("Mapping complete\n");
 
     // step 3: build the kernel mapping at KERNEL_VIRTUAL_BASE
-    // Map physical 0 to 2 MB (kernel + bitmap + stack live here)
-    // we keep 4KB granularity for the kernel area for future flexibility
-    serial_write_string("Mapping Kernel at 0xFFFFFFFF80000000...\n");
-    for (uint64_t phys = 0; phys < 0x200000; phys +=PAGE_SIZE) {
+    // Map [0 .. round_up(KV2P(kernel_end), 4K)) so the kernel can grow past 2 MB
+    // without faulting after CR3 switch. Keep a floor tied to boot stack top
+    // exported by the linker (stage2 currently sets rsp to higher-half + this
+    // physical value; stack grows down, so pages below this boundary are needed).
+    uint64_t kernel_end_phys = KV2P(kernel_end);
+    uint64_t boot_stack_floor = (uint64_t)BOOT_STACK_TOP_PHYS;
+    uint64_t kernel_map_end = (kernel_end_phys + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
+    if (kernel_map_end < boot_stack_floor)
+        kernel_map_end = boot_stack_floor;
+
+    serial_write_string("Mapping Kernel at 0xFFFFFFFF80000000 up to phys: ");
+    serial_write_hex(kernel_map_end);
+    serial_write_string("\n");
+    for (uint64_t phys = 0; phys < kernel_map_end; phys += PAGE_SIZE) {
         uint64_t virt = KERNEL_VIRTUAL_BASE + phys;
         if (vmm_map(virt, phys, VMM_WRITABLE) < 0) {
             serial_write_string("FATAL: vmm_map kernel failed at\n");

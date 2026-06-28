@@ -1,5 +1,6 @@
 #include "include/kprintf.h"
 #include "drivers/serial.h"
+#include "drivers/console.h"
 #include <stdint.h>
 #include "include/types.h"   // for size_t
 
@@ -29,7 +30,11 @@ struct out_sink {
 
 // Serial sink: write straight to COM1
 static void sink_serial_put(struct out_sink *s, char c) {
-    serial_write_char(c);
+    if (console_is_ready()) {
+        console_putchar(c);
+    } else {
+        serial_write_char(c);
+    }
     s->written++;
 }
 

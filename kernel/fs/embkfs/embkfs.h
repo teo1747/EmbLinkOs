@@ -294,6 +294,7 @@ int embkfs_run_allocator_selftests(void);
 int embkfs_run_tree_selftests(void);
 int embkfs_run_object_selftests(void);
 int embkfs_run_namespace_selftests(void);
+int embkfs_run_boot_diagnostics(void);
 
 /* Namespace/data mutators. */
 int embkfs_create_file(struct embkfs_volume *vol, uint64_t dir_oid,

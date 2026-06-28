@@ -1,4 +1,5 @@
 #include "fat32.h"
+#include "vfs.h"
 #include "../include/ctype.h"
 #include "../include/errno.h"
 #include "../include/kprintf.h"
@@ -1567,4 +1568,828 @@ int fat32_write(struct fat32_volume *vol, const char *path,
     }
 
     return (int)size;
+}
+
+/* ---------------- FAT32 -> VFS adapter ---------------- */
+
+#define FAT32_VFS_ROOT_INO 0ULL
+#define FAT32_VFS_INO_TAG  (1ULL << 63)
+
+static inline uint64_t fat32_vfs_pack_ino(uint32_t entry_cluster, uint32_t entry_index)
+{
+    return FAT32_VFS_INO_TAG | ((uint64_t)entry_cluster << 32) | (uint64_t)entry_index;
+}
+
+static inline bool fat32_vfs_is_packed_ino(uint64_t ino)
+{
+    return (ino & FAT32_VFS_INO_TAG) != 0;
+}
+
+static inline uint32_t fat32_vfs_ino_cluster(uint64_t ino)
+{
+    return (uint32_t)((ino >> 32) & 0x7fffffffU);
+}
+
+static inline uint32_t fat32_vfs_ino_index(uint64_t ino)
+{
+    return (uint32_t)(ino & 0xffffffffU);
+}
+
+static inline struct fat32_volume *fat32_vfs_vol(struct vnode *vn)
+{
+    return (struct fat32_volume *)vn->mnt->fs_data;
+}
+
+static uint8_t fat32_vfs_type_from_attr(uint8_t attr)
+{
+    return (attr & FAT32_ATTR_DIRECTORY) ? VFS_DT_DIR : VFS_DT_REG;
+}
+
+static uint32_t fat32_vfs_entry_first_cluster(const struct fat_dir_entry *entry)
+{
+    return ((uint32_t)entry->first_cluster_high << 16) | entry->first_cluster_low;
+}
+
+static int fat32_vfs_load_entry_by_ino(struct fat32_volume *vol, uint64_t ino,
+                                       struct fat_dir_entry *out_entry,
+                                       uint32_t *out_entry_cluster,
+                                       uint32_t *out_entry_index)
+{
+    if (!vol || !out_entry || !fat32_vfs_is_packed_ino(ino))
+        return -EMBK_EINVAL;
+
+    uint32_t entry_cluster = fat32_vfs_ino_cluster(ino);
+    uint32_t entry_index = fat32_vfs_ino_index(ino);
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+    if (entry_index >= entries_per_cluster)
+        return -EMBK_EINVAL;
+
+    static uint8_t clusbuf[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(clusbuf))
+        return -EMBK_EINVAL;
+
+    int rc = embk_block_read(vol->dev, cluster_to_sector(vol, entry_cluster),
+                             vol->sectors_per_cluster, clusbuf);
+    if (rc != EMBK_OK)
+        return rc;
+
+    struct fat_dir_entry *entries = (struct fat_dir_entry *)clusbuf;
+    struct fat_dir_entry *entry = &entries[entry_index];
+
+    if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+        return -EMBK_ENOENT;
+    if ((entry->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN)
+        return -EMBK_EINVAL;
+    if (entry->attr & FAT32_ATTR_VOLUME_ID)
+        return -EMBK_EINVAL;
+
+    *out_entry = *entry;
+    if (out_entry_cluster) *out_entry_cluster = entry_cluster;
+    if (out_entry_index) *out_entry_index = entry_index;
+    return EMBK_OK;
+}
+
+static int fat32_vfs_get_dir_cluster(struct vnode *dir, uint32_t *out_cluster)
+{
+    if (!dir || !out_cluster)
+        return -EMBK_EINVAL;
+
+    struct fat32_volume *vol = fat32_vfs_vol(dir);
+    if (!vol || !vol->mounted)
+        return -EMBK_ENODEV;
+
+    if (dir->ino == FAT32_VFS_ROOT_INO) {
+        *out_cluster = vol->root_cluster;
+        return EMBK_OK;
+    }
+
+    struct fat_dir_entry entry;
+    int rc = fat32_vfs_load_entry_by_ino(vol, dir->ino, &entry, NULL, NULL);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!(entry.attr & FAT32_ATTR_DIRECTORY))
+        return -EMBK_ENOTDIR;
+
+    uint32_t cl = fat32_vfs_entry_first_cluster(&entry);
+    if (!fat32_valid_cluster(vol, cl))
+        return -EMBK_EIO;
+
+    *out_cluster = cl;
+    return EMBK_OK;
+}
+
+static uint8_t fat32_vfs_short_name(const struct fat_dir_entry *entry, char *out)
+{
+    uint8_t n = 0;
+    for (int j = 0; j < 8 && entry->name[j] != ' '; j++)
+        out[n++] = (char)entry->name[j];
+
+    if (entry->name[8] != ' ') {
+        out[n++] = '.';
+        for (int j = 8; j < 11 && entry->name[j] != ' '; j++)
+            out[n++] = (char)entry->name[j];
+    }
+
+    out[n] = '\0';
+    return n;
+}
+
+static int fat32_vfs_lookup(struct vnode *dir, const char *name,
+                            size_t name_len, struct vnode *out)
+{
+    if (!dir || !name || !out || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    uint32_t dir_cluster = 0;
+    int rc = fat32_vfs_get_dir_cluster(dir, &dir_cluster);
+    if (rc != EMBK_OK)
+        return rc;
+
+    char comp[256];
+    for (size_t i = 0; i < name_len; i++)
+        comp[i] = name[i];
+    comp[name_len] = '\0';
+
+    uint32_t entry_cluster = 0, entry_index = 0;
+    struct fat_dir_entry entry;
+    rc = fat32_find_dir_entry_location(fat32_vfs_vol(dir), dir_cluster, comp,
+                                       &entry_cluster, &entry_index, &entry);
+    if (rc != EMBK_OK)
+        return rc;
+
+    out->mnt = dir->mnt;
+    out->ino = fat32_vfs_pack_ino(entry_cluster, entry_index);
+    out->type = fat32_vfs_type_from_attr(entry.attr);
+    return EMBK_OK;
+}
+
+struct fat32_vfs_readdir_ctx {
+    vfs_readdir_cb cb;
+    void *ctx;
+};
+
+static int fat32_vfs_readdir(struct vnode *dir, vfs_readdir_cb cb, void *ctx)
+{
+    if (!dir || !cb || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+
+    struct fat32_volume *vol = fat32_vfs_vol(dir);
+    uint32_t dir_cluster = 0;
+    int rc = fat32_vfs_get_dir_cluster(dir, &dir_cluster);
+    if (rc != EMBK_OK)
+        return rc;
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+    static uint8_t clusbuf[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(clusbuf))
+        return -EMBK_EINVAL;
+
+    struct fat32_lfn_entry lfn_entries[20];
+    uint32_t lfn_count = 0;
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        rc = embk_block_read(vol->dev, cluster_to_sector(vol, cluster),
+                             vol->sectors_per_cluster, clusbuf);
+        if (rc != EMBK_OK)
+            return rc;
+
+        struct fat_dir_entry *entries = (struct fat_dir_entry *)clusbuf;
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            struct fat_dir_entry *entry = &entries[i];
+
+            if (entry->name[0] == 0x00)
+                return EMBK_OK;
+
+            if (entry->name[0] == 0xE5) {
+                lfn_count = 0;
+                continue;
+            }
+
+            if ((entry->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN) {
+                if (lfn_count < sizeof(lfn_entries) / sizeof(lfn_entries[0]))
+                    lfn_entries[lfn_count++] = *(struct fat32_lfn_entry *)entry;
+                continue;
+            }
+
+            if (entry->attr & FAT32_ATTR_VOLUME_ID) {
+                lfn_count = 0;
+                continue;
+            }
+
+            char namebuf[256];
+            uint8_t name_len = 0;
+            if (lfn_count > 0 &&
+                fat32_reconstruct_lfn_name(namebuf, sizeof(namebuf), lfn_entries, lfn_count)) {
+                name_len = (uint8_t)strlen(namebuf);
+            } else {
+                name_len = fat32_vfs_short_name(entry, namebuf);
+            }
+            lfn_count = 0;
+
+            uint64_t ino = fat32_vfs_pack_ino(cluster, i);
+            uint8_t type = fat32_vfs_type_from_attr(entry->attr);
+            rc = cb(namebuf, name_len, type, ino, ctx);
+            if (rc != EMBK_OK)
+                return rc;
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0)
+            return -EMBK_EIO;
+    }
+
+    return EMBK_OK;
+}
+
+static int fat32_vfs_read(struct vnode *vn, uint64_t off, void *buf, size_t len,
+                          size_t *out_read)
+{
+    if (!vn || !buf || !out_read || !vn->mnt || !vn->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (vn->type != VFS_DT_REG)
+        return -EMBK_EISDIR;
+
+    struct fat32_volume *vol = fat32_vfs_vol(vn);
+    struct fat_dir_entry entry;
+    int rc = fat32_vfs_load_entry_by_ino(vol, vn->ino, &entry, NULL, NULL);
+    if (rc != EMBK_OK)
+        return rc;
+
+    uint32_t file_size = entry.file_size;
+    if (off >= file_size) {
+        *out_read = 0;
+        return EMBK_OK;
+    }
+
+    uint64_t max_read = (uint64_t)file_size - off;
+    if ((uint64_t)len < max_read)
+        max_read = (uint64_t)len;
+
+    uint32_t cluster = fat32_vfs_entry_first_cluster(&entry);
+    if (cluster == FAT32_FREE || !fat32_valid_cluster(vol, cluster)) {
+        *out_read = 0;
+        return EMBK_OK;
+    }
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    static uint8_t clusbuf[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(clusbuf))
+        return -EMBK_EINVAL;
+
+    uint64_t skip = off;
+    while (skip >= cluster_size) {
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0 || cluster >= FAT32_EOC_MIN || cluster == FAT32_FREE) {
+            *out_read = 0;
+            return EMBK_OK;
+        }
+        skip -= cluster_size;
+    }
+
+    uint64_t done = 0;
+    while (done < max_read && cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        rc = embk_block_read(vol->dev, cluster_to_sector(vol, cluster),
+                             vol->sectors_per_cluster, clusbuf);
+        if (rc != EMBK_OK)
+            return rc;
+
+        uint32_t start = (uint32_t)skip;
+        uint32_t avail = cluster_size - start;
+        uint64_t need = max_read - done;
+        uint32_t take = (need < avail) ? (uint32_t)need : avail;
+
+        memcpy((uint8_t *)buf + done, clusbuf + start, take);
+        done += take;
+        skip = 0;
+
+        if (done >= max_read)
+            break;
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0)
+            return -EMBK_EIO;
+    }
+
+    *out_read = (size_t)done;
+    return EMBK_OK;
+}
+
+static int fat32_vfs_write(struct vnode *vn, uint64_t off, const void *buf, size_t len,
+                           size_t *out_written)
+{
+    if (!vn || (!buf && len) || !out_written || !vn->mnt || !vn->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (vn->type != VFS_DT_REG)
+        return -EMBK_EISDIR;
+
+    struct fat32_volume *vol = fat32_vfs_vol(vn);
+    struct fat_dir_entry old_entry;
+    uint32_t entry_cluster = 0, entry_index = 0;
+    int rc = fat32_vfs_load_entry_by_ino(vol, vn->ino, &old_entry, &entry_cluster, &entry_index);
+    if (rc != EMBK_OK)
+        return rc;
+
+    uint64_t end_off = off + len;
+    if (end_off > 0xffffffffULL)
+        return -EMBK_ERANGE;
+
+    uint32_t old_size = old_entry.file_size;
+    uint32_t new_size = (uint32_t)((end_off > old_size) ? end_off : old_size);
+
+    uint8_t *new_data = NULL;
+    if (new_size > 0) {
+        new_data = kmalloc(new_size);
+        if (!new_data)
+            return -EMBK_ENOMEM;
+        memset(new_data, 0, new_size);
+    }
+
+    if (old_size > 0 && new_data) {
+        int got = fat32_read_file_data(vol, &old_entry, new_data, old_size);
+        if (got < 0) {
+            kfree(new_data);
+            return got;
+        }
+    }
+
+    if (len > 0 && new_data)
+        memcpy(new_data + off, buf, len);
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint32_t new_head = 0;
+    if (new_size > 0) {
+        uint32_t need_clusters = (new_size + cluster_size - 1) / cluster_size;
+        rc = fat32_alloc_cluster_chain(vol, need_clusters, &new_head, NULL);
+        if (rc != EMBK_OK) {
+            kfree(new_data);
+            return rc;
+        }
+
+        rc = fat32_write_data_to_chain(vol, new_head, new_data, new_size);
+        if (rc < 0 || (uint32_t)rc != new_size) {
+            fat32_free_cluster_chain(vol, new_head);
+            kfree(new_data);
+            return (rc < 0) ? rc : -EMBK_EIO;
+        }
+    }
+
+    if (new_data)
+        kfree(new_data);
+
+    uint8_t *cluster_buffer = kmalloc(cluster_size);
+    if (!cluster_buffer) {
+        if (new_head)
+            fat32_free_cluster_chain(vol, new_head);
+        return -EMBK_ENOMEM;
+    }
+
+    rc = embk_block_read(vol->dev, cluster_to_sector(vol, entry_cluster),
+                         vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        if (new_head)
+            fat32_free_cluster_chain(vol, new_head);
+        return rc;
+    }
+
+    struct fat_dir_entry *entries = (struct fat_dir_entry *)cluster_buffer;
+    entries[entry_index].first_cluster_high = (uint16_t)(new_head >> 16);
+    entries[entry_index].first_cluster_low = (uint16_t)(new_head & 0xffff);
+    entries[entry_index].file_size = new_size;
+
+    rc = embk_block_write(vol->dev, cluster_to_sector(vol, entry_cluster),
+                          vol->sectors_per_cluster, cluster_buffer);
+    kfree(cluster_buffer);
+    if (rc != EMBK_OK) {
+        if (new_head)
+            fat32_free_cluster_chain(vol, new_head);
+        return rc;
+    }
+
+    uint32_t old_head = fat32_vfs_entry_first_cluster(&old_entry);
+    if (old_head >= 2 && old_head < FAT32_EOC_MIN && old_head != FAT32_FREE && old_head != new_head)
+        fat32_free_cluster_chain(vol, old_head);
+
+    *out_written = len;
+    return EMBK_OK;
+}
+
+static int fat32_vfs_create(struct vnode *dir, const char *name, size_t name_len,
+                            uint32_t mode, struct vnode *out)
+{
+    (void)mode;
+    if (!dir || !name || !out || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    struct fat32_volume *vol = fat32_vfs_vol(dir);
+    uint32_t dir_cluster = 0;
+    int rc = fat32_vfs_get_dir_cluster(dir, &dir_cluster);
+    if (rc != EMBK_OK)
+        return rc;
+
+    char comp[256];
+    for (size_t i = 0; i < name_len; i++)
+        comp[i] = name[i];
+    comp[name_len] = '\0';
+
+    uint32_t found_c = 0, found_i = 0;
+    struct fat_dir_entry found;
+    rc = fat32_find_dir_entry_location(vol, dir_cluster, comp, &found_c, &found_i, &found);
+    if (rc == EMBK_OK)
+        return -EMBK_EEXIST;
+    if (rc != -EMBK_ENOENT)
+        return rc;
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint8_t *cluster_buffer = kmalloc(cluster_size);
+    if (!cluster_buffer)
+        return -EMBK_ENOMEM;
+
+    uint32_t needed_slots = fat32_lfn_slot_count(comp) + 1;
+    uint32_t slot_cluster = 0, slot_index = 0;
+    rc = fat32_find_free_dir_slot(vol, dir_cluster, needed_slots,
+                                  &slot_cluster, &slot_index, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        return rc;
+    }
+
+    rc = embk_block_read(vol->dev, cluster_to_sector(vol, slot_cluster),
+                         vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        return rc;
+    }
+
+    struct fat_dir_entry template_entry;
+    memset(&template_entry, 0, sizeof(template_entry));
+    fat32_generate_short_name(comp, template_entry.name);
+    template_entry.attr = FAT32_ATTR_ARCHIVE;
+    template_entry.create_date = FAT32_EPOCH_DATE;
+    template_entry.write_date = FAT32_EPOCH_DATE;
+    template_entry.access_date = FAT32_EPOCH_DATE;
+
+    rc = fat32_write_dir_entry_with_lfn(vol, cluster_buffer,
+                                        cluster_size / sizeof(struct fat_dir_entry),
+                                        slot_index, comp, &template_entry);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        return rc;
+    }
+
+    rc = embk_block_write(vol->dev, cluster_to_sector(vol, slot_cluster),
+                          vol->sectors_per_cluster, cluster_buffer);
+    kfree(cluster_buffer);
+    if (rc != EMBK_OK)
+        return rc;
+
+    out->mnt = dir->mnt;
+    out->ino = fat32_vfs_pack_ino(slot_cluster, slot_index + fat32_lfn_slot_count(comp));
+    out->type = VFS_DT_REG;
+    return EMBK_OK;
+}
+
+static bool fat32_vfs_is_dot_or_dotdot(const struct fat_dir_entry *entry)
+{
+    if (!entry || entry->name[0] != '.')
+        return false;
+
+    bool rest_spaces = true;
+    for (int i = 2; i < 11; i++) {
+        if (entry->name[i] != ' ') {
+            rest_spaces = false;
+            break;
+        }
+    }
+    if (!rest_spaces)
+        return false;
+
+    return (entry->name[1] == ' ') || (entry->name[1] == '.');
+}
+
+static int fat32_vfs_dir_is_empty(struct fat32_volume *vol, uint32_t dir_cluster)
+{
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+
+    static uint8_t clusbuf[4096] __attribute__((aligned(4)));
+    if (cluster_size > sizeof(clusbuf))
+        return -EMBK_EINVAL;
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC_MIN && cluster != FAT32_FREE) {
+        int rc = embk_block_read(vol->dev, cluster_to_sector(vol, cluster),
+                                 vol->sectors_per_cluster, clusbuf);
+        if (rc != EMBK_OK)
+            return rc;
+
+        struct fat_dir_entry *entries = (struct fat_dir_entry *)clusbuf;
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            struct fat_dir_entry *e = &entries[i];
+
+            if (e->name[0] == 0x00)
+                return EMBK_OK;
+            if (e->name[0] == 0xE5)
+                continue;
+            if ((e->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN)
+                continue;
+            if (e->attr & FAT32_ATTR_VOLUME_ID)
+                continue;
+            if (fat32_vfs_is_dot_or_dotdot(e))
+                continue;
+
+            return -EMBK_ENOTEMPTY;
+        }
+
+        cluster = fat_get_next_cluster(vol, cluster);
+        if (cluster == 0)
+            return -EMBK_EIO;
+    }
+
+    return EMBK_OK;
+}
+
+static int fat32_vfs_mkdir(struct vnode *dir, const char *name, size_t name_len,
+                           struct vnode *out)
+{
+    if (!dir || !name || !out || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    if ((name_len == 1 && name[0] == '.') ||
+        (name_len == 2 && name[0] == '.' && name[1] == '.'))
+        return -EMBK_EINVAL;
+
+    struct fat32_volume *vol = fat32_vfs_vol(dir);
+    uint32_t parent_cluster = 0;
+    int rc = fat32_vfs_get_dir_cluster(dir, &parent_cluster);
+    if (rc != EMBK_OK)
+        return rc;
+
+    char comp[256];
+    for (size_t i = 0; i < name_len; i++)
+        comp[i] = name[i];
+    comp[name_len] = '\0';
+
+    uint32_t entry_cluster = 0, entry_index = 0;
+    struct fat_dir_entry existing;
+    rc = fat32_find_dir_entry_location(vol, parent_cluster, comp,
+                                       &entry_cluster, &entry_index, &existing);
+    if (rc == EMBK_OK)
+        return -EMBK_EEXIST;
+    if (rc != -EMBK_ENOENT)
+        return rc;
+
+    uint32_t new_cluster = 0;
+    rc = fat32_alloc_cluster_chain(vol, 1, &new_cluster, NULL);
+    if (rc != EMBK_OK)
+        return rc;
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint8_t *cluster_buffer = kmalloc(cluster_size);
+    if (!cluster_buffer) {
+        fat32_free_cluster_chain(vol, new_cluster);
+        return -EMBK_ENOMEM;
+    }
+
+    uint32_t lfn_slots = fat32_lfn_slot_count(comp);
+    uint32_t needed_slots = lfn_slots + 1;
+    uint32_t dir_entry_cluster = 0, dir_entry_index = 0;
+    rc = fat32_find_free_dir_slot(vol, parent_cluster, needed_slots,
+                                  &dir_entry_cluster, &dir_entry_index,
+                                  cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    uint32_t first_sector = cluster_to_sector(vol, dir_entry_cluster);
+    rc = embk_block_read(vol->dev, first_sector,
+                         vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    struct fat_dir_entry template_entry;
+    memset(&template_entry, 0, sizeof(template_entry));
+    fat32_generate_short_name(comp, template_entry.name);
+    template_entry.attr = FAT32_ATTR_DIRECTORY;
+    template_entry.create_date = FAT32_EPOCH_DATE;
+    template_entry.write_date = FAT32_EPOCH_DATE;
+    template_entry.access_date = FAT32_EPOCH_DATE;
+    template_entry.first_cluster_high = (uint16_t)(new_cluster >> 16);
+    template_entry.first_cluster_low = (uint16_t)(new_cluster & 0xFFFF);
+    template_entry.file_size = 0;
+
+    rc = fat32_write_dir_entry_with_lfn(vol, cluster_buffer,
+                                        cluster_size / sizeof(struct fat_dir_entry),
+                                        dir_entry_index, comp, &template_entry);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    rc = embk_block_write(vol->dev, first_sector,
+                          vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    memset(cluster_buffer, 0, cluster_size);
+    struct fat_dir_entry *dot_entries = (struct fat_dir_entry *)cluster_buffer;
+    memset(dot_entries, 0, sizeof(struct fat_dir_entry) * 2);
+
+    memcpy(dot_entries[0].name, ".          ", 11);
+    dot_entries[0].attr = FAT32_ATTR_DIRECTORY;
+    dot_entries[0].create_date = FAT32_EPOCH_DATE;
+    dot_entries[0].write_date = FAT32_EPOCH_DATE;
+    dot_entries[0].access_date = FAT32_EPOCH_DATE;
+    dot_entries[0].first_cluster_high = (uint16_t)(new_cluster >> 16);
+    dot_entries[0].first_cluster_low = (uint16_t)(new_cluster & 0xFFFF);
+
+    uint32_t dotdot_cluster =
+        (parent_cluster == vol->root_cluster) ? 0 : parent_cluster;
+
+    memcpy(dot_entries[1].name, "..         ", 11);
+    dot_entries[1].attr = FAT32_ATTR_DIRECTORY;
+    dot_entries[1].create_date = FAT32_EPOCH_DATE;
+    dot_entries[1].write_date = FAT32_EPOCH_DATE;
+    dot_entries[1].access_date = FAT32_EPOCH_DATE;
+    dot_entries[1].first_cluster_high = (uint16_t)(dotdot_cluster >> 16);
+    dot_entries[1].first_cluster_low = (uint16_t)(dotdot_cluster & 0xFFFF);
+
+    rc = embk_block_write(vol->dev, cluster_to_sector(vol, new_cluster),
+                          vol->sectors_per_cluster, cluster_buffer);
+    kfree(cluster_buffer);
+    if (rc != EMBK_OK) {
+        fat32_free_cluster_chain(vol, new_cluster);
+        return rc;
+    }
+
+    out->mnt = dir->mnt;
+    out->ino = fat32_vfs_pack_ino(dir_entry_cluster, dir_entry_index + lfn_slots);
+    out->type = VFS_DT_DIR;
+    return EMBK_OK;
+}
+
+static int fat32_vfs_unlink(struct vnode *dir, const char *name, size_t name_len)
+{
+    if (!dir || !name || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    if ((name_len == 1 && name[0] == '.') ||
+        (name_len == 2 && name[0] == '.' && name[1] == '.'))
+        return -EMBK_EINVAL;
+
+    struct fat32_volume *vol = fat32_vfs_vol(dir);
+    uint32_t dir_cluster = 0;
+    int rc = fat32_vfs_get_dir_cluster(dir, &dir_cluster);
+    if (rc != EMBK_OK)
+        return rc;
+
+    char comp[256];
+    for (size_t i = 0; i < name_len; i++)
+        comp[i] = name[i];
+    comp[name_len] = '\0';
+
+    uint32_t entry_cluster = 0, entry_index = 0;
+    struct fat_dir_entry target;
+    rc = fat32_find_dir_entry_location(vol, dir_cluster, comp,
+                                       &entry_cluster, &entry_index, &target);
+    if (rc != EMBK_OK)
+        return rc;
+
+    uint32_t target_head = fat32_vfs_entry_first_cluster(&target);
+    if (target.attr & FAT32_ATTR_DIRECTORY) {
+        if (!fat32_valid_cluster(vol, target_head))
+            return -EMBK_EIO;
+        rc = fat32_vfs_dir_is_empty(vol, target_head);
+        if (rc != EMBK_OK)
+            return rc;
+    }
+
+    uint32_t cluster_size = vol->bytes_per_sector * vol->sectors_per_cluster;
+    uint8_t *cluster_buffer = kmalloc(cluster_size);
+    if (!cluster_buffer)
+        return -EMBK_ENOMEM;
+
+    rc = embk_block_read(vol->dev, cluster_to_sector(vol, entry_cluster),
+                         vol->sectors_per_cluster, cluster_buffer);
+    if (rc != EMBK_OK) {
+        kfree(cluster_buffer);
+        return rc;
+    }
+
+    uint32_t entries_per_cluster = cluster_size / sizeof(struct fat_dir_entry);
+    struct fat_dir_entry *entries = (struct fat_dir_entry *)cluster_buffer;
+    if (entry_index >= entries_per_cluster) {
+        kfree(cluster_buffer);
+        return -EMBK_EINVAL;
+    }
+
+    entries[entry_index].name[0] = 0xE5;
+    uint32_t i = entry_index;
+    while (i > 0) {
+        struct fat_dir_entry *prev = &entries[i - 1];
+        if ((prev->attr & FAT32_ATTR_LFN) != FAT32_ATTR_LFN)
+            break;
+        prev->name[0] = 0xE5;
+        i--;
+    }
+
+    rc = embk_block_write(vol->dev, cluster_to_sector(vol, entry_cluster),
+                          vol->sectors_per_cluster, cluster_buffer);
+    kfree(cluster_buffer);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (target_head >= 2 && target_head < FAT32_EOC_MIN && target_head != FAT32_FREE)
+        return fat32_free_cluster_chain(vol, target_head);
+
+    return EMBK_OK;
+}
+
+static int fat32_vfs_stat(struct vnode *vn, struct vfs_stat *out)
+{
+    if (!vn || !out || !vn->mnt || !vn->mnt->fs_data)
+        return -EMBK_EINVAL;
+
+    if (vn->ino == FAT32_VFS_ROOT_INO) {
+        out->type = VFS_DT_DIR;
+        out->mode = 040755;
+        out->size = 0;
+        out->nlink = 1;
+        return EMBK_OK;
+    }
+
+    struct fat_dir_entry entry;
+    int rc = fat32_vfs_load_entry_by_ino(fat32_vfs_vol(vn), vn->ino, &entry, NULL, NULL);
+    if (rc != EMBK_OK)
+        return rc;
+
+    out->type = fat32_vfs_type_from_attr(entry.attr);
+    out->mode = (out->type == VFS_DT_DIR) ? 040755 : 0100644;
+    out->size = (out->type == VFS_DT_DIR) ? 0 : entry.file_size;
+    out->nlink = 1;
+    return EMBK_OK;
+}
+
+static int fat32_vfs_vget(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
+                          struct vnode *out)
+{
+    if (!mnt || !out)
+        return -EMBK_EINVAL;
+
+    out->mnt = mnt;
+    out->ino = ino;
+    out->type = type;
+    return EMBK_OK;
+}
+
+static const struct vfs_ops fat32_vfs_ops = {
+    .lookup = fat32_vfs_lookup,
+    .readdir = fat32_vfs_readdir,
+    .read = fat32_vfs_read,
+    .write = fat32_vfs_write,
+    .create = fat32_vfs_create,
+    .mkdir = fat32_vfs_mkdir,
+    .unlink = fat32_vfs_unlink,
+    .stat = fat32_vfs_stat,
+    .vget = fat32_vfs_vget,
+    .obj_get = NULL,
+    .obj_put = NULL,
+};
+
+int fat32_vfs_register(const char *path, struct fat32_volume *vol)
+{
+    if (!vol || !vol->mounted)
+        return -EMBK_ENODEV;
+    return vfs_mount(path, &fat32_vfs_ops, vol, FAT32_VFS_ROOT_INO);
 }
