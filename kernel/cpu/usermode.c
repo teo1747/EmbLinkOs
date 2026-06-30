@@ -6,6 +6,16 @@
 #include "../drivers/serial.h"
 #include <stdint.h>
 
+
+
+/* The embedded user program, bracketed by labels from init_blob.asm. Declared
+ * as arrays so the names decay to the linker symbols' ADDRESSES; end - start is
+ * therefore the byte length. */
+extern const uint8_t init_blob_start[];
+extern const uint8_t init_blob_end[];
+#define INIT_BLOB_LEN ((uint64_t)(init_blob_end - init_blob_start))
+
+
 /* Saved kernel context to resume when the ring-3 task exits. sys_exit
  * (syscall.c) restores this instead of halting, so control returns here. */
 struct kcontext g_user_exit_ctx;
@@ -15,6 +25,10 @@ struct kcontext g_user_exit_ctx;
 
 #define USER_CODE_VA   0x0000400000000000ULL   /* low-half: user space   */
 #define USER_STACK_VA  0x0000700000000000ULL
+
+
+#define USER_LOAD_BASE   0x400000ULL          /* MUST equal user.ld's base */
+#define PAGE_SIZE_4K     0x1000ULL
 
 /* the new user_stub — runs in ring 3, calls write then exit.
  *
@@ -52,48 +66,56 @@ static void user_stub(void)
     );
 }
 
-void enter_user_mode(void) {
-    /* 0. Save a kernel context to come back to. On the direct call this returns
-     * 0 and we fall through to ring 3. When the ring-3 task calls exit(),
-     * sys_exit does kernel_ctx_restore(&g_user_exit_ctx, 1), which resumes here
-     * with a nonzero return — we re-enable interrupts (the int 0x80 gate cleared
-     * IF) and return to the caller so the shell runs. */
-    if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
-        __asm__ volatile ("sti");
-        serial_write_string("Returned to kernel from ring 3.\n");
-        return;
+
+void enter_user_mode(void)
+{
+    uint64_t blob_len = INIT_BLOB_LEN;
+    serial_write_string("Loading user program, bytes=");
+    serial_write_hex(blob_len);
+    serial_write_string("\n");
+
+    /* 1. Map enough user pages at the link base to hold the blob, and copy it
+     *    in. v1: one RWX region (W^X deferred to the ELF loader — see TODO).
+     *    Map page-by-page so a multi-page program just works. */
+    uint64_t pages = (blob_len + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va   = USER_LOAD_BASE + i * PAGE_SIZE_4K;
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) {
+            serial_write_string("FATAL: out of frames loading user program\n");
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+        /* WRITABLE so the copy below lands; USER so ring 3 can fetch it.
+         * (RWX for now — code+data share the region.) */
+        vmm_map(va, phys, VMM_WRITABLE | VMM_USER);
     }
 
-    /* 1. Fresh user code page, copy the stub's bytes in. */
-    uint64_t code_phys = pmm_alloc_page();
-    vmm_map(USER_CODE_VA, code_phys, VMM_USER);          /* exec, RO, U/S=1 */
+    /* Copy the blob into the freshly mapped user VA. After vmm_map, the user
+     * VA is valid in THIS address space, so a plain byte copy works. */
+    volatile uint8_t *dst = (volatile uint8_t *)USER_LOAD_BASE;
+    for (uint64_t i = 0; i < blob_len; i++)
+        dst[i] = init_blob_start[i];
 
-    volatile uint8_t *dst = (volatile uint8_t *)USER_CODE_VA;
-    const uint8_t *src = (const uint8_t *)&user_stub;
-    for (int i = 0; i < 64; i++)                          /* 64 B >> the stub */
-        dst[i] = src[i];
-
-    /* 2. Fresh user stack page. */
+    /* 2. A user stack page. */
     uint64_t stack_phys = pmm_alloc_page();
     vmm_map(USER_STACK_VA, stack_phys, VMM_WRITABLE | VMM_USER);
-    uint64_t user_rsp = USER_STACK_VA + 0x1000;           /* top, grows down */
+    uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;     /* top, grows down */
 
-    serial_write_string("Entering ring 3...\n");
+    serial_write_string("Entering ring 3 at 0x400000...\n");
 
-    /* 3. Synthesize the interrupt frame and iretq into ring 3.
-     * Pop order: RIP, CS, RFLAGS, RSP, SS  ->  push in reverse. */
+    /* 3. iretq into the program. Frame pop order: RIP, CS, RFLAGS, RSP, SS. */
     __asm__ volatile (
-        "pushq %0\n"        /* SS     = user data | 3   */
-        "pushq %1\n"        /* RSP    = user stack top  */
+        "pushq %0\n"        /* SS     = user data | 3 */
+        "pushq %1\n"        /* RSP    = user stack top */
         "pushq $0x202\n"    /* RFLAGS = IF | reserved-1 */
-        "pushq %2\n"        /* CS     = user code | 3   */
-        "pushq %3\n"        /* RIP    = user code VA    */
+        "pushq %2\n"        /* CS     = user code | 3 */
+        "pushq %3\n"        /* RIP    = 0x400000 (entry) */
         "iretq\n"
         :
-        : "r"((uint64_t)USER_DATA_SEL),
+        : "r"((uint64_t)(0x18 | 3)),     /* USER_DATA_SEL */
           "r"(user_rsp),
-          "r"((uint64_t)USER_CODE_SEL),
-          "r"(USER_CODE_VA)        /* enter the COPY, not &user_stub */
+          "r"((uint64_t)(0x20 | 3)),     /* USER_CODE_SEL */
+          "r"(USER_LOAD_BASE)            /* enter at the blob's base == _start */
         : "memory"
     );
 }

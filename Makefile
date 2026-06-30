@@ -13,6 +13,8 @@ STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
 ISR_ASM     = kernel/cpu/isr.asm
 ISR_OBJ     = kernel/cpu/isr.o
+SYSCALL_ASM = kernel/cpu/syscall_entry.asm
+SYSCALL_OBJ = kernel/cpu/syscall_entry.o
 
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
@@ -20,6 +22,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/irq.c \
              kernel/cpu/gdt.c \
              kernel/cpu/spinlock.c \
+             kernel/cpu/rwlock.c \
+             kernel/cpu/syscall.c \
              kernel/cpu/lapic.c \
              kernel/cpu/ioapic.c \
 			 kernel/cpu/usermode.c \
@@ -37,6 +41,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/bootanim.c \
              kernel/drivers/ahci.c \
              kernel/block/block.c \
+             kernel/block/partition.c \
              kernel/mm/pmm.c \
              kernel/cpu/idt.c \
              kernel/mm/vmm.c \
@@ -58,6 +63,32 @@ STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
 
+
+# ---- Userland ---------------------------------------------------------------
+# The first program that isn't the kernel. Freestanding, linked at 0x400000,
+# flattened to a raw blob, then embedded into the kernel image (see init_blob).
+USER_CC      = x86_64-elf-gcc
+USER_LD      = x86_64-elf-ld
+USER_OBJCOPY = x86_64-elf-objcopy
+USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
+               -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2
+
+user/init.o: user/init.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/init.elf: user/init.o user/user.ld
+	$(USER_LD) -T user/user.ld user/init.o -o $@
+
+user/init.bin: user/init.elf
+	$(USER_OBJCOPY) -O binary $< $@
+
+# Wrap the raw blob in an object the kernel links against. The .incbin pulls in
+# the bytes; the two labels bracket them so C can compute the length at runtime.
+user/init_blob.o: user/init.bin kernel/cpu/init_blob.asm
+	$(ASM) -f elf64 kernel/cpu/init_blob.asm -o $@
+
+USER_BLOB_OBJ = user/init_blob.o
+
 # QEMU drive args: boot disk (master) + data disk (slave)
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
          -drive format=raw,file=$(DISK),if=ide,index=1
@@ -77,8 +108,11 @@ $(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_ELF)
 $(ISR_OBJ): $(ISR_ASM)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ)
+$(SYSCALL_OBJ): $(SYSCALL_ASM)
+	$(ASM) -f elf64 $< -o $@
+
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
@@ -157,6 +191,39 @@ run-fat: $(IMG) $(DISK) fat32.img
 	    -drive format=raw,file=fat32.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 
+# ---- Partition-table tests (MBR) -------------------------------------------
+# A whole disk carrying an MBR with one primary partition starting at LBA 2048.
+# The block layer should expose it as sdb1 and mount the filesystem THERE, not
+# on the raw disk. Two flavours: FAT32 and EMBKFS inside the partition.
+
+# 64MB disk, one 63MB FAT32 partition at LBA 2048.
+part_fat.img:
+	dd if=/dev/zero of=part_fat.img bs=1M count=64 status=none
+	printf 'label: dos\nstart=2048, type=0c\n' | sfdisk part_fat.img
+	dd if=/dev/zero of=/tmp/fatpart.img bs=512 count=129024 status=none
+	mkfs.vfat -F 32 -n PARTTEST /tmp/fatpart.img
+	echo "hello from a FAT32 partition" > /tmp/pf.txt
+	mcopy -i /tmp/fatpart.img /tmp/pf.txt ::PART.TXT
+	dd if=/tmp/fatpart.img of=part_fat.img bs=512 seek=2048 conv=notrunc status=none
+
+# 16MB disk, one partition at LBA 2048 holding the pristine EMBKFS tree image.
+part_embkfs.img: embkfs_tree.img
+	dd if=/dev/zero of=part_embkfs.img bs=1M count=16 status=none
+	printf 'label: dos\nstart=2048, type=83\n' | sfdisk part_embkfs.img
+	dd if=embkfs_tree.img of=part_embkfs.img bs=512 seek=2048 conv=notrunc status=none
+
+run-part-fat: $(IMG) $(DISK) part_fat.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=part_fat.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
+
+run-part-embkfs: $(IMG) $(DISK) part_embkfs.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=part_embkfs.img,if=ide,index=1,cache=writethrough \
+	    -serial stdio -no-reboot -no-shutdown
+
 run: $(IMG) $(DISK)
 	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown
 
@@ -180,7 +247,10 @@ run-all: $(IMG) ahci.img fat32.img
 	    -drive id=satadisk,file=ahci.img,format=raw,if=none \
 	    -device ide-hd,drive=satadisk,bus=ahci0.0 \
 	    -serial stdio -no-reboot -no-shutdown
-clean:
-	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) $(ISR_OBJ)
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow
+clean:
+	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) \
+	      $(ISR_OBJ) $(SYSCALL_OBJ) \
+	      user/init.o user/init.elf user/init.bin user/init_blob.o
+
+.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs
