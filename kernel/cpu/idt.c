@@ -44,14 +44,18 @@ extern void isr30(void);
 extern void isr31(void);    
 
 
-void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr) {
+void idt_set_entry_ist(uint8_t vector, uint64_t handler, uint8_t type_attr, uint8_t ist) {
     idt[vector].offset_low = handler & 0xFFFF;
     idt[vector].selector = 0x08; // kernel code segment selector in GDT
-    idt[vector].ist = 0; // No IST
+    idt[vector].ist = ist & 0x7; // low 3 bits = IST index; bits 3-7 reserved (0)
     idt[vector].type_attr = type_attr;
     idt[vector].offset_mid = (handler >> 16) & 0xFFFF;
     idt[vector].offset_high = (handler >> 32) & 0xFFFFFFFF;
     idt[vector].reserved = 0;
+}
+
+void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr) {
+    idt_set_entry_ist(vector, handler, type_attr, 0); // no IST
 }
 
 
