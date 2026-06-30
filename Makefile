@@ -12,9 +12,11 @@ DISK = disk.img
 STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
 ISR_ASM     = kernel/cpu/isr.asm
+KCONTEXT_ASM = kernel/cpu/kcontext.asm
 ISR_OBJ     = kernel/cpu/isr.o
 SYSCALL_ASM = kernel/cpu/syscall_entry.asm
 SYSCALL_OBJ = kernel/cpu/syscall_entry.o
+KCONTEXT_OBJ = kernel/cpu/kcontext.o
 
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
@@ -111,8 +113,11 @@ $(ISR_OBJ): $(ISR_ASM)
 $(SYSCALL_OBJ): $(SYSCALL_ASM)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ)
+$(KCONTEXT_OBJ): $(KCONTEXT_ASM)
+	$(ASM) -f elf64 $< -o $@
+
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(KCONTEXT_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(KCONTEXT_OBJ)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)

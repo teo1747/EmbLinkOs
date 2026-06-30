@@ -101,21 +101,22 @@ void enter_user_mode(void)
     vmm_map(USER_STACK_VA, stack_phys, VMM_WRITABLE | VMM_USER);
     uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;     /* top, grows down */
 
-    serial_write_string("Entering ring 3 at 0x400000...\n");
 
-    /* 3. iretq into the program. Frame pop order: RIP, CS, RFLAGS, RSP, SS. */
+    /* Save the kernel context. Direct call returns 0 -> we proceed to drop
+     * into ring 3. When sys_exit calls kernel_ctx_restore(&g_user_exit_ctx, 1),
+     * execution reappears HERE returning 1, and we skip the iretq and fall
+     * through back into the kernel. */
+    if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
+        serial_write_string("Returned to kernel: user program exited.\n");
+        return;                       /* clean return into the kernel */
+    }
+
+    serial_write_string("Entering ring 3 at 0x400000...\n");
     __asm__ volatile (
-        "pushq %0\n"        /* SS     = user data | 3 */
-        "pushq %1\n"        /* RSP    = user stack top */
-        "pushq $0x202\n"    /* RFLAGS = IF | reserved-1 */
-        "pushq %2\n"        /* CS     = user code | 3 */
-        "pushq %3\n"        /* RIP    = 0x400000 (entry) */
+        "pushq %0\n" "pushq %1\n" "pushq $0x202\n" "pushq %2\n" "pushq %3\n"
         "iretq\n"
-        :
-        : "r"((uint64_t)(0x18 | 3)),     /* USER_DATA_SEL */
-          "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)),     /* USER_CODE_SEL */
-          "r"(USER_LOAD_BASE)            /* enter at the blob's base == _start */
+        : : "r"((uint64_t)(0x18|3)), "r"(user_rsp),
+            "r"((uint64_t)(0x20|3)), "r"(USER_LOAD_BASE)
         : "memory"
     );
 }
