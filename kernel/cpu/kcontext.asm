@@ -1,6 +1,6 @@
 ; Minimal setjmp/longjmp implementation for kernel->user->kernel context switching.
 ; Field order Must match struct kcontext in kernel/cpu/kcontext.h
-; rbx=0, rbp=8, r12=16, r13=24, r14=32, r15=40, rsp=48, rip=56
+; rbx=0, rbp=8, r12=16, r13=24, r14=32, r15=40, rsp=48, rip=56, rflags=64
 ; SysV ABI: 1st arg = rdi (struct kcontext *), 2nd arg = rsi (return value)
 
 global kernel_ctx_save
@@ -24,6 +24,9 @@ kernel_ctx_save:
     ; RIP to resume at: our return address (sitting at [rsp])
     mov rax, [rsp]               ; resume RIP = our return address
     mov [rdi + 56], rax
+    pushfq                       ; save RFLAGS to stack
+    pop rax                      ; pop RFLAGS into rax
+    mov [rdi + 64], rax          ; save RFLAGS
 
     xor eax, eax                 ; the direct call returns 0
     ret
@@ -44,4 +47,9 @@ kernel_ctx_restore:
     mov rax, 1                   ; never let restore return 0, would look like direct call
 .nonzero_retval:
     mov rcx, [rdi + 56]          ; resume right after kernel_ctx_save
+
+    mov rax, [rdi + 64]          ; restore RFLAGS
+    push rax                      ; push RFLAGS onto stack
+    popfq                        ; restore RFLAGS from stack
+    
     jmp rcx                      ; jump to the saved RIP

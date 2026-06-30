@@ -6,6 +6,8 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
+#include "cpu/rwlock.h"
+#include "cpu/usermode.h"
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -244,6 +246,8 @@ static void selftests_print_commands(void)
     kprintf("  test fd\n");
     kprintf("  test fat32\n");
     kprintf("  test fat32 vfs\n");
+    kprintf("  test rwlock\n");
+    kprintf("  test ring3\n");
 }
 
 static void run_embkfs_all(void)
@@ -334,6 +338,21 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = vfs_fd_run_selftests();
         kprintf("\n[cmd] test fd: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test rwlock") == 0) {
+        int rc = rwlock_run_selftests();
+        kprintf("\n[cmd] test rwlock: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test ring3") == 0) {
+        // Drop to ring 3, run the user stub (write + exit via int 0x80), and
+        // return here when it exits. Re-runnable (leaks a couple of user pages
+        // per run until enter_user_mode frees them).
+        enter_user_mode();
+        kprintf("\n[cmd] test ring3: returned to kernel\n");
         return 1;
     }
 

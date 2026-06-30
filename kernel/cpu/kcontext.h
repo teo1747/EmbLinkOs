@@ -10,7 +10,7 @@
 // resume address need saving. Field order MUST match the offsets used by
 // kernel_ctx_save / kernel_ctx_restore in kcontext.asm.
 struct kcontext {
-    uint64_t rbx, rbp, r12, r13, r14, r15, rsp, rip;
+    uint64_t rbx, rbp, r12, r13, r14, r15, rsp, rip, rflags;
 };
 
 // setjmp: save the current context into ctx. Returns 0 on the direct call, and

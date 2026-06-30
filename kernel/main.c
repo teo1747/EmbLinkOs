@@ -18,6 +18,7 @@
 
 #include "cpu/gdt.h"
 #include "cpu/idt.h"
+#include "cpu/syscall.h"
 #include "cpu/pic.h"
 #include "cpu/irq.h"
 #include "cpu/lapic.h"
@@ -29,6 +30,7 @@
 
 #include "acpi/acpi.h"
 #include "block/block.h"
+#include "block/partition.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
@@ -52,6 +54,7 @@ void kernel_main(void) {
     serial_init();
     gdt_init();
     idt_init();
+    syscall_init();   // install int 0x80 (DPL3) + #DF on IST1; needs idt_init first
     pic_init();
     irq_install();
 
@@ -77,7 +80,7 @@ void kernel_main(void) {
     // Register AHCI drives as block devices (after ahci_init filled sector counts)
     ahci_register_block_devices();
 
-    
+
 
     // --- Display + input ---
     fb_init();
@@ -102,6 +105,13 @@ void kernel_main(void) {
 // ============================================================
     //  Block device enumeration
     // ============================================================
+    // Probe each whole disk for an MBR and expose its partitions (sda1, sda2,
+    // ...) as block devices. Must run after `sti` above: the ATA read path is
+    // IRQ-driven and would hang waiting on an interrupt that can't fire yet.
+    // Done before enumeration/mount so partitions appear in the listing and the
+    // mount probe below sees them alongside whole disks.
+    embk_partition_scan_all();
+
     kprintf("\n=== Block devices ===\n");
     for (uint32_t i = 0; i < embk_block_count(); i++) {
         struct embk_block_device *dev = embk_block_get(i);
@@ -161,15 +171,7 @@ void kernel_main(void) {
 
     vfs_ls("/");
 
-    void enter_user_mode(void);   /* or include usermode.h */
-
-    serial_write_string("\n=== Ring 3 test ===\n");
-    enter_user_mode();
-
-    /* execution does not return here — the stub faults in ring 3 and the
-    #GP handler takes over */
-    serial_write_string("UNREACHABLE: returned from ring 3?!\n");
-    for (;;) { __asm__ volatile("hlt"); }
+    // Ring-3 demo is now shell-triggered: type `test ring3` at the prompt.
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;

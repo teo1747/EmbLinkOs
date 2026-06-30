@@ -4,9 +4,25 @@
 #include <stdint.h>
 
 
-static uint64_t *kernel_pml4 = 0;
+static uint64_t kernel_pml4_phys = 0;     // physical address of the kernel PML4
+static int vmm_direct_map_active = 0;     // 0 during early init, 1 after the CR3 switch
 extern uint8_t kernel_end[];
 extern uint8_t BOOT_STACK_TOP_PHYS[];
+
+
+// Map a physical page-table page to a usable virtual pointer.
+//
+// Page-table pages are handed out by the PMM from anywhere in usable RAM, so
+// they routinely live past the kernel image. Before the CR3 switch the only
+// active mapping that spans arbitrary low RAM is the stage2 kernel window
+// (KP2V covers the low 1GB). After the switch that window only covers the
+// kernel image (up to ~2MB), so we must reach page-table pages through the
+// direct map (P2V), which spans all usable RAM. Using KP2V post-switch is the
+// bug that faulted once the kernel grew enough to push allocations past 2MB.
+static inline uint64_t *vmm_table(uint64_t phys) {
+    return (uint64_t *)(vmm_direct_map_active ? P2V(phys) : KP2V(phys));
+}
+static inline uint64_t *vmm_pml4(void) { return vmm_table(kernel_pml4_phys); }
 
 
 // helper functions
@@ -22,7 +38,7 @@ static uint64_t *alloc_table(void) {
     if (!pyhs_addr){
         return 0;
     }
-    uint64_t *table = (uint64_t *)KP2V(pyhs_addr);
+    uint64_t *table = (uint64_t *)vmm_table(pyhs_addr);
     for (int i = 0; i < 512; i++) {
         table[i] = 0;
     }
@@ -35,15 +51,15 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
     if (parent[index] & VMM_PRESENT) {
         // Table already exists, return its vitual address
         uint64_t phys_addr = parent[index] & VMM_ADDR_MASK;
-        return (uint64_t *)KP2V(phys_addr);
+        return (uint64_t *)vmm_table(phys_addr);
     }
     // Allocate a new table and set its flags
     uint64_t phys_addr = pmm_alloc_page();
     if (!phys_addr) {
         return 0;
     }
-    
-    uint64_t *table = (uint64_t *)KP2V(phys_addr);
+
+    uint64_t *table = (uint64_t *)vmm_table(phys_addr);
     for (int i = 0; i < 512; i++) {
         table[i] = 0;
     }
@@ -56,7 +72,7 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
 
 // Public API
 int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
-    uint64_t *pdpt = get_or_create_table(kernel_pml4, pml4_index(virt_addr),  flags);
+    uint64_t *pdpt = get_or_create_table(vmm_pml4(), pml4_index(virt_addr),  flags);
     if (!pdpt) {
         return -1;
     }
@@ -79,20 +95,21 @@ int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
 }
 
 void vmm_unmap(uint64_t virt_addr){
-    uint64_t *pdpt = (uint64_t *)KP2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(kernel_pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
+    uint64_t *pml4 = vmm_pml4();
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
+    uint64_t *pdpt = (uint64_t *)vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
 
-    uint64_t *pd = (uint64_t *)KP2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
     if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
+    uint64_t *pd = (uint64_t *)vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
 
-    uint64_t *pt = (uint64_t *)KP2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
     if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
         return;
     }
+    uint64_t *pt = (uint64_t *)vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
 
     uint64_t page_index = pt_index(virt_addr); // represents 12 bits for 4K pages
     pt[page_index] = 0; // clear the page table entry
@@ -100,21 +117,22 @@ void vmm_unmap(uint64_t virt_addr){
 }
 
 uint64_t vmm_get_phys(uint64_t virt_addr) {
-    if (!(kernel_pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
+    uint64_t *pml4 = vmm_pml4();
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pdpt = (uint64_t *)KP2V(kernel_pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pdpt = (uint64_t *)vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
 
-  
+
     if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pd = (uint64_t *)KP2V(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pd = (uint64_t *)vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
     }
-    uint64_t *pt = (uint64_t *)KP2V(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pt = (uint64_t *)vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) {
         return 0;
@@ -130,7 +148,7 @@ void vmm_flush_tlb(uint64_t virt_addr) {
 }
 
 uint64_t vmm_get_kernel_pml4(void) {
-    return KV2P(kernel_pml4);
+    return kernel_pml4_phys;
 }
 
 
@@ -140,14 +158,17 @@ void vmm_init(void) {
 
 
     // step 1:Allocate a new page for the kernel PML4
-    kernel_pml4 = alloc_table();
-    if (!kernel_pml4) {
+    // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it
+    // hands back a KP2V pointer; recover the physical address with KV2P.
+    uint64_t *pml4 = alloc_table();
+    if (!pml4) {
         serial_write_string("FATAL: Could not allocate PML4\n");
         while (1) {}
     }
+    kernel_pml4_phys = KV2P(pml4);
 
     serial_write_string("PML4 Allocated at phys: ");
-    serial_write_hex(KV2P(kernel_pml4));
+    serial_write_hex(kernel_pml4_phys);
     serial_write_string("\n");
 
 
@@ -179,7 +200,7 @@ void vmm_init(void) {
     for (uint64_t phys = 0; phys < highest_phys; phys += 0x200000) {
         uint64_t virt = phys + DIRECT_MAP_BASE;
         
-        uint64_t *pdpt = get_or_create_table(kernel_pml4, pml4_index(virt),  VMM_WRITABLE);
+        uint64_t *pdpt = get_or_create_table(vmm_pml4(), pml4_index(virt),  VMM_WRITABLE);
         if (!pdpt) {
             serial_write_string("FATAL: Could not allocate PDPT\n");
             while (1) {}
@@ -229,8 +250,12 @@ void vmm_init(void) {
     // step 4: switch CR3 to point to the kernel PML4 (new page tables)
 
     serial_write_string("switching CR3 ...\n");
-    uint64_t new_cr3 = KV2P(kernel_pml4);
+    uint64_t new_cr3 = kernel_pml4_phys;
     __asm__ volatile("mov %0, %%cr3" : : "r" (new_cr3): "memory");
+    // The new tables carry the full direct map, so from here on page-table
+    // pages must be reached through it (P2V) rather than the now-2MB kernel
+    // window (KP2V).
+    vmm_direct_map_active = 1;
     serial_write_string("CR3 set to ");
     serial_write_hex(new_cr3);
     serial_write_string("\n");
