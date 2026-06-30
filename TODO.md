@@ -84,7 +84,13 @@ left to do.
 
 ### Synchronization
 - [ ] Spinlock has no deadlock detection / lock-ordering checks.
-- [ ] No reader-writer locks (all mutual exclusion is exclusive).
+- [x] Reader-writer locks — rwlock_t in kernel/cpu/rwlock.c (many readers OR one
+  writer, single atomic state word; irqsave/irqrestore since multiple readers
+  can't share one saved-flags slot). Smoke test: `test rwlock`. Not yet wired
+  into any data structure (read-mostly candidates arrive with SMP).
+  - [ ] Reader-preferring — a steady reader stream can starve a writer. Add a
+    writer-preferring variant (pending-writer flag blocking new readers) if
+    needed.
 - [ ] Per-CPU heap caches to reduce lock contention (multi-core, future).
 
 ---
@@ -120,14 +126,17 @@ left to do.
 ## Storage
 
 ### ATA / DMA
-- [ ] PRD_EOT has a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
+- [x] PRD_EOT had a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
   ata.c. Works in the current single-assignment use but will break inside a
   larger expression — remove the semicolon.
 - [ ] Multi-PRD scatter-gather for buffers > 64KB or spanning pages (current
   limit: single contiguous region ≤ 64KB / ≤ 128 sectors).
 - [ ] LBA48 DMA (READ DMA EXT 0x25) for > 128 sectors / disks > 128GB on the
   IDE/DMA path. (AHCI path already does LBA48.)
-- [ ] DMA buffer must be kernel BSS/contiguous (KV2P). For arbitrary virtual
+- [x] DMA buffer no longer has to be contiguous in callers: ATA DMA now uses
+  direct multi-PRD for physically contiguous mappings and a bounce-buffer
+  fallback for arbitrary virtual buffers.
+  For arbitrary virtual
   buffers: walk pages + multi-PRD, or bounce-buffer.
 - [ ] Secondary channel DMA (offset 0x08 in BMIDE) not handled.
 - [ ] No cache-coherency handling (fine on QEMU/x86; matters on some HW).
@@ -140,8 +149,15 @@ left to do.
   ports if multiple SATA disks appear.
 
 ### Block layer
-- [ ] No partition support — devices are whole disks (sda, sdb…). Partition
-  naming convention (sdaN) needed once we parse partition tables / MBR/GPT.
+- [x] Partition support — MBR (DOS) table parsed; each primary partition is
+  exposed as a child block device (sda1, sda2…) that delegates to its parent
+  disk at the partition's start LBA, bounded by its length. Mount probe sees
+  partitions alongside whole disks. See kernel/block/partition.c.
+  - [ ] GPT not parsed yet — a protective-MBR (type 0xEE) disk is detected and
+    skipped with a notice.
+  - [ ] Extended/logical partitions (type 0x05/0x0F) detected but not walked.
+  - [ ] Scan must run after `sti` (ATA read path is IRQ-driven). Placed in
+    main.c right before block enumeration / mount probe for that reason.
 - [ ] Block-layer reads/writes on IDE secondary channel hang — DMA + IRQ
   are only wired for the primary channel (IRQ 14, primary BMIDE base).
   Secondary needs IRQ 15 + BMIDE offset 0x08 + per-channel state. Until
@@ -151,7 +167,6 @@ left to do.
   once transfers can be concurrent (IRQ-driven / multi-threaded). Fine while
   synchronous. Also: bounce always copies; multi-PRD scatter-gather (page-walk
   via vmm_get_phys) would be the zero-copy alternative (already on TODO).
-
 
 ---
 
@@ -260,6 +275,44 @@ left to do.
 - [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
   stat per write, and a TOCTOU window if writes can race. Acceptable while
   single-threaded; revisit with concurrency.
+
+---
+
+## User Mode & Syscalls
+
+### Security — user-pointer validation (HIGH, the real hole)
+- [ ] `sys_write` dereferences a raw user pointer (rsi) with NO validation. A
+  ring-3 caller can pass a KERNEL address → the kernel reads/prints kernel
+  memory, or faults. This is the canonical syscall vuln class (missing
+  copy_from_user / access_ok).
+  - FIX: copy_from_user / copy_to_user with an access_ok-style range check
+    (pointer + len lies entirely within this process's user VA range, and is
+    mapped). Blocked on per-process address spaces — there's no "this process's
+    user range" to check against until then. Becomes mandatory the moment
+    untrusted programs run.
+
+### Syscall transport
+- [ ] Only `int 0x80` (software gate) implemented. Fast path `syscall`/`sysret`
+  deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE, AND swapgs + a per-CPU GS
+  base for the kernel-stack switch (syscall does NOT switch stacks via the TSS).
+  Wants per-CPU/SMP infra. GDT already laid out user data-before-code for it.
+- [ ] Syscall table is minimal (write=1, exit=2). Wire the fd/VFS syscalls —
+  open/read/write/close/lseek/stat/readdir — straight through to vfs_open /
+  vfs_fd_read / … so ring 3 can do real file I/O (depends on user-pointer
+  validation above for read/write buffers).
+- [ ] `sys_write` is serial-only and ignores fd. Route through the fd layer
+  once the fd syscalls land (fd 1 = stdout, etc.).
+
+### Ring-3 / TSS plumbing
+- [ ] Ring-3 test still HAND-COPIES a fixed byte count of a kernel function
+  into a user page; kernel-address references (string literals) aren't
+  reachable from ring 3. Being replaced by the user-program loader (in
+  progress). Remove the stub-copy hack once the loader lands.
+- [ ] `tss_set_rsp0` exists but RSP0 is a single static kernel stack. Once
+  threads/processes exist, RSP0 must be updated on every context switch so an
+  interrupt taken in user mode lands on the CURRENT thread's kernel stack.
+  Deferred to the scheduler.
+  
 
 ## Core / Library
 

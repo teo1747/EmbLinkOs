@@ -28,5 +28,12 @@ struct idt_ptr {
 void idt_init(void);
 void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr);
 
+// Like idt_set_entry, but selects an Interrupt Stack Table slot (1..7) so the
+// CPU switches to TSS.ist[ist-1] on entry instead of using the current stack.
+// ist == 0 means "no IST" (use the regular stack), identical to idt_set_entry.
+// Used for #DF (vector 8): a corrupted/overflowed kernel stack must not be
+// reused by the handler, or the fault escalates to a triple-fault reset.
+void idt_set_entry_ist(uint8_t vector, uint64_t handler, uint8_t type_attr, uint8_t ist);
+
 
 #endif // _IDT_H

@@ -96,6 +96,17 @@ IRQ_STUB 14, 46
 IRQ_STUB 15, 47
 
 
+; Dedicated double-fault (#DF, vector 8) entry. Installed on IST1 by
+; syscall_init, so even a corrupted/overflowed kernel stack lands on a known-
+; good stack instead of escalating #DF -> triple-fault -> CPU reset. The CPU
+; pushes a #DF error code (always 0), so like ISR_ERR we only push the vector
+; before joining the shared dump path (isr_handler prints and halts).
+global isr_double_fault
+isr_double_fault:
+    push qword 8        ; vector number (error code already on the stack)
+    jmp isr_commom
+
+
 
 
 isr_commom:
