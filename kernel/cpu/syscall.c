@@ -58,6 +58,8 @@ static int64_t sys_exit(struct regs *r) {
     return 0; // never reached
 }
 
+
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
