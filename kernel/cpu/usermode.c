@@ -107,6 +107,10 @@ void enter_user_mode(void)
      * execution reappears HERE returning 1, and we skip the iretq and fall
      * through back into the kernel. */
     if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
+        /* We got here via kernel_ctx_restore from sys_exit, NOT via iret, so the
+         * int 0x80 interrupt gate's cleared IF was never restored. Re-enable
+         * interrupts or IRQs (keyboard, timer) stay masked forever. */
+        
         serial_write_string("Returned to kernel: user program exited.\n");
         return;                       /* clean return into the kernel */
     }
