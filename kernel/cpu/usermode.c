@@ -4,17 +4,22 @@
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include "../drivers/serial.h"
+#include "../cpu/elf.h"
+#include "../include/errno.h"
+#include "../fs/vfs.h"
+#include "../fs/fd.h"
+#include "../include/kmalloc.h"
+
+
+
 #include <stdint.h>
 
 
 
-/* The embedded user program, bracketed by labels from init_blob.asm. Declared
- * as arrays so the names decay to the linker symbols' ADDRESSES; end - start is
- * therefore the byte length. */
-extern const uint8_t init_blob_start[];
-extern const uint8_t init_blob_end[];
-#define INIT_BLOB_LEN ((uint64_t)(init_blob_end - init_blob_start))
 
+
+
+#define INIT_PROGRAM_PATH "/init.elf"
 
 /* Saved kernel context to resume when the ring-3 task exits. sys_exit
  * (syscall.c) restores this instead of halting, so control returns here. */
@@ -67,60 +72,80 @@ static void user_stub(void)
 }
 
 
+/* Read a static ELF64 executable off the filesystem into a kmalloc'd buffer,
+ * then hand it to elf_load — which is source-agnostic, it only ever cared
+ * about an image pointer + length. The buffer is freed here, not by elf_load,
+ * because by the time elf_load returns it has already COPIED every byte it
+ * needs into user pages (the p_filesz copy loop runs synchronously inside
+ * it) — nothing downstream reads from this buffer again. */
+static int elf_load_from_file(const char *path, uint64_t *entry_out)
+{
+    int fd = vfs_open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        serial_write_string("elf_load_from_file: open failed: ");
+        serial_write_hex((uint64_t)(-fd));
+        serial_write_string("\n");
+        return fd;
+    }
+
+    struct vfs_stat st;
+    int rc = vfs_fd_fstat(fd, &st);
+    if (rc != EMBK_OK) { vfs_close(fd); return rc; }
+    if (st.size == 0)  { vfs_close(fd); return -EMBK_EINVAL; }
+
+    uint8_t *buf = kmalloc(st.size);
+    if (!buf) { vfs_close(fd); return -EMBK_ENOMEM; }
+
+    /* Robust read loop: ONE vfs_fd_read call is not guaranteed to return the
+     * whole file. Keep reading until we have st.size bytes, or hit EOF short
+     * of that (truncated/corrupt — do not hand a partial image to the ELF
+     * parser), or a hard error. */
+    uint64_t total = 0;
+    while (total < st.size) {
+        size_t got = 0;
+        rc = vfs_fd_read(fd, buf + total, (size_t)(st.size - total), &got);
+        if (rc != EMBK_OK) { kfree(buf); vfs_close(fd); return rc; }
+        if (got == 0)      { kfree(buf); vfs_close(fd); return -EMBK_EIO; }
+        total += got;
+    }
+    vfs_close(fd);   /* done with the fd; only the buffer matters now */
+
+    rc = elf_load(buf, total, entry_out);
+    kfree(buf);
+    return rc;
+}
+
+
 void enter_user_mode(void)
 {
-    uint64_t blob_len = INIT_BLOB_LEN;
-    serial_write_string("Loading user program, bytes=");
-    serial_write_hex(blob_len);
+    uint64_t entry = 0;
+    int rc = elf_load_from_file(INIT_PROGRAM_PATH, &entry);
+    if (rc != EMBK_OK) {
+        serial_write_string("Failed to load init program: ");
+        serial_write_hex((uint64_t)(-rc));
+        serial_write_string("\n");
+        return;
+    }
+
+    /* everything below is UNCHANGED: user stack, kernel_ctx_save, iretq */
+    uint64_t stack_phys = pmm_alloc_page();
+    vmm_map(USER_STACK_VA, stack_phys, VMM_USER | VMM_WRITABLE | VMM_NX);
+    uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;
+
+    if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
+        serial_write_string("Returned to kernel: user program exited.\n");
+        return;
+    }
+
+    serial_write_string("Entering ring 3 at entry=");
+    serial_write_hex(entry);
     serial_write_string("\n");
 
-    /* 1. Map enough user pages at the link base to hold the blob, and copy it
-     *    in. v1: one RWX region (W^X deferred to the ELF loader — see TODO).
-     *    Map page-by-page so a multi-page program just works. */
-    uint64_t pages = (blob_len + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K;
-    for (uint64_t i = 0; i < pages; i++) {
-        uint64_t va   = USER_LOAD_BASE + i * PAGE_SIZE_4K;
-        uint64_t phys = pmm_alloc_page();
-        if (!phys) {
-            serial_write_string("FATAL: out of frames loading user program\n");
-            for (;;) __asm__ volatile("cli; hlt");
-        }
-        /* WRITABLE so the copy below lands; USER so ring 3 can fetch it.
-         * (RWX for now — code+data share the region.) */
-        vmm_map(va, phys, VMM_WRITABLE | VMM_USER);
-    }
-
-    /* Copy the blob into the freshly mapped user VA. After vmm_map, the user
-     * VA is valid in THIS address space, so a plain byte copy works. */
-    volatile uint8_t *dst = (volatile uint8_t *)USER_LOAD_BASE;
-    for (uint64_t i = 0; i < blob_len; i++)
-        dst[i] = init_blob_start[i];
-
-    /* 2. A user stack page. */
-    uint64_t stack_phys = pmm_alloc_page();
-    vmm_map(USER_STACK_VA, stack_phys, VMM_WRITABLE | VMM_USER);
-    uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;     /* top, grows down */
-
-
-    /* Save the kernel context. Direct call returns 0 -> we proceed to drop
-     * into ring 3. When sys_exit calls kernel_ctx_restore(&g_user_exit_ctx, 1),
-     * execution reappears HERE returning 1, and we skip the iretq and fall
-     * through back into the kernel. */
-    if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
-        /* We got here via kernel_ctx_restore from sys_exit, NOT via iret, so the
-         * int 0x80 interrupt gate's cleared IF was never restored. Re-enable
-         * interrupts or IRQs (keyboard, timer) stay masked forever. */
-        
-        serial_write_string("Returned to kernel: user program exited.\n");
-        return;                       /* clean return into the kernel */
-    }
-
-    serial_write_string("Entering ring 3 at 0x400000...\n");
     __asm__ volatile (
         "pushq %0\n" "pushq %1\n" "pushq $0x202\n" "pushq %2\n" "pushq %3\n"
         "iretq\n"
         : : "r"((uint64_t)(0x18|3)), "r"(user_rsp),
-            "r"((uint64_t)(0x20|3)), "r"(USER_LOAD_BASE)
+            "r"((uint64_t)(0x20|3)), "r"(entry)
         : "memory"
     );
 }
