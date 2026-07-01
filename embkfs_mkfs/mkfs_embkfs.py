@@ -13,9 +13,10 @@ deliberately small but exercises the WHOLE format:
         * the root directory's entries           {OBJID_ROOT, DIR_ENTRY, hash}
           (one item per name hash; names that COLLIDE on the hash share one item
            as a chain of records — see build_dir_entry_items)
-        * each file's inode                      {fileid, INODE, 0}
-        * each file's single extent              {fileid, EXTENT, 0}
-    - one data block per file
+                * each file's inode                      {fileid, INODE, 0}
+                * each file's extent                     {fileid, EXTENT, 0}
+                    (length_blocks may be >1 for larger files)
+        - one or more data blocks per file
 
 The default image holds regular files plus one symlink in the root directory:
     hello.txt    — an ordinary entry (its own single-record dir-entry item)
@@ -30,7 +31,7 @@ field-wise key ordering, collision chaining, and every item type.
 Block map (4 KiB blocks):
     block 16     : primary superblock (byte offset 65536)
     block 17     : the metadata leaf (tree root)
-    block 18..   : one data block per file
+    block 18..   : file data blocks (contiguous per file)
     last block   : backup superblock
 """
 
@@ -132,12 +133,23 @@ def build_leaf_block(generation: int, block_no: int, items: list) -> bytes:
 
 
 def build_data_block(data: bytes) -> bytes:
-    """A file data block: the bytes, zero-padded to a full block."""
+    """One on-disk block: payload bytes zero-padded to exactly BLOCK_SIZE."""
     if len(data) > L.BLOCK_SIZE:
-        raise ValueError("this minimal formatter supports a single-block file")
+        raise ValueError("block payload exceeds BLOCK_SIZE")
     buf = bytearray(L.BLOCK_SIZE)
     buf[0:len(data)] = data
     return bytes(buf)
+
+
+def build_data_blocks(data: bytes) -> list:
+    """Split file bytes into 4 KiB blocks (last block is zero-padded)."""
+    if len(data) == 0:
+        return []
+
+    blocks = []
+    for off in range(0, len(data), L.BLOCK_SIZE):
+        blocks.append(build_data_block(data[off:off + L.BLOCK_SIZE]))
+    return blocks
 
 
 def build_superblock(total_blocks: int, free_blocks: int, generation: int,
@@ -180,11 +192,16 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
     DATA_BLOCK   = SB_BLOCK + 2                 # block 18: first file's data
     BACKUP_BLOCK = total_blocks - 1            # last block: backup superblock
 
+    with open("user/init.elf", "rb") as f:
+        init_elf_data = f.read()
+
     # --- objects we put in the root directory ---
     # hello.txt is an ordinary single-entry item (the regression case).
     # wgyehkb.txt and illoeuw.txt share the SAME CRC32C name hash (0xC38842AB),
     # so they land in ONE dir-entry item as a 2-record collision chain.
     objects = [
+        (b"init.elf",   L.DT_REG, L.S_IFREG | 0o755,
+         init_elf_data),
         (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
          b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
         (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
@@ -204,30 +221,37 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
                                mode=L.S_IFDIR | L.PERM_DIR, uid=0, gid=0,
                                generation=gen)))
 
-    # one object id + data block + inode + extent per file; collect the dir
+    # one object id + inode + extent per file; collect the dir
     # entries so they can be grouped/chained by name hash afterwards.
     dir_entries = []
     data_blocks = []                              # (block_no, block_bytes) to write
+    file_layouts = []                             # (name, start_block, nblocks, size, csum)
     oid = L.FIRST_USER_OBJID                      # 2
     blk = DATA_BLOCK                              # 18
     for name, dtype, mode, data in objects:
         dir_entries.append((name, oid, dtype))
 
+        nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
+        data_csum = crc32c(data)
+
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
-                      L.pack_inode(size=len(data), blocks=1, links=1,
+                      L.pack_inode(size=len(data), blocks=nblocks, links=1,
                                    mode=mode, uid=0, gid=0,
                                    generation=gen)))
 
         # data checksum is CRC32C over the file's actual bytes (logical_size),
         # NOT the zero padding — spec §9.3 end-to-end data integrity.
-        items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
-                      L.pack_extent(disk_block=blk, length_blocks=1,
-                                    logical_size=len(data),
-                                    data_checksum=crc32c(data), generation=gen)))
+        if nblocks > 0:
+            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
+                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
+                                        logical_size=len(data),
+                                        data_checksum=data_csum, generation=gen)))
 
-        data_blocks.append((blk, build_data_block(data)))
+        for i, db in enumerate(build_data_blocks(data)):
+            data_blocks.append((blk + i, db))
+        file_layouts.append((name, blk, nblocks, len(data), data_csum))
         oid += 1
-        blk += 1
+        blk += nblocks
 
     # the directory's entries, grouped + chained by name hash
     items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
@@ -245,10 +269,10 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
     assert embedded == leaf_csum, "leaf self-checksum mismatch in builder"
 
     # free_blocks hint: block 0 (reserved as the null-pointer sentinel) + SB +
-    # leaf + backup (4) plus one data block per file. Block 0 is never written
+    # leaf + backup (4) plus all file data blocks. Block 0 is never written
     # but is counted used so the kernel's allocator oracle (which reserves it)
     # agrees with this hint.
-    used = 4 + len(objects)
+    used = 4 + sum(nblocks for (_name, _start, nblocks, _size, _csum) in file_layouts)
     free_blocks = total_blocks - used
 
     superblock = build_superblock(total_blocks=total_blocks,
@@ -276,9 +300,13 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
     print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs})")
     print(f"  superblock      : block {SB_BLOCK} (byte {SB_BLOCK*bs})")
     print(f"  metadata leaf   : block {LEAF_BLOCK}  (checksum 0x{leaf_csum:08X}, {len(items)} items)")
-    for (b, _d), (name, _dtype, _mode, data) in zip(data_blocks, objects):
-        print(f"  file data       : block {b}  (\"{name.decode()}\", {len(data)} bytes,"
-              f" data csum 0x{crc32c(data):08X})")
+    for name, start, nblocks, logical_size, data_csum in file_layouts:
+        if nblocks == 1:
+            where = f"block {start}"
+        else:
+            where = f"blocks {start}..{start + nblocks - 1}"
+        print(f"  file data       : {where}  (\"{name.decode()}\", {logical_size} bytes,"
+              f" {nblocks} blocks, data csum 0x{data_csum:08X})")
     print(f"  backup superblk : block {BACKUP_BLOCK} (last block)")
     print(f"  free_blocks hint: {free_blocks}")
     print()
@@ -331,7 +359,12 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     DATA_START  = SB_BLOCK + 4               # 20..: file data
     BACKUP_BLOCK = total_blocks - 1
 
+    with open("user/init.elf", "rb") as f:
+        init_elf_data = f.read()
+
     objects = [
+        (b"init.elf",   L.DT_REG, L.S_IFREG | 0o755,
+         init_elf_data),
         (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
          b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
         (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
@@ -346,19 +379,27 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     items.append((L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
                   L.pack_inode(size=0, blocks=0, links=2, mode=L.S_IFDIR | L.PERM_DIR,
                                uid=0, gid=0, generation=gen)))
-    dir_entries, data_blocks = [], []
+    dir_entries, data_blocks, file_layouts = [], [], []
     oid, blk = L.FIRST_USER_OBJID, DATA_START
     for name, dtype, mode, data in objects:
         dir_entries.append((name, oid, dtype))
+
+        nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
+        data_csum = crc32c(data)
+
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
-                      L.pack_inode(size=len(data), blocks=1, links=1, mode=mode,
+                      L.pack_inode(size=len(data), blocks=nblocks, links=1, mode=mode,
                                    uid=0, gid=0, generation=gen)))
-        items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
-                      L.pack_extent(disk_block=blk, length_blocks=1, logical_size=len(data),
-                                    data_checksum=crc32c(data), generation=gen)))
-        data_blocks.append((blk, build_data_block(data)))
+        if nblocks > 0:
+            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
+                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
+                                        logical_size=len(data),
+                                        data_checksum=data_csum, generation=gen)))
+        for i, db in enumerate(build_data_blocks(data)):
+            data_blocks.append((blk + i, db))
+        file_layouts.append((name, blk, nblocks, len(data), data_csum))
         oid += 1
-        blk += 1
+        blk += nblocks
     items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
     items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
 
@@ -378,9 +419,9 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     root_csum = crc32c(root[8:])
 
     # block 0 (reserved null-pointer sentinel) + SB, root, leafA, leafB, backup
-    # (6) + one data block per file. Block 0 is counted used so the kernel's
+    # (6) + all file data blocks. Block 0 is counted used so the kernel's
     # allocator oracle (which reserves it) agrees with this hint.
-    used = 6 + len(objects)
+    used = 6 + sum(nblocks for (_name, _start, nblocks, _size, _csum) in file_layouts)
     free_blocks = total_blocks - used
     sb = build_superblock(total_blocks=total_blocks, free_blocks=free_blocks, generation=gen,
                           uuid16=uuidlib.uuid4().bytes, root_block=ROOT_BLOCK, root_csum=root_csum)

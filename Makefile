@@ -29,6 +29,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/lapic.c \
              kernel/cpu/ioapic.c \
 			 kernel/cpu/usermode.c \
+			 kernel/cpu/elf.c \
              kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
@@ -78,6 +79,7 @@ USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
 user/init.o: user/init.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
+
 user/init.elf: user/init.o user/user.ld
 	$(USER_LD) -T user/user.ld user/init.o -o $@
 
@@ -86,10 +88,10 @@ user/init.bin: user/init.elf
 
 # Wrap the raw blob in an object the kernel links against. The .incbin pulls in
 # the bytes; the two labels bracket them so C can compute the length at runtime.
-user/init_blob.o: user/init.bin kernel/cpu/init_blob.asm
+user/init_blob.o: user/init.elf kernel/cpu/init_blob.asm
 	$(ASM) -f elf64 kernel/cpu/init_blob.asm -o $@
 
-USER_BLOB_OBJ = user/init_blob.o
+
 
 # QEMU drive args: boot disk (master) + data disk (slave)
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
@@ -116,8 +118,8 @@ $(SYSCALL_OBJ): $(SYSCALL_ASM)
 $(KCONTEXT_OBJ): $(KCONTEXT_ASM)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(KCONTEXT_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(USER_BLOB_OBJ) $(KCONTEXT_OBJ)
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
@@ -127,6 +129,13 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 # Create the 64 MB data disk only if it doesn't already exist
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=64
+
+# One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
+# targets in one run, rather than potentially invoking the script twice if
+# both are requested stale in the same `make` invocation.
+embkfs.img embkfs_tree.img &: embkfs_mkfs/mkfs_embkfs.py user/init.elf
+	python3 embkfs_mkfs/mkfs_embkfs.py
+
 
 # Create a 64MB AHCI test disk (separate from disk.img)
 ahci.img:
@@ -255,7 +264,7 @@ run-all: $(IMG) ahci.img fat32.img
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) \
-	      $(ISR_OBJ) $(SYSCALL_OBJ) \
+	      $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ)\
 	      user/init.o user/init.elf user/init.bin user/init_blob.o
 
 .PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs
