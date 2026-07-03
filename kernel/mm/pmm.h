@@ -50,6 +50,9 @@ void pmm_init(void);
 void pmm_print_map(void);
 void pmm_print_stats(void);
 
+// Physical end (exclusive, page-aligned) of the kernel image + PMM bitmap.
+uint64_t pmm_reserved_phys_end(void);
+
 
 // Returns Physical address of the given virtual address (or NULL if not found)
 uint64_t pmm_alloc_page(void);

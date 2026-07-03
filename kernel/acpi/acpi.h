@@ -89,6 +89,21 @@ struct madt_int_override {
 } __attribute__((packed));
 
 
+/* ---- HPET ACPI description table (signature "HPET") ---- */
+struct acpi_hpet {
+    struct acpi_sdt_header header;      /* "HPET" */
+    uint32_t event_timer_block_id;      /* bits[15:8]=vendor, [12]=64-bit, [7:0]=HW rev */
+    /* Generic Address Structure for the base */
+    uint8_t  gas_addr_space;            /* 0 = memory-mapped */
+    uint8_t  gas_bit_width;
+    uint8_t  gas_bit_offset;
+    uint8_t  gas_access_size;
+    uint64_t base_address;              /* physical base of the HPET block */
+    uint8_t  hpet_number;
+    uint16_t minimum_tick;              /* minimum IRQ period (clock ticks) */
+    uint8_t  page_protection;
+} __attribute__((packed));
+
 // Max CPUs / IO-APICs we'll
 #define ACPI_MAX_CPUS     256
 #define ACPI_MAX_IO_APICS 8
@@ -104,6 +119,10 @@ struct acpi_info{
     uint32_t io_apic_count; // number of I/O APICs found in MADT
     uint32_t io_apic_addresses[ACPI_MAX_IO_APICS]; // physical addresses of I/O APICs
     uint32_t io_apic_gsi_bases[ACPI_MAX_IO_APICS]; // GSI base numbers for each I/O APIC
+
+    bool     hpet_found;          /* true if HPET table was present and valid */
+    uint64_t hpet_address;        /* physical base address of HPET MMIO block */
+    uint16_t hpet_minimum_tick;   /* minimum IRQ period in clock ticks */
 };
 
 

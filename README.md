@@ -1,10 +1,10 @@
-# Helios
+# EmbLinkOs
 
 A 64-bit x86_64 operating system built entirely from scratch — no GRUB, no pre-built bootloader, no shortcuts. The goal isn't a toy that boots in QEMU; it's a real system where every layer, from the boot sector to the page tables, is written and understood by hand.
 
 ## What it is
 
-Helios starts from a 512-byte boot sector and works its way up: real mode → protected mode → long mode → a higher-half kernel running at `0xFFFFFFFF80100000`. Along the way it parses the BIOS memory map, sets up paging, manages physical and virtual memory, handles CPU exceptions, and brings up modern interrupt hardware.
+EmbLinkOs starts from a 512-byte boot sector and works its way up: real mode → protected mode → long mode → a higher-half kernel running at `0xFFFFFFFF80100000`. Along the way it parses the BIOS memory map, sets up paging, manages physical and virtual memory, handles CPU exceptions, and brings up modern interrupt hardware.
 
 It is written in C and x86_64 assembly (NASM), built with an `x86_64-elf` cross-compiler, and tested under QEMU with GDB for source-level debugging.
 
