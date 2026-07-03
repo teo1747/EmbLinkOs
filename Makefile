@@ -13,6 +13,8 @@ STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
 ISR_ASM     = kernel/cpu/isr.asm
 KCONTEXT_ASM = kernel/cpu/kcontext.asm
+KENTRY_ASM  = kernel/cpu/kentry.asm
+KENTRY_OBJ  = kernel/cpu/kentry.o
 ISR_OBJ     = kernel/cpu/isr.o
 SYSCALL_ASM = kernel/cpu/syscall_entry.asm
 SYSCALL_OBJ = kernel/cpu/syscall_entry.o
@@ -40,6 +42,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/keyboard.c \
              kernel/drivers/pit.c \
              kernel/drivers/pci.c \
+             kernel/drivers/usb.c \
+             kernel/drivers/xhci.c \
              kernel/drivers/ata.c \
              kernel/drivers/bootanim.c \
              kernel/drivers/ahci.c \
@@ -118,8 +122,11 @@ $(SYSCALL_OBJ): $(SYSCALL_ASM)
 $(KCONTEXT_OBJ): $(KCONTEXT_ASM)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ)
+$(KENTRY_OBJ): $(KENTRY_ASM)
+	$(ASM) -f elf64 $< -o $@
+
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
@@ -264,7 +271,7 @@ run-all: $(IMG) ahci.img fat32.img
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) \
-	      $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ)\
+	      $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ)\
 	      user/init.o user/init.elf user/init.bin user/init_blob.o
 
 .PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs

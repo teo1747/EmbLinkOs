@@ -22,6 +22,7 @@
 #define PCI_BAR0         0x10
 #define PCI_INTERRUPT_LINE    0x3C
 #define PCI_INTERRUPT_PIN    0x3D
+#define PCI_CAP_PTR          0x34
 
 
 // A discouvered PCI device
@@ -61,6 +62,14 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
 
  // Write config space of a PCI device
  void pci_write32  (uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
+ void pci_write16  (uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value);
+
+ // Find + enable the device's MSI capability, delivering `vector` to `apic_id`.
+ // Returns true on success. Bypasses IOAPIC INTx routing.
+ bool pci_enable_msi(uint8_t bus, uint8_t device, uint8_t function,
+                     uint8_t vector, uint8_t apic_id);
+ bool pci_enable_msix(uint8_t bus, uint8_t device, uint8_t function,
+                      uint8_t vector, uint8_t apic_id);
 
  // Enumerate all PCI devices, fill internal table, print them
  void pci_init();

@@ -75,10 +75,13 @@ left to do.
 
 ### Heap
 - [x] kmalloc/kfree locking — spinlock with cli/sti save-restore.
-- [ ] No slab allocator — add fixed-size pools (16/32/64/…) on top of the
-  linked list for O(1) common-case alloc.
-- [ ] krealloc always copies — could expand in place if the next block is free.
-- [ ] First-fit is O(n) — consider segregated free lists or best-fit.
+- [ ] Slab allocator — fixed-size pools (16/32/64/128/256/512/1024 bytes) with O(1)
+  common-case alloc (DEFERRED: current design has metadata collision issues; needs
+  safer approach like tracking slab block ranges separately).
+- [x] krealloc in-place expansion — checks if next block is free before allocating
+  new; coalesces and returns same pointer if expansion succeeds. Reduces copies
+  and fragmentation in dynamic array growth (e.g., embkfs_free_index_reserve).
+- [ ] First-fit is O(n) — consider segregated free lists by size class (lower priority).
 - [ ] Security hardening (later): guard pages between allocations, allocation
   randomization, quarantine/delayed-free for use-after-free detection.
 
@@ -92,6 +95,12 @@ left to do.
     writer-preferring variant (pending-writer flag blocking new readers) if
     needed.
 - [ ] Per-CPU heap caches to reduce lock contention (multi-core, future).
+
+### Memory Management
+- [x] EFER.NXE enabled (in gdt_init) so PTE bit 63 (NX) is legal — required
+  before any VMM_NX mapping. Was missing; surfaced as a reserved-bit #PF
+  (error 0x0C) the first time W^X set NX on the data segment. Consider moving
+  the enable into vmm_init/CPU-feature init where it belongs logically.
 
 ---
 
@@ -280,6 +289,24 @@ left to do.
 
 ## User Mode & Syscalls
 
+### ELF Loading (COMPLETED)
+- [x] ELF64 loader (kernel/cpu/elf.c/h) loads PT_LOAD segments with correct
+  permissions (PF_X → no NX, PF_W → writable). Maps pages in user VA space
+  (0x0000400000000000–0x0000700000000000 low-half), restores real p_flags
+  after loading (NX on data, exec on code).
+- [x] Entry point (e_entry) from ELF header used instead of hardcoded
+  0x400000. init_blob is now an ELF-format binary, not flat .bin.
+- [x] Context save/restore (kernel_ctx_save / kcontext) allows kernel to
+  resume after user program exits via sys_exit.
+
+### Ring-3 Entry & Exit (COMPLETED)
+- [x] iretq path to ring 3 with user code/data selectors, user RSP, EFLAGS=0x202
+  (IF+reserved). Works with interrupt handling + IRQ re-enable on exit.
+- [x] sys_exit (syscall 2) restores saved kernel context → control returns to
+  enter_user_mode (no halt).
+- [x] Interrupts live during user execution (no CLI mask); IRQs pre-enabled
+  before entering ring 3.
+
 ### Security — user-pointer validation (HIGH, the real hole)
 - [ ] `sys_write` dereferences a raw user pointer (rsi) with NO validation. A
   ring-3 caller can pass a KERNEL address → the kernel reads/prints kernel
@@ -291,28 +318,36 @@ left to do.
     user range" to check against until then. Becomes mandatory the moment
     untrusted programs run.
 
+### Userspace loader
+- [ ] elf_load leaks mapped user pages on partial failure: if segment N maps
+  but segment N+1's frame alloc fails, segment N's pages stay mapped and
+  nothing unmaps them. Harmless in the single shared address space today;
+  becomes a real leak once per-process address spaces exist (a failed load
+  must discard the whole attempt). FIX: unwind mapped segments on error, or
+  build into a fresh address space that's simply dropped on failure.
+- [x] Loads /init.elf from the filesystem (multi-block extent read verified).
+  Embedded-blob path removed.
+
 ### Syscall transport
-- [ ] Only `int 0x80` (software gate) implemented. Fast path `syscall`/`sysret`
-  deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE, AND swapgs + a per-CPU GS
-  base for the kernel-stack switch (syscall does NOT switch stacks via the TSS).
-  Wants per-CPU/SMP infra. GDT already laid out user data-before-code for it.
-- [ ] Syscall table is minimal (write=1, exit=2). Wire the fd/VFS syscalls —
-  open/read/write/close/lseek/stat/readdir — straight through to vfs_open /
-  vfs_fd_read / … so ring 3 can do real file I/O (depends on user-pointer
-  validation above for read/write buffers).
+- [x] `int 0x80` (software gate) implemented: dispatch table (write=1, exit=2).
+- [ ] Fast path `syscall`/`sysret` deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE,
+  AND swapgs + a per-CPU GS base for the kernel-stack switch (syscall does NOT
+  switch stacks via the TSS). Wants per-CPU/SMP infra. GDT already laid out user
+  data-before-code for it.
+- [ ] Syscall table: wire the fd/VFS syscalls — open/read/write/close/lseek/stat/readdir —
+  straight through to vfs_open / vfs_fd_read / … so ring 3 can do real file I/O
+  (depends on user-pointer validation above for read/write buffers).
 - [ ] `sys_write` is serial-only and ignores fd. Route through the fd layer
   once the fd syscalls land (fd 1 = stdout, etc.).
 
 ### Ring-3 / TSS plumbing
-- [ ] Ring-3 test still HAND-COPIES a fixed byte count of a kernel function
-  into a user page; kernel-address references (string literals) aren't
-  reachable from ring 3. Being replaced by the user-program loader (in
-  progress). Remove the stub-copy hack once the loader lands.
+- [x] Ring-3 entry point: enter_user_mode() loads ELF, maps user stack,
+  saves kernel context, enters ring 3 via iretq.
 - [ ] `tss_set_rsp0` exists but RSP0 is a single static kernel stack. Once
   threads/processes exist, RSP0 must be updated on every context switch so an
   interrupt taken in user mode lands on the CURRENT thread's kernel stack.
   Deferred to the scheduler.
-  
+
 
 ## Core / Library
 

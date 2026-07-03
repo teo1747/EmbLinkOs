@@ -70,6 +70,21 @@ void ioapic_route(uint8_t gsi, uint8_t vector, uint8_t dest_apic_id, bool masked
 }
 
 
+// Route a PCI-style interrupt: level-triggered, active-low (bit15 trigger=level,
+// bit13 polarity=active-low). The device must clear its own interrupt source in
+// its handler so the level de-asserts before EOI, or it re-fires immediately.
+void ioapic_route_level(uint8_t gsi, uint8_t vector, uint8_t dest_apic_id, bool active_low){
+    uint32_t low = vector | (1u << 15);       // trigger mode = level
+    if (active_low) { low |= (1u << 13); }    // polarity = active low
+    uint32_t high = (uint32_t)dest_apic_id << 24;
+    uint32_t reg = IOAPIC_REG_REDTBL_BASE + (gsi * 2);
+    ioapic_write(reg + 1, high);
+    ioapic_write(reg, low);
+    kprintf("IO-APIC: GSI %u -> vector %u, CPU %u (level, %s)\n",
+            (unsigned int)gsi, (unsigned int)vector, (unsigned int)dest_apic_id,
+            active_low ? "active-low" : "active-high");
+}
+
 void ioapic_mask(uint8_t gsi){
    uint32_t reg = IOAPIC_REG_REDTBL_BASE + (gsi * 2);
    uint32_t low = ioapic_read(reg);
