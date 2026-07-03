@@ -349,8 +349,8 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test ring3") == 0) {
         // Drop to ring 3, run the user stub (write + exit via int 0x80), and
-        // return here when it exits. Re-runnable (leaks a couple of user pages
-        // per run until enter_user_mode frees them).
+        // return here when it exits. Re-runnable: enter_user_mode now tears
+        // down the process address space on both exit and load failure.
         enter_user_mode();
         kprintf("\n[cmd] test ring3: returned to kernel\n");
         return 1;

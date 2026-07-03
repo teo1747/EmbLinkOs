@@ -1530,7 +1530,7 @@ static int usb_msc_block_read(struct embk_block_device *dev, uint64_t lba,
         uint32_t chunk = (count > max_sec) ? max_sec : count;
         if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
         memcpy(out, bounce, chunk * bsize);
-        out += chunk * bsize; lba += chunk; count -= chunk;
+        out += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
     return rc;
@@ -1547,9 +1547,9 @@ static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
     xhci_intr_enable(m->rt, false);  // see usb_msc_block_read
     while (count > 0U) {
         uint32_t chunk = (count > max_sec) ? max_sec : count;
-        memcpy(bounce, in, chunk * bsize);
+        memcpy(bounce, in, (size_t)chunk * (size_t)bsize);
         if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
-        in += chunk * bsize; lba += chunk; count -= chunk;
+        in += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
     return rc;
