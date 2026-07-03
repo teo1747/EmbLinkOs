@@ -45,5 +45,18 @@ uint64_t vmm_get_kernel_pml4(void);
 // Size in bytes, will be rounded up to a multiple of PAGE_SIZE.
 uint64_t vmm_map_mmio(uint64_t phys, uint64_t size);
 
+// Map a virtual address to a physical address in a specific PML4 (address space)
+int vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags);
+
+// Create a new address space (PML4) and return its physical address
+uint64_t vmm_create_address_space(void);
+
+// Switch to a new address space by loading CR3 with the given PML4 physical address
+void vmm_switch_address_space(uint64_t pml4_phys);
+
+// Look up the physical address a VA maps to IN A GIVEN address space.
+// Mirrors vmm_get_phys but walks `pml4_phys` instead of the kernel PML4 — needed so elf_load can find the frame it just mapped into the process space and reach
+
+uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) ;
 
 #endif

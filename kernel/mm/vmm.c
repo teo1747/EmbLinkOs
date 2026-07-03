@@ -7,7 +7,6 @@
 static uint64_t kernel_pml4_phys = 0;     // physical address of the kernel PML4
 static int vmm_direct_map_active = 0;     // 0 during early init, 1 after the CR3 switch
 extern uint8_t kernel_end[];
-extern uint8_t BOOT_STACK_TOP_PHYS[];
 
 
 // Map a physical page-table page to a usable virtual pointer.
@@ -44,7 +43,34 @@ static uint64_t *alloc_table(void) {
     }
     return table;
 }
- 
+
+/* Create a fresh address space: a new PML4 whose USER half(slots 0-255) is empty 
+ and the KERNEL half (slots 256-511) is identity-mapped. returns the physical address of the new PML4. */
+uint64_t vmm_create_address_space(void) {
+    uint64_t pml4_phys = pmm_alloc_page();
+    if (!pml4_phys) {
+        return 0;
+    }
+
+    uint64_t *pml4 = (uint64_t *)vmm_table(pml4_phys);    // virtual pointer to the new PML4
+    uint64_t *kernel_pml4 = vmm_pml4(); // virtual pointer to the kernel's PML4
+
+    for (int i = 0; i < 512; i++) {
+        pml4[i] = 0;                    // empty user half + identity-map kernel half
+    }
+    
+    for (int i = 256; i < 512; i++) {
+        pml4[i] = kernel_pml4[i];      // copy kernel half from the current PML4
+    }
+
+    return pml4_phys;
+}
+
+
+/* Switch the active address space by loading CR3 with a new PML4 physical address */
+void vmm_switch_address_space(uint64_t pml4_phys) {
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
+}
 // Get or Create the next-level table from entry
 static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t flags) {
 
@@ -70,9 +96,16 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
 }
 
 
-// Public API
-int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
-    uint64_t *pdpt = get_or_create_table(vmm_pml4(), pml4_index(virt_addr),  flags);
+/* --- Refactor: walkers operate on a GIVEN pml4 physical address --- */
+/* The core mapper, now parameterized by the target address space's PML4.
+ `pml4_phys` is the physical address of the PML4 to map into the table;
+ vmm_table() turns a physical address into a virtual pointer regardless of 
+ which address space it belongs to (page-table pages are reachable via the
+ direct map no matter whose tree they're in). */
+ int vmm_map_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags){
+    uint64_t *pml4 = vmm_table(pml4_phys);
+
+    uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  flags);
     if (!pdpt) {
         return -1;
     }
@@ -90,9 +123,16 @@ int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
     // set the page table entry
     uint64_t page_index = pt_index(virt_addr); // 12 bits for 4K pages 
     pt[page_index] = (phys_addr & VMM_ADDR_MASK )| VMM_PRESENT | flags;
-    vmm_flush_tlb(virt_addr);// flush TLB to update mapping
+    vmm_flush_tlb(virt_addr);// flush TLB to update mapping /* harmless if the target address space isn't active */
     return 0;
+ }
+
+
+ // Public API
+int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+    return vmm_map_in(kernel_pml4_phys, virt_addr, phys_addr, flags);
 }
+
 
 void vmm_unmap(uint64_t virt_addr){
     uint64_t *pml4 = vmm_pml4();
@@ -116,31 +156,26 @@ void vmm_unmap(uint64_t virt_addr){
     vmm_flush_tlb(virt_addr); // flush TLB to update mapping
 }
 
-uint64_t vmm_get_phys(uint64_t virt_addr) {
-    uint64_t *pml4 = vmm_pml4();
-    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
-        return 0;
-    }
-    uint64_t *pdpt = (uint64_t *)vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
-
-
-    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
-        return 0;
-    }
-    uint64_t *pd = (uint64_t *)vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
-
-    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
-        return 0;
-    }
-    uint64_t *pt = (uint64_t *)vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
-
-    if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) {
-        return 0;
-    }
-
+/* Look up the physical address a VA maps to IN A GIVEN address space.
+   Mirrors vmm_get_phys but walks `pml4_phys` instead of the kernel PML4 —
+   needed so elf_load can find the frame it just mapped into the process
+   space and reach it via the direct map. */
+uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) return 0;
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) return 0;
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) return 0;
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) return 0;
     return (pt[pt_index(virt_addr)] & VMM_ADDR_MASK) | (virt_addr & 0xfff);
 }
 
+/* Existing public one becomes the kernel-space wrapper. */
+uint64_t vmm_get_phys(uint64_t virt_addr) {
+    return vmm_get_phys_in(kernel_pml4_phys, virt_addr);
+}
 
 
 void vmm_flush_tlb(uint64_t virt_addr) {
@@ -156,6 +191,11 @@ uint64_t vmm_get_kernel_pml4(void) {
 void vmm_init(void) {
     serial_write_string("\n=== VMM init ===\n");
 
+    /* enable NX: EFER.NXE (bit 11) — required before any PTE sets bit 63 */
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+    lo |= (1 << 11);                        /* NXE */
+    __asm__ volatile("wrmsr" : : "c"(0xC0000080), "a"(lo), "d"(hi));
 
     // step 1:Allocate a new page for the kernel PML4
     // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it
@@ -220,15 +260,16 @@ void vmm_init(void) {
     serial_write_string("Mapping complete\n");
 
     // step 3: build the kernel mapping at KERNEL_VIRTUAL_BASE
-    // Map [0 .. round_up(KV2P(kernel_end), 4K)) so the kernel can grow past 2 MB
-    // without faulting after CR3 switch. Keep a floor tied to boot stack top
-    // exported by the linker (stage2 currently sets rsp to higher-half + this
-    // physical value; stack grows down, so pages below this boundary are needed).
-    uint64_t kernel_end_phys = KV2P(kernel_end);
-    uint64_t boot_stack_floor = (uint64_t)BOOT_STACK_TOP_PHYS;
-    uint64_t kernel_map_end = (kernel_end_phys + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
-    if (kernel_map_end < boot_stack_floor)
-        kernel_map_end = boot_stack_floor;
+    // Map [0 .. kernel image + PMM bitmap) so the kernel can grow past 2 MB
+    // without faulting after the CR3 switch. The boot stack now lives in the
+    // kernel's own .bss (see kernel/cpu/kentry.asm), so it is below kernel_end
+    // and covered automatically. The PMM bitmap sits *at* kernel_end and is
+    // written before this remap, so extend the mapping to pmm_reserved_phys_end()
+    // — otherwise the first bitmap access after the CR3 switch page-faults.
+    uint64_t kernel_end_phys = (KV2P(kernel_end) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
+    uint64_t kernel_map_end = pmm_reserved_phys_end();
+    if (kernel_map_end < kernel_end_phys)
+        kernel_map_end = kernel_end_phys;
 
     serial_write_string("Mapping Kernel at 0xFFFFFFFF80000000 up to phys: ");
     serial_write_hex(kernel_map_end);
