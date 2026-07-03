@@ -78,7 +78,8 @@ static void user_stub(void)
  * because by the time elf_load returns it has already COPIED every byte it
  * needs into user pages (the p_filesz copy loop runs synchronously inside
  * it) — nothing downstream reads from this buffer again. */
-static int elf_load_from_file(const char *path, uint64_t *entry_out)
+static int elf_load_from_file(const char *path, uint64_t pml4_phys,
+                              uint64_t *entry_out)
 {
     int fd = vfs_open(path, O_RDONLY, 0);
     if (fd < 0) {
@@ -96,10 +97,6 @@ static int elf_load_from_file(const char *path, uint64_t *entry_out)
     uint8_t *buf = kmalloc(st.size);
     if (!buf) { vfs_close(fd); return -EMBK_ENOMEM; }
 
-    /* Robust read loop: ONE vfs_fd_read call is not guaranteed to return the
-     * whole file. Keep reading until we have st.size bytes, or hit EOF short
-     * of that (truncated/corrupt — do not hand a partial image to the ELF
-     * parser), or a hard error. */
     uint64_t total = 0;
     while (total < st.size) {
         size_t got = 0;
@@ -108,32 +105,50 @@ static int elf_load_from_file(const char *path, uint64_t *entry_out)
         if (got == 0)      { kfree(buf); vfs_close(fd); return -EMBK_EIO; }
         total += got;
     }
-    vfs_close(fd);   /* done with the fd; only the buffer matters now */
+    vfs_close(fd);
 
-    rc = elf_load(buf, total, entry_out);
+    /* Hand the in-memory image to the parser, targeting the PROCESS address
+     * space — elf_load maps each segment into pml4_phys, not the kernel PML4. */
+    rc = elf_load(buf, total, pml4_phys, entry_out);
     kfree(buf);
     return rc;
 }
 
-
 void enter_user_mode(void)
 {
-    uint64_t entry = 0;
-    int rc = elf_load_from_file(INIT_PROGRAM_PATH, &entry);
-    if (rc != EMBK_OK) {
-        serial_write_string("Failed to load init program: ");
-        serial_write_hex((uint64_t)(-rc));
-        serial_write_string("\n");
+    /* 1. Create the process address space (kernel half aliased, user half empty). */
+    uint64_t proc_pml4 = vmm_create_address_space();
+    if (!proc_pml4) {
+        serial_write_string("enter_user_mode: no memory for address space\n");
         return;
     }
 
-    /* everything below is UNCHANGED: user stack, kernel_ctx_save, iretq */
+    /* 2. Load the ELF INTO that address space. elf_load must map via
+     *    vmm_map_in(proc_pml4, ...) now, not the kernel PML4 — so it needs the
+     *    target pml4 passed in. (See note below.) */
+    uint64_t entry = 0;
+    int rc = elf_load_from_file(INIT_PROGRAM_PATH, proc_pml4, &entry);
+    if (rc != EMBK_OK) {
+        serial_write_string("enter_user_mode: ELF load failed: ");
+        serial_write_hex((uint64_t)(-rc));
+        serial_write_string("\n");
+        /* NOTE: proc_pml4 and any pages it mapped leak here — the partial-load
+         * cleanup gap already on the TODO. Fine for now, one address space. */
+        return;
+    }
+
+    /* 3. Map the user stack into the SAME process address space. */
     uint64_t stack_phys = pmm_alloc_page();
-    vmm_map(USER_STACK_VA, stack_phys, VMM_USER | VMM_WRITABLE | VMM_NX);
+    if (!stack_phys) { serial_write_string("no stack frame\n"); return; }
+    vmm_map_in(proc_pml4, USER_STACK_VA, stack_phys,
+               VMM_USER | VMM_WRITABLE | VMM_NX);
     uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;
 
+    /* Save the kernel return context (unchanged — this stack is higher-half,
+     * survives the CR3 switch). */
     if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
         serial_write_string("Returned to kernel: user program exited.\n");
+        vmm_switch_address_space(vmm_get_kernel_pml4());
         return;
     }
 
@@ -141,6 +156,12 @@ void enter_user_mode(void)
     serial_write_hex(entry);
     serial_write_string("\n");
 
+    /* 4. Switch CR3 to the process address space — LATE, right before iretq. */
+    vmm_switch_address_space(proc_pml4);
+
+    /* 5. iretq into ring 3. RIP (entry) and RSP (user_rsp) are process-private
+     *    lower-half addresses that exist only in proc_pml4 — which is why the
+     *    switch had to happen first. */
     __asm__ volatile (
         "pushq %0\n" "pushq %1\n" "pushq $0x202\n" "pushq %2\n" "pushq %3\n"
         "iretq\n"
