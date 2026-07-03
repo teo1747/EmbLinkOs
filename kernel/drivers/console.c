@@ -14,6 +14,7 @@ static uint32_t rows = 0;   // total number of rows
 // Current color
 static uint8_t fg_r = 255, fg_g = 255, fg_b = 255;  // white
 static uint8_t bg_r = 0, bg_g = 0, bg_b = 0;        // black
+static bool g_console_ready = false;
 
 // Cached Framebuffer info pointer
 static const fb_info_t *fb_info = 0;
@@ -30,6 +31,12 @@ void console_init(void) {
     cursor_row = 0;
 
     fb_clear(bg_r, bg_g, bg_b);
+    g_console_ready = true;
+}
+
+bool console_is_ready(void)
+{
+    return g_console_ready;
 }
 
 void console_set_color(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2) {

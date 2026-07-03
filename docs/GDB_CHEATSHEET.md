@@ -1,4 +1,4 @@
-# GDB Cheat Sheet for Helios Kernel Debugging
+# GDB Cheat Sheet for EmbLinkOs Kernel Debugging
 
 ## Getting Started
 
@@ -108,7 +108,7 @@ The `.gdbinit` file auto-connects to QEMU and stops at `kernel_main`.
 
 ---
 
-## Helios-Specific Debugging
+## EmbLinkOs-Specific Debugging
 
 ### Check the E820 Memory Map
 ```gdb

@@ -2,6 +2,7 @@
 #include "../include/io.h"
 #include "../include/kprintf.h"
 #include "../drivers/serial.h"
+#include "../mm/vmm.h"   // vmm_map_mmio for the MSI-X table (lives in a BAR)
 #include <stdint.h>
 
 
@@ -45,6 +46,88 @@ void pci_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, 
     uint32_t address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     outl(PCI_CONFIG_DATA, value);
+}
+
+// 16-bit config write via read-modify-write of the containing dword.
+void pci_write16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value){
+    uint32_t dword = pci_read32(bus, device, function, offset & 0xFC);
+    uint32_t shift = (offset & 2) * 8;
+    dword = (dword & ~(0xFFFFu << shift)) | ((uint32_t)value << shift);
+    pci_write32(bus, device, function, offset & 0xFC, dword);
+}
+
+// Find the device's MSI capability and program it to deliver `vector` to the
+// LAPIC of `apic_id` (edge-triggered, fixed delivery). Returns true if MSI was
+// found and enabled. MSI bypasses IOAPIC routing, so it sidesteps the PIC-vs-
+// APIC PCI-INTx GSI-mapping problem entirely.
+bool pci_enable_msi(uint8_t bus, uint8_t device, uint8_t function,
+                    uint8_t vector, uint8_t apic_id) {
+    uint16_t status = pci_read16(bus, device, function, PCI_STATUS);
+    if (!(status & (1u << 4))) { return false; } // no capabilities list
+
+    uint8_t cap = pci_read8(bus, device, function, PCI_CAP_PTR) & 0xFC;
+    for (int guard = 0; cap && guard < 48; guard++) {
+        uint8_t id   = pci_read8(bus, device, function, cap + 0);
+        uint8_t next = pci_read8(bus, device, function, cap + 1) & 0xFC;
+        if (id == 0x05) { // MSI capability
+            uint16_t ctrl = pci_read16(bus, device, function, cap + 2);
+            bool is64 = (ctrl & (1u << 7)) != 0;
+            uint32_t msg_addr = 0xFEE00000u | ((uint32_t)apic_id << 12); // LAPIC MSI addr
+            pci_write32(bus, device, function, cap + 4, msg_addr);
+            if (is64) {
+                pci_write32(bus, device, function, cap + 8, 0);           // upper addr
+                pci_write16(bus, device, function, cap + 12, vector);     // message data
+            } else {
+                pci_write16(bus, device, function, cap + 8, vector);      // message data
+            }
+            ctrl &= ~(0x7u << 4); // Multiple Message Enable = 0 -> a single vector
+            ctrl |= 1u;           // MSI Enable
+            pci_write16(bus, device, function, cap + 2, ctrl);
+            return true;
+        }
+        cap = next;
+    }
+    return false;
+}
+
+// Find + enable the device's MSI-X capability, programming table entry 0 to
+// deliver `vector` to `apic_id`. The MSI-X table lives in one of the device's
+// BARs; we map it and write the entry. Returns true on success.
+bool pci_enable_msix(uint8_t bus, uint8_t device, uint8_t function,
+                     uint8_t vector, uint8_t apic_id) {
+    uint16_t status = pci_read16(bus, device, function, PCI_STATUS);
+    if (!(status & (1u << 4))) { return false; }
+
+    uint8_t cap = pci_read8(bus, device, function, PCI_CAP_PTR) & 0xFC;
+    for (int guard = 0; cap && guard < 48; guard++) {
+        uint8_t id   = pci_read8(bus, device, function, cap + 0);
+        uint8_t next = pci_read8(bus, device, function, cap + 1) & 0xFC;
+        if (id == 0x11) { // MSI-X capability
+            uint16_t ctrl = pci_read16(bus, device, function, cap + 2);
+            uint32_t tbl  = pci_read32(bus, device, function, cap + 4);
+            uint8_t  bir  = (uint8_t)(tbl & 0x7u);          // which BAR holds the table
+            uint32_t off  = tbl & ~0x7u;                    // byte offset within it
+
+            struct pci_bar bar = pci_read_bar(bus, device, function, bir);
+            if (!bar.valid || !bar.is_mmio) { return false; }
+
+            // Map the table (entry 0 is 16 bytes at bar.address + off).
+            uint64_t virt = vmm_map_mmio(bar.address + off, 16);
+            if (!virt) { return false; }
+            volatile uint32_t *e0 = (volatile uint32_t *)(uintptr_t)virt;
+            e0[0] = 0xFEE00000u | ((uint32_t)apic_id << 12); // Message Address low
+            e0[1] = 0;                                       // Message Address high
+            e0[2] = vector;                                  // Message Data
+            e0[3] = 0;                                       // Vector Control: unmasked
+
+            ctrl |= (1u << 15);   // MSI-X Enable
+            ctrl &= ~(1u << 14);  // clear function mask
+            pci_write16(bus, device, function, cap + 2, ctrl);
+            return true;
+        }
+        cap = next;
+    }
+    return false;
 }
 
 

@@ -1,4 +1,4 @@
-ENTRY(kernel_main)
+ENTRY(_start)
 
 
 KERNEL_VIRTUAL_BASE = 0XFFFFFFFF80000000;

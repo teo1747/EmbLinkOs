@@ -1,7 +1,17 @@
 [BITS 16]
 [ORG 0x7E00]
 
+%ifndef KERNEL_LOAD_SECTORS
 %define KERNEL_LOAD_SECTORS 1024
+%endif
+%define KERNEL_VIRTUAL_BASE 0xFFFFFFFF80000000
+; Transient stack for stage2 ITSELF (used while parsing/copying the kernel ELF).
+; Placed in low conventional memory below the kernel load address (0x100000) so it
+; can never collide with the kernel image no matter how large the kernel grows.
+; Once we jump to the kernel, kentry.asm immediately switches to the kernel-owned
+; stack in .bss, so this address stops mattering.
+%define BOOT_STACK_TOP_PHYS 0x80000
+%define BOOT_STACK_TOP_VIRT (KERNEL_VIRTUAL_BASE + BOOT_STACK_TOP_PHYS)
 
 start:
     
@@ -441,8 +451,8 @@ long_mode_start:
     mov gs, ax              
     mov ss, ax  
 
-    ; Use higher half vitual address space for stack
-    mov rsp, 0xFFFFFFFF80200000         ; Set stack pointer to 0x200000  
+    ; Use higher-half virtual address space for stack.
+    mov rsp, BOOT_STACK_TOP_VIRT
 
     mov rsi, msg_longmode     
     call print_string_64
@@ -548,11 +558,11 @@ print_string_64:
     ret
 
 
-msg_stage2    db 'Helios Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
+msg_stage2    db 'EmbLinkOs Stage 2 loading...', 0x0D, 0x0A, 0 ; Message to display (null-terminated)
 
-msg_protected db 'Welcome to Helios Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
+msg_protected db 'Welcome to EmbLinkOs Protected Mode!', 0 ; Message to display in protected mode (null-terminated)
 
-msg_longmode  db 'Welcome to Helios Long Mode!', 0 ; Message to display in long mode (null-terminated)
+msg_longmode  db 'Welcome to EmbLinkOs Long Mode!', 0 ; Message to display in long mode (null-terminated)
 
 msg_error_S2   db 'Kernel loading failed!', 0x0D, 0x0A, 0 ; Error message for stage 2 (null-terminated)
 

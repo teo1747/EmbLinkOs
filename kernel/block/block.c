@@ -13,6 +13,11 @@
 static struct embk_block_device *devices[BLOCK_MAX_DEVICES];
 static uint32_t device_count = 0;
 
+// Whole-disk letter counter. Only auto-named disks consume a letter (sda, sdb,
+// ...). Partitions name themselves (sda1, sda2, ...) and must NOT advance this,
+// or the next disk would skip a letter.
+static uint32_t disk_letters = 0;
+
 
 // One shared bounce buffer in kernel BSS (low physical, KV2P-able, < 4GB).
 // Sized to the max single transfer the adapters issue (64 sectors = 32KB).
@@ -44,11 +49,15 @@ int embk_block_register(struct embk_block_device *dev) {
         return -EMBK_EINVAL; // Invalid device or missing read function
     }
     
-    // Assign the next name : sda, sdb, sdc ...
-    dev->name[0] =  's';
-    dev->name[1] =  'd';
-    dev->name[2] = (char)('a' + device_count);
-    dev->name[3] = '\0'; // Null-terminate the string
+    // Auto-name whole disks sda, sdb, sdc ... A caller that has already filled
+    // in dev->name (e.g. the partition layer registering "sda1") keeps its name.
+    if (dev->name[0] == '\0') {
+        dev->name[0] =  's';
+        dev->name[1] =  'd';
+        dev->name[2] = (char)('a' + disk_letters);
+        dev->name[3] = '\0'; // Null-terminate the string
+        disk_letters++;
+    }
 
     devices[device_count++] = dev;
 

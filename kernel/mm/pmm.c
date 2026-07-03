@@ -164,15 +164,9 @@ void pmm_init(void) {
     }
 
 
-    // reserve stack region
-    for (uint64_t p = 0x1f0; p<=0x200; p++){
-        if (!bitmap_test(p)) {
-            bitmap_set(p); // Mark the page as reserved 
-            free_pages--;
-            used_pages++;
-        }
-
-    }
+    // The boot stack now lives in the kernel's own .bss (see kernel/cpu/kentry.asm),
+    // so it sits below kernel_end and is already covered by the kernel+bitmap
+    // reservation above — no separate boot-stack reservation is needed.
 
     pmm_print_stats();
 
@@ -180,8 +174,17 @@ void pmm_init(void) {
 
 
 // Allocate a single page of physical memory 
+// Physical end (exclusive, page-aligned) of the region PMM keeps for the kernel
+// image plus its own bitmap. The bitmap lives at kernel_end and is written before
+// paging is rebuilt, so vmm_init must map at least this far in the kernel window
+// or the first bitmap access after the CR3 switch faults.
+uint64_t pmm_reserved_phys_end(void) {
+    uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size;
+    return (bitmap_phys_end + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+}
+
 uint64_t pmm_alloc_page(void) {
-    
+
     for (uint64_t page_index = 0; page_index < total_pages; page_index++) {
         if (!bitmap_test(page_index)) { // If the page is free
             bitmap_set(page_index); // Mark it as used

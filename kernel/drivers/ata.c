@@ -7,6 +7,8 @@
 #include "../cpu/irq.h"
 #include "../cpu/ioapic.h"
 #include "../include/errno.h"
+#include "../include/kstring.h"
+#include "../mm/vmm.h"
 
 
 #include <stdint.h>
@@ -40,16 +42,23 @@ struct prd{
     uint16_t flags;       // Flags: bit 15 = end of table
 } __attribute__((packed));
 
-#define PRD_EOT 0x8000;
+#define PRD_EOT 0x8000
+#define ATA_DMA_PRD_MAX 8
+#define ATA_DMA_BOUNCE_MAX_SECTORS 255u
+#define ATA_DMA_BOUNCE_MAX_BYTES (ATA_DMA_BOUNCE_MAX_SECTORS * ATA_SECTOR_SIZE)
 
 
 //Block device structs for each detected ATA drive. The block layer will use these to read/write sectors from/to
 static struct embk_block_device ata_block_devices[ATA_MAX_DRIVES];
 
 
-// A single PRD, 4-bytes aligned. won't cross 4K boundary, (it's 8 bytes in BSS)
-// Static so it has a fixed physical address we can compute with KV2P.
-static struct prd dma_prdt[1] __attribute__((aligned(4)));
+// PRDT in BSS so it has a fixed physical address we can compute with KV2P.
+// Multiple entries let us span >64KB and avoid crossing 64KB boundaries.
+static struct prd dma_prdt[ATA_DMA_PRD_MAX] __attribute__((aligned(4)));
+
+// Fallback for non-contiguous virtual buffers.
+// Single shared buffer is fine while ATA path is synchronous.
+static uint8_t ata_dma_bounce[ATA_DMA_BOUNCE_MAX_BYTES] __attribute__((aligned(4096)));
 
 // Bus master I/O base (BAR4 of the IDE controller)
 static uint16_t bmide_base;
@@ -82,6 +91,78 @@ static int ata_wait_irq(void){
     ata_irq_fired = false;
     return 0;
 }
+
+static uint32_t min_u32(uint32_t a, uint32_t b) {
+    return (a < b) ? a : b;
+}
+
+// Verify [buffer, buffer+bytes) maps to one contiguous physical range.
+// Returns first physical byte via out_phys on success.
+static int ata_dma_get_contig_phys(const void *buffer, uint32_t bytes, uint64_t *out_phys) {
+    if (!buffer || !out_phys || bytes == 0) return -1;
+
+    uint64_t v = (uint64_t)(uintptr_t)buffer;
+    uint64_t p0 = vmm_get_phys(v);
+    if (p0 == 0) return -1;
+
+    uint64_t expected = p0;
+    uint32_t done = 0;
+    while (done < bytes) {
+        uint64_t p = vmm_get_phys(v + done);
+        if (p == 0 || p != expected) return -1;
+
+        uint32_t off = (uint32_t)(p & 0xFFFu);
+        uint32_t step = 0x1000u - off;
+        if (step > (bytes - done)) step = bytes - done;
+
+        done += step;
+        expected += step;
+    }
+
+    *out_phys = p0;
+    return 0;
+}
+
+// Build a PRDT for a physically contiguous DMA buffer.
+// Splits at 64KB boundaries because a PRD entry must not cross one.
+static int ata_build_prdt(uint64_t buf_phys, uint32_t total_bytes) {
+    if ((buf_phys >> 32) != 0) {
+        kprintf("ATA DMA: buffer above 4GB, unsupported\n");
+        return -1;
+    }
+
+    if (total_bytes == 0) {
+        return -1;
+    }
+
+    uint32_t remaining = total_bytes;
+    uint64_t cur_phys = buf_phys;
+    int prd_count = 0;
+
+    while (remaining > 0) {
+        if (prd_count >= ATA_DMA_PRD_MAX) {
+            kprintf("ATA DMA: PRDT overflow (%u bytes needs >%u entries)\n",
+                    (unsigned int)total_bytes, (unsigned int)ATA_DMA_PRD_MAX);
+            return -1;
+        }
+
+        uint32_t off_64k = (uint32_t)(cur_phys & 0xFFFFu);
+        uint32_t until_64k_boundary = (off_64k == 0) ? 0x10000u : (0x10000u - off_64k);
+        uint32_t chunk = min_u32(remaining, until_64k_boundary);
+
+        dma_prdt[prd_count].phys_addr = (uint32_t)cur_phys;
+        dma_prdt[prd_count].byte_count = (chunk == 0x10000u) ? 0 : (uint16_t)chunk;
+        dma_prdt[prd_count].flags = 0;
+
+        cur_phys += chunk;
+        remaining -= chunk;
+        prd_count++;
+    }
+
+    dma_prdt[prd_count - 1].flags = PRD_EOT;
+    return prd_count;
+}
+
 
 
 // 400ns delY: READ ALTERNATE STATUS 4 TIMESS (~100ns each)
@@ -292,26 +373,32 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
 
     const struct ata_drive *d = &drives[drive_index]; // Get drive pointer
 
-    // Transfer size in bytes. Single PRD must not cross 64KB boundary, so we limit to 64KB (128 sectors) per transfer. For simplicity, we also require the buffer to be physically contiguous and not cross 4K boundary.
+    // Transfer size in bytes. Multi-PRD allows >64KB, but the buffer still
+    // must be physically contiguous (KV2P linear range).
     uint32_t byte_count = (uint32_t)count * ATA_SECTOR_SIZE;
-    if (byte_count > 64 * 1024) {
-        kprintf("ATA: DMA transfer too large (max 128 sectors)\n");
-        return -1;
+
+    uint64_t buf_phys = 0;
+    void *dma_buf = buffer;
+    bool used_bounce = false;
+
+    // Fast path: DMA directly into caller buffer when physically contiguous.
+    if (ata_dma_get_contig_phys(buffer, byte_count, &buf_phys) < 0) {
+        if (byte_count > ATA_DMA_BOUNCE_MAX_BYTES) {
+            kprintf("ATA DMA read: bounce buffer too small for %u bytes\n", (unsigned int)byte_count);
+            return -1;
+        }
+        dma_buf = ata_dma_bounce;
+        used_bounce = true;
+        if (ata_dma_get_contig_phys(dma_buf, byte_count, &buf_phys) < 0) {
+            kprintf("ATA DMA read: bounce buffer not physically contiguous\n");
+            return -1;
+        }
     }
 
-    // Physical address of the destination buffer.
-    // NOTE: buffer must be a kernel static/stack address (KV2P applies)
-    // and physically contiguous, not crossing a 64KB boundary.
-    uint64_t buf_phys = KV2P(buffer);
-    if ((buf_phys >> 32) != 0) {
-        kprintf("ATA DMA: buffer above 4GB, unsupported\n");
+    // 1. Build PRDT (split at 64KB boundaries as needed).
+    if (ata_build_prdt(buf_phys, byte_count) < 0) {
         return -1;
     }
-
-    // 1. Built the PRDT (single entry since we limit to 64KB)
-    dma_prdt[0].phys_addr = (uint32_t)buf_phys;
-    dma_prdt[0].byte_count = (uint16_t)byte_count;  // 0 would mean 64KB; bytes<=64kb ok
-    dma_prdt[0].flags = PRD_EOT; // End of table
 
     uint64_t prdt_phys = KV2P(dma_prdt); // Physical address of the PRDT
 
@@ -355,7 +442,11 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
         return -1;
     }
 
-    // Data is now in the buffer, placed there by the controller via DMA. We can return success.
+    if (used_bounce) {
+        memcpy(buffer, dma_buf, byte_count);
+    }
+
+    // Data is now in the destination buffer.
     return 0;
 }
 
@@ -368,21 +459,30 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     const struct ata_drive *d = &drives[drive_index];
 
     uint32_t bytes = (uint32_t)count * ATA_SECTOR_SIZE;
-    if (bytes > 64 * 1024) {
-        kprintf("ATA DMA: write too large for single PRD\n");
-        return -1;
+
+    uint64_t buf_phys = 0;
+    const void *dma_buf = buffer;
+    bool used_bounce = false;
+
+    // Fast path: DMA directly from caller buffer when physically contiguous.
+    if (ata_dma_get_contig_phys(buffer, bytes, &buf_phys) < 0) {
+        if (bytes > ATA_DMA_BOUNCE_MAX_BYTES) {
+            kprintf("ATA DMA write: bounce buffer too small for %u bytes\n", (unsigned int)bytes);
+            return -1;
+        }
+        memcpy(ata_dma_bounce, buffer, bytes);
+        dma_buf = ata_dma_bounce;
+        used_bounce = true;
+        if (ata_dma_get_contig_phys(dma_buf, bytes, &buf_phys) < 0) {
+            kprintf("ATA DMA write: bounce buffer not physically contiguous\n");
+            return -1;
+        }
     }
 
-    uint64_t buf_phys = KV2P(buffer);
-    if ((buf_phys >> 32) != 0) {
-        kprintf("ATA DMA: buffer above 4GB, unsupported\n");
+    // 1. Build PRDT (split at 64KB boundaries as needed).
+    if (ata_build_prdt(buf_phys, bytes) < 0) {
         return -1;
     }
-
-    // 1. Build PRDT (single entry pointing at the source buffer)
-    dma_prdt[0].phys_addr  = (uint32_t)buf_phys;
-    dma_prdt[0].byte_count = (uint16_t)bytes;
-    dma_prdt[0].flags      = PRD_EOT;
 
     uint64_t prdt_phys = KV2P(dma_prdt);
 
@@ -433,6 +533,7 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
         ata_wait_not_busy(d->io_base);   // fallback if no flush IRQ
     }
 
+    (void)used_bounce;
     return 0;
 }
 
@@ -472,10 +573,10 @@ static int ata_block_read(struct embk_block_device *dev, uint64_t lba, uint32_t 
     if (!dev || !buffer) return -EMBK_EINVAL;
     uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data; // driver_data holds the ATA drive index
     
-    // ata_read_dma takes uint8_t count, chuck if needed (count <= 128 for one PRD)
+    // ata_read_dma takes uint8_t count; chunk if needed.
     uint8_t *ptr = (uint8_t *)buffer;
     while (count > 0) {
-        uint8_t chunk = (count > 64) ? 64 : (uint8_t)count; // 64 sectors = 32KB, safe for one PRD
+        uint8_t chunk = (count > 255) ? 255 : (uint8_t)count;
         if (ata_read_dma(drive_index, lba, chunk, ptr) != 0) {
             return -EMBK_EIO; // I/O error
         }
@@ -493,7 +594,7 @@ static int ata_block_write(struct embk_block_device *dev, uint64_t lba, uint32_t
 
     const uint8_t *ptr = (const uint8_t *)buffer;
     while (count > 0) {
-        uint8_t chunk = (count > 64) ? 64 : (uint8_t)count; // 64 sectors = 32KB, safe for one PRD
+        uint8_t chunk = (count > 255) ? 255 : (uint8_t)count;
         if (ata_write_dma(drive_index, lba, chunk, ptr) != 0) {
             return -EMBK_EIO; // I/O error
         }

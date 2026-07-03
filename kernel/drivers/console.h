@@ -1,6 +1,7 @@
 #ifndef _CONSOLE_H_
 #define _CONSOLE_H_
 
+#include "../include/types.h"
 #include <stdint.h>
 
 
@@ -23,6 +24,9 @@ void console_set_color(uint8_t fg_r, uint8_t fg_g, uint8_t fg_b,
 
 // Clear the console screen and reset cursor position to (0, 0)
 void console_clear(void);
+
+// True once console_init completed and framebuffer-backed writes are safe.
+bool console_is_ready(void);
 
 
 

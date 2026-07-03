@@ -9,10 +9,10 @@ left to do.
 ## Bootloader
 
 ### Stage 1
-- [ ] Hardcoded Stage 2 sector count (8 sectors) — should be dynamic.
+- [x] Hardcoded Stage 2 sector count (8 sectors) — should be dynamic.
 
 ### Stage 2
-- [ ] Loads a fixed 512 sectors for the kernel regardless of actual size.
+- [x] Loads a fixed 512 sectors for the kernel regardless of actual size.
   - LESSON (learned the hard way): when the kernel outgrew the old 90-sector
     limit, the tail wasn't loaded. Symptoms were truncated MMIO addresses and
     garbled E820 — looked like a pointer bug, was actually missing code/data
@@ -64,7 +64,7 @@ left to do.
     * Then switch VMM table access from KP2V to P2V.
 
 ### vmm_map_mmio
-- [x] Uses VMM_NOCACHE (PCD) — correct for register MMIO.
+
 - [ ] Add vmm_map_mmio_wc() for write-combining (framebuffer, large buffers).
   Requires PAT setup in IA32_PAT (MSR 0x277); then PWT + PAT bits in the PTE
   select the WC slot. See Intel SDM Vol 3, §11.12.
@@ -75,17 +75,32 @@ left to do.
 
 ### Heap
 - [x] kmalloc/kfree locking — spinlock with cli/sti save-restore.
-- [ ] No slab allocator — add fixed-size pools (16/32/64/…) on top of the
-  linked list for O(1) common-case alloc.
-- [ ] krealloc always copies — could expand in place if the next block is free.
-- [ ] First-fit is O(n) — consider segregated free lists or best-fit.
+- [ ] Slab allocator — fixed-size pools (16/32/64/128/256/512/1024 bytes) with O(1)
+  common-case alloc (DEFERRED: current design has metadata collision issues; needs
+  safer approach like tracking slab block ranges separately).
+- [x] krealloc in-place expansion — checks if next block is free before allocating
+  new; coalesces and returns same pointer if expansion succeeds. Reduces copies
+  and fragmentation in dynamic array growth (e.g., embkfs_free_index_reserve).
+- [ ] First-fit is O(n) — consider segregated free lists by size class (lower priority).
 - [ ] Security hardening (later): guard pages between allocations, allocation
   randomization, quarantine/delayed-free for use-after-free detection.
 
 ### Synchronization
 - [ ] Spinlock has no deadlock detection / lock-ordering checks.
-- [ ] No reader-writer locks (all mutual exclusion is exclusive).
+- [x] Reader-writer locks — rwlock_t in kernel/cpu/rwlock.c (many readers OR one
+  writer, single atomic state word; irqsave/irqrestore since multiple readers
+  can't share one saved-flags slot). Smoke test: `test rwlock`. Not yet wired
+  into any data structure (read-mostly candidates arrive with SMP).
+  - [ ] Reader-preferring — a steady reader stream can starve a writer. Add a
+    writer-preferring variant (pending-writer flag blocking new readers) if
+    needed.
 - [ ] Per-CPU heap caches to reduce lock contention (multi-core, future).
+
+### Memory Management
+- [x] EFER.NXE enabled (in gdt_init) so PTE bit 63 (NX) is legal — required
+  before any VMM_NX mapping. Was missing; surfaced as a reserved-bit #PF
+  (error 0x0C) the first time W^X set NX on the data segment. Consider moving
+  the enable into vmm_init/CPU-feature init where it belongs logically.
 
 ---
 
@@ -110,7 +125,7 @@ left to do.
   per Intel SDM Vol 3A §4.7.
 
 ### Timer / Time
-- [ ] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
+- [x] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
   both discovered via ACPI.
 - [ ] Tick handler only does counter++ — eventually: preemption check +
   scheduler invocation (once there are processes).
@@ -120,14 +135,17 @@ left to do.
 ## Storage
 
 ### ATA / DMA
-- [ ] PRD_EOT has a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
+- [x] PRD_EOT had a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
   ata.c. Works in the current single-assignment use but will break inside a
   larger expression — remove the semicolon.
 - [ ] Multi-PRD scatter-gather for buffers > 64KB or spanning pages (current
   limit: single contiguous region ≤ 64KB / ≤ 128 sectors).
 - [ ] LBA48 DMA (READ DMA EXT 0x25) for > 128 sectors / disks > 128GB on the
   IDE/DMA path. (AHCI path already does LBA48.)
-- [ ] DMA buffer must be kernel BSS/contiguous (KV2P). For arbitrary virtual
+- [x] DMA buffer no longer has to be contiguous in callers: ATA DMA now uses
+  direct multi-PRD for physically contiguous mappings and a bounce-buffer
+  fallback for arbitrary virtual buffers.
+  For arbitrary virtual
   buffers: walk pages + multi-PRD, or bounce-buffer.
 - [ ] Secondary channel DMA (offset 0x08 in BMIDE) not handled.
 - [ ] No cache-coherency handling (fine on QEMU/x86; matters on some HW).
@@ -140,10 +158,15 @@ left to do.
   ports if multiple SATA disks appear.
 
 ### Block layer
-- [ ] `%llu` used in out-of-range error messages — verify kprintf handles it
-  (the path wasn't exercised yet); else cast to uint64_t / unsigned int.
-- [ ] No partition support — devices are whole disks (sda, sdb…). Partition
-  naming convention (sdaN) needed once we parse partition tables / MBR/GPT.
+- [x] Partition support — MBR (DOS) table parsed; each primary partition is
+  exposed as a child block device (sda1, sda2…) that delegates to its parent
+  disk at the partition's start LBA, bounded by its length. Mount probe sees
+  partitions alongside whole disks. See kernel/block/partition.c.
+  - [ ] GPT not parsed yet — a protective-MBR (type 0xEE) disk is detected and
+    skipped with a notice.
+  - [ ] Extended/logical partitions (type 0x05/0x0F) detected but not walked.
+  - [ ] Scan must run after `sti` (ATA read path is IRQ-driven). Placed in
+    main.c right before block enumeration / mount probe for that reason.
 - [ ] Block-layer reads/writes on IDE secondary channel hang — DMA + IRQ
   are only wired for the primary channel (IRQ 14, primary BMIDE base).
   Secondary needs IRQ 15 + BMIDE offset 0x08 + per-channel state. Until
@@ -153,7 +176,6 @@ left to do.
   once transfers can be concurrent (IRQ-driven / multi-threaded). Fine while
   synchronous. Also: bounce always copies; multi-PRD scatter-gather (page-walk
   via vmm_get_phys) would be the zero-copy alternative (already on TODO).
-
 
 ---
 
@@ -202,7 +224,130 @@ left to do.
   Configure via port 0x64: disable mouse port, set scancode set, enable IRQs.
 - [ ] Migrate to USB HID once there's a USB stack.
 
+
 ---
+
+## Filesystem
+
+### EMBKFS
+- [ ] Crash while a file is unlinked-but-open LEAKS its inode. Deferred-free
+  keeps the object alive (links==0, no dirent) until last close, but the
+  open-ref table is in-memory/per-boot — a crash in that window loses the
+  reclaim. Non-corrupting (no fd survives reboot to dangle), just lost space.
+  - FIX: mount-time sweep — scan for inodes with links==0 and free them
+    (orphan reclaim). Cheap, runs once at mount.
+  - STRONGER (later): an on-disk orphan list for crash-safe deferred delete,
+    replayed on mount. Bigger; only if crash-safety of unlinked-open matters.
+- [ ] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
+  array with linear scan and NO lock. Fine single-core/synchronous; needs a
+  lock once opens can race (SMP / preemption) — same class as the block-layer
+  bounce buffer.
+- [ ] `embkfs_parent_dir_oid` resolves `..` by a full-tree scan (O(tree) per
+  `..`). VFS now does dot-dot itself with a breadcrumb stack, so this path is
+  only hit by EMBKFS-internal callers — but if those stay, a stored parent
+  back-ref would make it O(1). Low priority.
+
+### VFS
+- [ ] Single mount only. `vfs_find_mount` ignores `path` and returns the one
+  used slot. Real multi-mount = longest-prefix match (deepest mount point that
+  prefixes the path) + hand back the path remainder relative to that mount.
+  The op table and resolve loop are already ready; only this function changes.
+- [ ] No `.readlink` op. Symlinks resolve to the LINK vnode but can't be
+  followed; EMBKFS already has `embkfs_readlink_object`.
+  - FIX: add `.readlink` to vfs_ops + adapter, follow links inside
+    `vfs_resolve` with a hop-count bound (ELOOP). NOTE: true `..` then differs
+    from the lexical breadcrumb `..` (a symlink's real parent vs its path
+    parent) — revisit the stack semantics when this lands.
+- [ ] No `.truncate` op → O_TRUNC can't be honored at open(). EMBKFS has
+  `embkfs_truncate_object`.
+  - FIX: add `.truncate` op + adapter; wire O_TRUNC in vfs_open.
+- [ ] stat() simplifications: directory nlink hardcoded to 2 (real = 2 +
+  subdir count); directory size reported as ENTRY COUNT, not bytes (ls tags it
+  'e'). Decide whether anything depends on either before "fixing."
+- [ ] `unlink` op has remove(3) semantics — it rmdirs an empty directory.
+  POSIX unlink(2) must return EISDIR on a directory; rmdir(2) is dirs-only.
+  - FIX (syscall layer): split unlink(2)/rmdir(2), either via a separate
+    `.rmdir` op or a stat-and-dispatch in the syscall handler.
+- [ ] Absolute paths only — no cwd / relative resolution (arrives with
+  per-process context).
+- [ ] `vfs_mount` duplicate-mount check is a raw strcmp on `at` (not a
+  normalized path). Fine for the single "/" mount.
+
+### File descriptors
+- [ ] fd table is fixed (64), global, per-boot. No per-process fd tables and no
+  open-file-description sharing (fork / dup / dup2) — arrives with processes.
+  The open-file-description vs fd distinction (shared cursor across dup'd fds)
+  isn't modeled yet; each fd entry currently owns its own cursor.
+- [ ] g_fds is unlocked global mutable state — needs a lock under SMP /
+  preemption (same note as the open-ref and mount tables).
+- [ ] O_TRUNC reserved but not honored (blocked on the VFS truncate op above).
+- [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
+  stat per write, and a TOCTOU window if writes can race. Acceptable while
+  single-threaded; revisit with concurrency.
+
+---
+
+## User Mode & Syscalls
+
+### ELF Loading (COMPLETED)
+- [x] ELF64 loader (kernel/cpu/elf.c/h) loads PT_LOAD segments with correct
+  permissions (PF_X → no NX, PF_W → writable). Maps pages in user VA space
+  (0x0000400000000000–0x0000700000000000 low-half), restores real p_flags
+  after loading (NX on data, exec on code).
+- [x] Entry point (e_entry) from ELF header used instead of hardcoded
+  0x400000. init_blob is now an ELF-format binary, not flat .bin.
+- [x] Context save/restore (kernel_ctx_save / kcontext) allows kernel to
+  resume after user program exits via sys_exit.
+
+### Ring-3 Entry & Exit (COMPLETED)
+- [x] iretq path to ring 3 with user code/data selectors, user RSP, EFLAGS=0x202
+  (IF+reserved). Works with interrupt handling + IRQ re-enable on exit.
+- [x] sys_exit (syscall 2) restores saved kernel context → control returns to
+  enter_user_mode (no halt).
+- [x] Interrupts live during user execution (no CLI mask); IRQs pre-enabled
+  before entering ring 3.
+
+### Security — user-pointer validation (HIGH, the real hole)
+- [ ] `sys_write` dereferences a raw user pointer (rsi) with NO validation. A
+  ring-3 caller can pass a KERNEL address → the kernel reads/prints kernel
+  memory, or faults. This is the canonical syscall vuln class (missing
+  copy_from_user / access_ok).
+  - FIX: copy_from_user / copy_to_user with an access_ok-style range check
+    (pointer + len lies entirely within this process's user VA range, and is
+    mapped). Blocked on per-process address spaces — there's no "this process's
+    user range" to check against until then. Becomes mandatory the moment
+    untrusted programs run.
+
+### Userspace loader
+- [ ] elf_load leaks mapped user pages on partial failure: if segment N maps
+  but segment N+1's frame alloc fails, segment N's pages stay mapped and
+  nothing unmaps them. Harmless in the single shared address space today;
+  becomes a real leak once per-process address spaces exist (a failed load
+  must discard the whole attempt). FIX: unwind mapped segments on error, or
+  build into a fresh address space that's simply dropped on failure.
+- [x] Loads /init.elf from the filesystem (multi-block extent read verified).
+  Embedded-blob path removed.
+
+### Syscall transport
+- [x] `int 0x80` (software gate) implemented: dispatch table (write=1, exit=2).
+- [ ] Fast path `syscall`/`sysret` deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE,
+  AND swapgs + a per-CPU GS base for the kernel-stack switch (syscall does NOT
+  switch stacks via the TSS). Wants per-CPU/SMP infra. GDT already laid out user
+  data-before-code for it.
+- [ ] Syscall table: wire the fd/VFS syscalls — open/read/write/close/lseek/stat/readdir —
+  straight through to vfs_open / vfs_fd_read / … so ring 3 can do real file I/O
+  (depends on user-pointer validation above for read/write buffers).
+- [ ] `sys_write` is serial-only and ignores fd. Route through the fd layer
+  once the fd syscalls land (fd 1 = stdout, etc.).
+
+### Ring-3 / TSS plumbing
+- [x] Ring-3 entry point: enter_user_mode() loads ELF, maps user stack,
+  saves kernel context, enters ring 3 via iretq.
+- [ ] `tss_set_rsp0` exists but RSP0 is a single static kernel stack. Once
+  threads/processes exist, RSP0 must be updated on every context switch so an
+  interrupt taken in user mode lands on the CURRENT thread's kernel stack.
+  Deferred to the scheduler.
+
 
 ## Core / Library
 

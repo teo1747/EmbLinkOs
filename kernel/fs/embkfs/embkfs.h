@@ -268,6 +268,8 @@ struct embk_txn {
 
 /* ---- Public API (grows over the next steps) ----------------------- */
 void embkfs_init(void);
+struct embkfs_volume *embkfs_live_volume(void);
+int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
@@ -292,6 +294,7 @@ int embkfs_run_allocator_selftests(void);
 int embkfs_run_tree_selftests(void);
 int embkfs_run_object_selftests(void);
 int embkfs_run_namespace_selftests(void);
+int embkfs_run_boot_diagnostics(void);
 
 /* Namespace/data mutators. */
 int embkfs_create_file(struct embkfs_volume *vol, uint64_t dir_oid,
@@ -382,5 +385,11 @@ int embkfs_dir_exists_name(struct embkfs_volume *vol, uint64_t dir_oid,
 int embkfs_dir_exists_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                            const char *path, bool *out_exists,
                            uint8_t *out_type, uint64_t *out_oid);
+
+/* Open-handle refcounting for unlink-while-open safety. The fd layer brackets
+ * each open file with get...put; the object is reclaimed only when its on-disk
+ * link count and its open count are both zero. */
+int embkfs_object_get(struct embkfs_volume *vol, uint64_t oid);
+int embkfs_object_put(struct embkfs_volume *vol, uint64_t oid);
 
 #endif /* _EMBKFS_H */
