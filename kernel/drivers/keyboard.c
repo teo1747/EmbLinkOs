@@ -36,7 +36,7 @@ static char kbd_buffer[KBD_BUFFER_SIZE];
 static volatile uint32_t buf_head = 0;   // write index (IRQ writes here)
 static volatile uint32_t buf_tail = 0;   // read index (kernel reads here)
 
-// Push a character into the circular buffer (called from IRQ handler)
+// Push a character into the circular buffer (called from IRQ handler or USB HID)
 static void buffer_push(char c) {
     uint32_t next_head = (buf_head + 1) % KBD_BUFFER_SIZE;
     if (next_head == buf_tail) {
@@ -78,6 +78,12 @@ static void keyboard_handler(void) {
 }
 
 
+
+// Inject a character as if it came from a keyboard press.
+// Called by the USB HID driver for keys received over xHCI.
+void keyboard_inject_char(char c) {
+    if (c) { buffer_push(c); }
+}
 
 void keyboard_init(void) {
     serial_write_string("\n=== Keyboard init ===\n");

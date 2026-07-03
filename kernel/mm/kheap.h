@@ -19,6 +19,19 @@
 #define KHEAP_CANARY_HEAD 0xDEADBEEFCAFEBABEULL
 #define KHEAP_CANARY_TAIL 0xCAFEBABEDEADBEEFULL
 
+// Slab allocator: fixed-size pools for common allocations
+#define KHEAP_SLAB_SIZES 7
+#define KHEAP_SLAB_16   0
+#define KHEAP_SLAB_32   1
+#define KHEAP_SLAB_64   2
+#define KHEAP_SLAB_128  3
+#define KHEAP_SLAB_256  4
+#define KHEAP_SLAB_512  5
+#define KHEAP_SLAB_1024 6
+
+// Min objects per slab block
+#define KHEAP_SLAB_MIN_OBJS 8
+
 
 /*
  * Low-level heap engine API.
@@ -49,5 +62,8 @@ void kheap_stats(void);
 
 // Walk the heap and validate canary, panics on corruption
 void kheap_check(void);
+
+// Slab allocator stats (objects in use vs capacity per pool)
+void kheap_slab_stats(void);
 
 #endif /* __KHEAP__H__ */

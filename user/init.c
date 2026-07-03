@@ -40,10 +40,21 @@ static unsigned long ustrlen(const char *s)
 
 /* The entry point. The linker script makes THIS the first thing in the binary,
  * so the program's entry == its load base == 0x400000. */
-__attribute__((noreturn, section(".text.start")))
+
+
+volatile int  counter = 5;          /* volatile -> real .data store/load */
+volatile char scratch[64];          /* volatile -> real .bss, not elided  */
+
 void _start(void)
 {
-    const char *msg = "Hello from a real user program loaded at 0x400000!\n";
-    write(1, msg, ustrlen(msg));
-    exit(0);
+    write(1, "Hello from ELF!\n", 16);
+    
+    counter++;                       /* real write to .data                */
+
+    /* touch bss so it can't be elided, and prove it was ZEROED: sum it —
+     * must be 0 if the loader zeroed the p_memsz - p_filesz tail */
+    int sum = 0;
+    for (int i = 0; i < 64; i++) sum += scratch[i];
+
+    exit(counter + sum);             /* expect 6 + 0 = 6; nonzero => bss not zeroed */
 }

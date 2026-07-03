@@ -131,4 +131,6 @@ void gdt_init(void) {
     uint16_t tr;
     __asm__ volatile ("str %0" : "=r"(tr));   /* read the Task Register back */
     serial_write_string("TR="); serial_write_hex(tr); serial_write_string("\n");
+
+    
 }

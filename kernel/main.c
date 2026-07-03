@@ -12,6 +12,7 @@
 #include "drivers/timer.h"
 #include "drivers/hpet.h"
 #include "drivers/pci.h"
+#include "drivers/usb.h"
 #include "drivers/ata.h"
 #include "drivers/ahci.h"
 #include "drivers/bootanim.h"
@@ -74,6 +75,7 @@ void kernel_main(void) {
     // --- Devices ---
     
     pci_init();
+    usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
 
@@ -180,6 +182,8 @@ void kernel_main(void) {
     for (;;) {
         uint64_t now = lapic_timer_get_ticks();
         if (now >= last + 500) { last = now; }
+        // USB HID input now arrives via the xHCI interrupt (see xhci_enable_irq),
+        // which wakes us from the hlt below and injects keys into the keyboard buffer.
         if (keyboard_has_char()) {
             char c = keyboard_getchar();
             kprintf("%c", c);
@@ -195,6 +199,6 @@ void kernel_main(void) {
                     cmd_buf[cmd_len++] = c;
             }
         }
-        __asm__ volatile ("hlt");
+        __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
     }
 }

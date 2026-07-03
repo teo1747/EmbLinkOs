@@ -22,10 +22,16 @@ static uint64_t elf_flags_to_vmm(uint32_t p_flags)
 /* Load a static ELF64 executable already resident in memory at `image`
  * (image_len bytes). On success writes the entry point to *entry_out. */
 int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out)
-{
-    if (image_len < sizeof(struct elf64_ehdr))
+{   
+    if (!image || !entry_out)
+        return -EMBK_EINVAL;
+    if (!pml4_phys)
         return -EMBK_EINVAL;
 
+
+    if (image_len < sizeof(struct elf64_ehdr))
+        return -EMBK_EINVAL;
+    
     const struct elf64_ehdr *eh = (const struct elf64_ehdr *)image;
 
     /* Validate: magic, 64-bit, x86-64, static executable. Fail loudly. */
@@ -50,6 +56,9 @@ int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint6
             return -EMBK_EINVAL;             /* malformed */
         if (p->p_offset + p->p_filesz > image_len)
             return -EMBK_EINVAL;             /* file bytes out of bounds */
+        if (p->p_vaddr >= DIRECT_MAP_BASE)   /* <-- restore this */
+            return -EMBK_EINVAL;             /* user must load lower-half only */
+
 
         uint64_t seg_start = PAGE_DOWN(p->p_vaddr);
         uint64_t seg_end   = PAGE_UP(p->p_vaddr + p->p_memsz);
