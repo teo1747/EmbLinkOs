@@ -66,6 +66,52 @@ uint64_t vmm_create_address_space(void) {
     return pml4_phys;
 }
 
+static void vmm_destroy_table(uint64_t table_phys, int level) {
+    uint64_t *table = vmm_table(table_phys);
+
+    for (int i = 0; i < 512; i++) {
+        uint64_t entry = table[i];
+        if (!(entry & VMM_PRESENT)) {
+            continue;
+        }
+
+        uint64_t child_phys = entry & VMM_ADDR_MASK;
+
+        if (level == 1) {
+            pmm_free_page(child_phys);
+            continue;
+        }
+
+        if (entry & VMM_HUGE) {
+            serial_write_string("vmm_destroy_address_space: huge user mapping unsupported\n");
+            continue;
+        }
+
+        vmm_destroy_table(child_phys, level - 1);
+    }
+
+    pmm_free_page(table_phys);
+}
+
+void vmm_destroy_address_space(uint64_t pml4_phys) {
+    if (!pml4_phys || pml4_phys == kernel_pml4_phys) {
+        return;
+    }
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    for (int i = 0; i < 256; i++) {
+        uint64_t entry = pml4[i];
+        if (!(entry & VMM_PRESENT)) {
+            continue;
+        }
+
+        vmm_destroy_table(entry & VMM_ADDR_MASK, 3);
+        pml4[i] = 0;
+    }
+
+    pmm_free_page(pml4_phys);
+}
+
 
 /* Switch the active address space by loading CR3 with a new PML4 physical address */
 void vmm_switch_address_space(uint64_t pml4_phys) {

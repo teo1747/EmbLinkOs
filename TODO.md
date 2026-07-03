@@ -319,7 +319,8 @@ left to do.
     untrusted programs run.
 
 ### Userspace loader
-- [ ] elf_load leaks mapped user pages on partial failure: if segment N maps
+- [x] elf_load partial-load cleanup now happens by loading into a fresh
+  address space and destroying that address space on load failure.
   but segment N+1's frame alloc fails, segment N's pages stay mapped and
   nothing unmaps them. Harmless in the single shared address space today;
   becomes a real leak once per-process address spaces exist (a failed load
@@ -347,6 +348,13 @@ left to do.
   threads/processes exist, RSP0 must be updated on every context switch so an
   interrupt taken in user mode lands on the CURRENT thread's kernel stack.
   Deferred to the scheduler.
+
+### Per-process address spaces
+- [x] vmm_destroy_address_space walks the user half, frees mapped frames and
+  user page-table pages, and is called on ELF load failure, stack setup
+  failure, and normal process exit.
+- [x] Per-process PML4 (kernel half aliased 256/511, user half private);
+  vmm_map_in/get_phys_in; late CR3 switch; higher-half p_vaddr rejected.
 
 
 ## Core / Library
