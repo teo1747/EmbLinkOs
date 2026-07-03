@@ -51,6 +51,10 @@ int vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags)
 // Create a new address space (PML4) and return its physical address
 uint64_t vmm_create_address_space(void);
 
+// Destroy a process address space: frees user-half frames, user page-table pages,
+// and the PML4 itself, while leaving the shared kernel half untouched.
+void vmm_destroy_address_space(uint64_t pml4_phys);
+
 // Switch to a new address space by loading CR3 with the given PML4 physical address
 void vmm_switch_address_space(uint64_t pml4_phys);
 

@@ -1,5 +1,4 @@
 /* kernel/cpu/usermode.c */
-#include "gdt.h"
 #include "kcontext.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
@@ -132,16 +131,24 @@ void enter_user_mode(void)
         serial_write_string("enter_user_mode: ELF load failed: ");
         serial_write_hex((uint64_t)(-rc));
         serial_write_string("\n");
-        /* NOTE: proc_pml4 and any pages it mapped leak here — the partial-load
-         * cleanup gap already on the TODO. Fine for now, one address space. */
+        vmm_destroy_address_space(proc_pml4);
         return;
     }
 
     /* 3. Map the user stack into the SAME process address space. */
     uint64_t stack_phys = pmm_alloc_page();
-    if (!stack_phys) { serial_write_string("no stack frame\n"); return; }
-    vmm_map_in(proc_pml4, USER_STACK_VA, stack_phys,
-               VMM_USER | VMM_WRITABLE | VMM_NX);
+    if (!stack_phys) {
+        serial_write_string("no stack frame\n");
+        vmm_destroy_address_space(proc_pml4);
+        return;
+    }
+    if (vmm_map_in(proc_pml4, USER_STACK_VA, stack_phys,
+                   VMM_USER | VMM_WRITABLE | VMM_NX) < 0) {
+        serial_write_string("enter_user_mode: stack map failed\n");
+        pmm_free_page(stack_phys);
+        vmm_destroy_address_space(proc_pml4);
+        return;
+    }
     uint64_t user_rsp = USER_STACK_VA + PAGE_SIZE_4K;
 
     /* Save the kernel return context (unchanged — this stack is higher-half,
@@ -149,6 +156,7 @@ void enter_user_mode(void)
     if (kernel_ctx_save(&g_user_exit_ctx) != 0) {
         serial_write_string("Returned to kernel: user program exited.\n");
         vmm_switch_address_space(vmm_get_kernel_pml4());
+        vmm_destroy_address_space(proc_pml4);
         return;
     }
 
