@@ -272,9 +272,10 @@ static int usb_msc_block_read(struct embk_block_device *bdev, uint64_t lba,
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
     while (count) {
         uint32_t n = count > per ? per : count;
+        size_t bytes = (size_t)n * (size_t)m->block_size;
         if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
-        memcpy(dst, m->data, n * m->block_size);
-        dst += n * m->block_size;
+        memcpy(dst, m->data, bytes);
+        dst += bytes;
         lba += n;
         count -= n;
     }
