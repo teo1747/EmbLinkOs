@@ -19,7 +19,7 @@ assignees: ''
 
 ## Concept first
 
-<!-- The mechanism, before code. Helios rule: understand it before building. -->
+<!-- The mechanism, before code. EmbLinkOs rule: understand it before building. -->
 
 ## SDM / spec references
 
