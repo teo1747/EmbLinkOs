@@ -101,6 +101,7 @@ struct usb_endpoint_descriptor {
 #define USB_REQ_SET_CONFIGURATION 0x09
 
 void usb_init(void);
+void usb_poll(void);
 uint32_t usb_controller_count(void);
 const struct usb_controller *usb_get_controller(uint32_t index);
 
