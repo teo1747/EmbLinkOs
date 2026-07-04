@@ -24,6 +24,9 @@ static inline uint64_t *vmm_table(uint64_t phys) {
 static inline uint64_t *vmm_pml4(void) { return vmm_table(kernel_pml4_phys); }
 
 
+
+
+
 // helper functions
 static inline uint64_t pml4_index(uint64_t v) { return (v >> 39) & 0x1ff; }
 static inline uint64_t pdpt_index(uint64_t v) { return (v >> 30) & 0x1ff; }
@@ -180,6 +183,11 @@ int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
 }
 
 
+uint64_t vmm_get_kernel_pml4(void) {
+    return kernel_pml4_phys;
+}
+
+
 void vmm_unmap(uint64_t virt_addr){
     uint64_t *pml4 = vmm_pml4();
     if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
@@ -228,9 +236,6 @@ void vmm_flush_tlb(uint64_t virt_addr) {
     __asm__ volatile("invlpg (%0)" : : "r" (virt_addr) : "memory");
 }
 
-uint64_t vmm_get_kernel_pml4(void) {
-    return kernel_pml4_phys;
-}
 
 
 // Initialize the virtual memory manager
