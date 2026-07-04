@@ -1,6 +1,6 @@
 # EmbLink OS — Project Status
 
-Last updated: 2026-07-01
+Last updated: 2026-07-04
 
 ## Overview
 
@@ -8,7 +8,7 @@ EmbLink OS is a minimal 64-bit x86 kernel with:
 - **Bootloader**: BIOS-based 2-stage loader with hardcoded kernel layout
 - **Memory**: PMM + VMM with dynamic paging (up to 4GB sustained, ~32GB architectural limit)
 - **Filesystems**: EMBKFS (native, transactional COW), FAT32 (R/W), VFS multiplexer
-- **Drivers**: Serial console, ATA/DMA, AHCI, keyboard, VBE framebuffer, ACPI/APIC
+- **Drivers**: Serial console, ATA/DMA, AHCI, keyboard, VBE/Bochs-DISPI/VirtIO-GPU framebuffer, ACPI/APIC, xHCI/EHCI/UHCI/OHCI USB (HID keyboard + mass storage)
 - **Interrupts**: IDT + handler dispatch, exceptions, LAPIC timer, keyboard IRQ
 - **User Mode**: Ring-3 entry via iretq, ELF64 loader, int 0x80 syscalls (write, exit)
 
@@ -68,6 +68,31 @@ EmbLink OS is a minimal 64-bit x86 kernel with:
 - **int 0x80 Dispatch**: syscall table with SYS_write (fd=1, serial out) + SYS_exit (return to kernel)
 - **Embedded ELF**: init_blob is now a proper ELF binary (replaces flat-binary stub copy)
 
+### Phase 7: Display Stack + Full USB Host Controller Support (✅ JUST LANDED)
+- **GPU abstraction** (`gpu.c`): probes PCI before `fb_init`, prefers
+  VirtIO-GPU over Bochs DISPI over the plain VBE fallback
+  - **VirtIO-GPU** (`virtio_gpu.c`): full virtio 1.x modern PCI transport
+    (capability-list walk, split virtqueue), 2D resource scan-out straight
+    from the kernel's RAM backbuffer, presented via TRANSFER_TO_HOST_2D +
+    RESOURCE_FLUSH per dirty rect — the accelerated host-GPU blit path
+  - **Bochs/QEMU stdvga DISPI** (`bochs_vbe.c`): runtime modeset (no real-mode
+    VBE call needed) via I/O ports 0x1CE/0x1CF, default 1024×768×32
+- **Framebuffer rewrite** (`framebuffer.c`): RAM backbuffer with dirty-rect
+  `fb_present()`, clipped fill/draw rect, h/v/Bresenham lines, circles
+  (outline + filled), screen-to-screen copy, fast memmove scroll, ARGB blit
+  with alpha blending; console/bootanim now draw-then-present
+- **USB core** (`usb_core.c`): HCD-agnostic enumeration, data-toggle
+  tracking, a HID boot-keyboard driver (with shift map), and a mass-storage
+  BOT/SCSI driver that registers block devices — shared by every legacy HC
+- **UHCI** (`uhci.c`, USB 1.x, I/O BAR4), **OHCI** (`ohci.c`, USB 1.x, MMIO
+  ED/TD + HCCA periodic table), **EHCI** (`ehci.c`, USB 2.0, async QH/qTD
+  schedule, releases full/low-speed ports to a companion controller) — xHCI
+  keeps its existing IRQ-driven path; legacy HCs are polled via `usb_poll()`
+  from the main loop
+- **Fixed along the way**: `hpet_delay_us` used 1e12 instead of 1e9 fs/µs,
+  making every HPET delay 1000× too long — this had silently broken LAPIC
+  timer calibration (the "100 Hz" timer actually ticked every ~8.6 s)
+
 ---
 
 ## Major To-Do Buckets (Rough Priority)
@@ -86,9 +111,11 @@ EmbLink OS is a minimal 64-bit x86 kernel with:
    - VFS: multi-mount (longest-prefix match), real `.truncate` op
    - FAT32: already works; IDE secondary channel (DMA + IRQ wiring)
 2. **Drivers**:
-   - VBE: mode enumeration + EDID query (don't hardcode 1024×768)
+   - VBE: mode enumeration + EDID query (only reached when no GPU driver
+     claims the display; don't hardcode 1024×768 there either)
    - Keyboard: modifiers (Shift/Ctrl/Alt), extended scancodes, F1–F12
-   - Framebuffer: write-combining (vmm_map_mmio_wc), GPU accel later
+   - Framebuffer: write-combining (vmm_map_mmio_wc)
+   - USB: hub support (legacy HCs and xHCI), isochronous transfers
    - ATA: LBA48, secondary channel, multi-disk
 3. **Synchronization**: per-CPU heap caches (SMP prep)
 
@@ -103,16 +130,16 @@ EmbLink OS is a minimal 64-bit x86 kernel with:
 ## Recent Commits (Last 10)
 
 ```
-c8e60bd finish implementing load ring3 user space
-d7e77ff usermode: re-enable IRQs on exit-via-kcontext return path
-5974e65 cpu: kernel survives a user program exiting (kcontext unwind)
-9dd4bfd user: load + run a real flat-binary program from an embedded blob
-120f406 syscall: int 0x80 entry + table dispatch (write, exit)
-0649dfb cpu: reach ring 3; exception dump shows CS/SS
-f09cf1e gdt: add ring-3 user descriptors + 64-bit TSS
-f2af17f d: open/close/read/write/seek + create-on-open, unlink-while-open proven
-44a19eb embkfs: unlink-while-open safety (in-memory open refcount)
-2b1fe16 vfs: ls consumer over the public VFS surface
+ea5eb71 update name
+d22989e Framebuffer rewrite, GPU drivers (Bochs DISPI + VirtIO-GPU), and USB 1.x/2.0 host controllers
+492d191 Process init (#15)
+19c1f1f Process init
+7fd843c Revise SECURITY.md to enhance security documentation
+639e273 Update issue templates
+2369478 Create CONTRIBUTING.md for project guidelines
+5e49c25 docs update (#14)
+02782ec Merge remote-tracking branch 'refs/remotes/origin/Teo' into Teo
+92dc1f7 pull_request_template
 ```
 
 ---
@@ -131,9 +158,14 @@ f2af17f d: open/close/read/write/seek + create-on-open, unlink-while-open proven
 
 ### Drivers
 - **No multi-IRQ routing** from MADT: only keyboard (GSI1, no override) routed
-- **VBE mode hardcoded**: 1024×768×24; EDID + mode enumeration TODO
+- **VBE mode hardcoded**: 1024×768×24; only reached when no GPU driver claims
+  the display; EDID + mode enumeration still TODO for that fallback path
 - **IDE secondary channel** not wired: ATA DMA is primary-only (IRQ14, BMIDE base)
 - **Keyboard** ASCII-only: no modifiers, extended codes, or function keys
+- **USB**: no hub support on any controller (legacy HCs or xHCI) — only
+  devices on root ports enumerate; no isochronous transfers; legacy HC
+  control/bulk transfers are synchronous busy-polls with a spin-count
+  timeout, not wall-clock
 
 ### User Mode
 - **Unchecked user pointers**: ring-3 can pass kernel addresses to sys_write
@@ -157,6 +189,8 @@ f2af17f d: open/close/read/write/seek + create-on-open, unlink-while-open proven
 | Context Switch | ✅ Passes | User exit restores kernel context |
 | LAPIC Timer | ✅ Passes | 100 Hz ticks, TSC calibrated |
 | rwlock | ✅ Passes | Reader/writer locking, smoke test passes |
+| GPU / Framebuffer | ✅ Passes (manual) | Bochs DISPI + VirtIO-GPU modeset verified via QEMU screendump; VBE fallback boots under `-vga vmware`. No automated selftest yet. |
+| USB (UHCI/OHCI/EHCI/xHCI) | ✅ Passes (manual) | HID keyboard input + mass-storage block device verified per-HC in QEMU (`run-usb-uhci` / `-ohci` / `-ehci` / `-xhci`), plus an EHCI+UHCI companion handoff. No automated selftest yet. |
 
 ---
 
