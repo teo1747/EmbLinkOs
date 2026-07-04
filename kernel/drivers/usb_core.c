@@ -289,7 +289,7 @@ static int usb_msc_block_write(struct embk_block_device *bdev, uint64_t lba,
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
     while (count) {
         uint32_t n = count > per ? per : count;
-        memcpy(m->data, src, n * m->block_size);
+        memcpy(m->data, src, (size_t)n * (size_t)m->block_size);
         if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
         src += n * m->block_size;
         lba += n;
