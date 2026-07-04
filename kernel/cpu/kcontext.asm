@@ -5,6 +5,43 @@
 
 global kernel_ctx_save
 global kernel_ctx_restore
+global kernel_ctx_switch
+; void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from) [save_to in rdi, restore_from in rsi]
+; save_to  in RDI - the OUTGOING process: save its context to this struct
+; restore_from in RSI - the INCOMING process: restore its context from this struct
+kernel_ctx_switch:
+    ; --- save outgoing context RDI (save_to) ---
+    mov [rdi + 0],  rbx
+    mov [rdi + 8],  rbp
+    mov [rdi + 16], r12
+    mov [rdi + 24], r13
+    mov [rdi + 32], r14
+    mov [rdi + 40], r15
+
+    lea rax, [rsp + 8]           ; caller's RSP (skip our return address)
+    mov [rdi + 48], rax
+    mov rax, [rsp]               ; resume RIP = our return address
+    mov [rdi + 56], rax
+
+    pushfq                       ; save RFLAGS to stack
+    pop rax                      ; pop RFLAGS into rax
+    mov [rdi + 64], rax          ; save RFLAGS
+
+    ; --- restore incoming context RSI (restore_from) ---
+    mov rbx, [rsi + 0]
+    mov rbp, [rsi + 8]
+    mov r12, [rsi + 16]
+    mov r13, [rsi + 24]
+    mov r14, [rsi + 32]
+    mov r15, [rsi + 40]
+    mov rsp, [rsi + 48]          ; switch back to the saved kernel stack
+
+    mov rax, [rsi + 64]          ; restore RFLAGS
+    push rax                      ; push RFLAGS onto stack
+    popfq                        ; restore RFLAGS from stack
+
+    mov rcx, [rsi + 56]          ; resume right after kernel_ctx_save
+    jmp rcx                      ; jump to the saved RIP
 
 ; uint64_t kernel_ctx_save(struct kcontext *ctx) [ctx in rdi]
 kernel_ctx_save:

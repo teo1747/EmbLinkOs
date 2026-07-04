@@ -39,6 +39,8 @@
 #include "fs/fd.h"
 #include "selftests.h"
 
+#include "process/process.h"
+
 
 extern uint64_t lapic_timer_get_ticks(void);
 
@@ -175,7 +177,7 @@ void kernel_main(void) {
 
     vfs_ls("/");
 
-    // Ring-3 demo is now shell-triggered: type `test ring3` at the prompt.
+
 
     // Main loop: keyboard echo + tick heartbeat
     uint64_t last = 0;
@@ -204,6 +206,17 @@ void kernel_main(void) {
                     cmd_buf[cmd_len++] = c;
             }
         }
+            /* ... vmm, acpi, drivers, fs mount, selftests ... */
+        process_init();
+        int pid = process_create("/init.elf");
+        if (pid < 0) {
+            serial_write_string("failed to create init process\n");
+        } else {
+            process_start_first();   /* one-way; never returns */
+        }
+        /* nothing meaningful runs here */
+        for (;;) __asm__ volatile("hlt");
+        /* nothing here runs */
         __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
     }
 }

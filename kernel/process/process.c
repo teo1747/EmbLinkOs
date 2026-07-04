@@ -6,6 +6,8 @@
 #include "../include/errno.h"
 #include "../drivers/serial.h"
 #include "../cpu/elf.h"
+#include "../cpu/gdt.h"
+#include "../cpu/kcontext.h"
 #include <stdint.h>
 
 #define USER_STACK_TOP 0x0000700000001000ULL  /* TOP of the user stack  page*/
@@ -59,11 +61,11 @@ int process_create(const char *path){
      * elf_load maps into pml4 and copies through P2V). stash the entry point for the trampoline jump to*/
 
     uint64_t entry_point = 0;
-    //int rc = elf_load_from_file(path, pml4, &entry_point);
-    //if (rc != EMBK_OK) {
-    //   vmm_destroy_address_space(pml4);
-    //    return rc;  // ELF load failed
-    //}
+    int rc = elf_load_from_file(path, pml4, &entry_point);
+    if (rc != EMBK_OK) {
+        vmm_destroy_address_space(pml4);
+        return rc;  // ELF load failed
+    }
 
     // 3. Allocate a user stack page and map it into the process's address space
     uint64_t stack_phys = pmm_alloc_page();
@@ -118,7 +120,7 @@ static void process_trampoline(void) {
         "pushq %0\n"            // ss = user data | 3
         "pushq %1\n"            // rsp = user stack top
         "pushq $0x202\n"        // rflags = IF=1
-        "pushq $2\n"            // cs = user code | 3
+        "pushq %2\n"            // cs = user code | 3
         "pushq %3\n"            // rip = entry point
         "iretq\n"               // return to user mode
         :
@@ -128,6 +130,89 @@ static void process_trampoline(void) {
     );
     __builtin_unreachable();  // Should never return
 }
+
+/* Round-robin scheduler: from the process after current, find the next READY (or the
+ * current one if it's still runnable and nothing else is). Switch address space + 
+ * kernel stack, then context-switch into it. */
+void schedule(void) {
+    if (!current_process) return;  // No process to schedule
+
+    /* find the next READY process */
+    int start = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (&proc_table[i] == current_process) {
+            start = i;
+            break;
+        }
+    }
+    struct process *next = NULL;
+    for (int off = 1; off <= MAX_PROCESSES; off++) {
+        struct process *candidate = &proc_table[(start + off) % MAX_PROCESSES];
+        if (candidate->state == PROCESS_READY || candidate->state == PROCESS_RUNNING) {
+            next = candidate;
+            break;
+        }
+    }
+
+    if (!next || next == current_process) {
+        // No other process to switch to, or only the current one is runnable
+        return;
+    }
+
+    struct process *prev = current_process;
+    if (prev->state == PROCESS_RUNNING) {
+        prev->state = PROCESS_READY;  // Mark the previous process as READY
+    }
+    next->state = PROCESS_RUNNING;  // Mark the next process as RUNNING
+    current_process = next;
+
+    /* Switch the incoming process's address space + kernel stack BEFORE the
+     * context switch - uniform for resumed and brand-new processes (the trampoline
+     * then needs neither). safe window: kernel half is shared, so flapping CR3 while
+     * still on prev's kernel stack keeps executing fine. */
+    vmm_switch_address_space(next->pml4_phys);
+    tss_set_rsp0(next->kstack_top);
+
+    kernel_ctx_switch(&prev->ctx, &current_process->ctx);
+    
+}
+
+void sys_yield(void) {
+    schedule();
+}
+
+/* Start the first process: no outgoing context switch/save, so this is a ONE-WAY
+ * restore into the first process, not a context switch. Set up its address space
+ * and kernel stack, marks it running, and restore its fabricated context, then jump to its entry point. */
+void process_start_first(void) {
+    struct process *first = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proc_table[i].state == PROCESS_READY) {
+            first = &proc_table[i];
+            break;
+        }
+    }
+    if (!first) {
+        kprintf("No READY process to start!\n");
+        return;
+    }
+
+    first->state = PROCESS_RUNNING;
+    current_process = first;
+    
+    /* same incoming-side setup schedule() does: CR3 + RSP0 before entering */
+    vmm_switch_address_space(first->pml4_phys);
+    tss_set_rsp0(first->kstack_top);
+
+    /* One way restore of fabricated context -> jmps to process_trampoline 
+     * 1 is the ret_val the kernel_ctx_restore forces non-zero anyway */
+    kernel_ctx_restore(&first->ctx, 1);
+
+    /* Should never return here */
+    __builtin_unreachable();
+}
+
+
 
 void process_init(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
