@@ -1,4 +1,4 @@
-# Contributing to Helios
+# Contributing to EmbLinkOs
 
 EmbLinkOs is a complete x86_64 operating system built from absolute zero — custom
 bootloader, kernel, filesystem, userspace, all hand-written with the goal of
