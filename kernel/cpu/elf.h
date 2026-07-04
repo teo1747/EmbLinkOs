@@ -37,3 +37,5 @@ struct elf64_phdr {
 #define EM_X86_64 0x3E
 
 int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out);
+
+int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out);
