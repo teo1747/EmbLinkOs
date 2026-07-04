@@ -104,18 +104,13 @@ void hpet_delay_us(uint64_t us)
     if (!hpet_ready || us == 0)
         return;
 
-    /* ticks_needed = us * 1_000_000_000 / hpet_period
-     *              = us * (1e9 / hpet_period)
-     * Work in two steps to avoid 128-bit arithmetic:
-     *   ticks = us * ns_per_us(1000) / period_ns
-     * period_ns = hpet_period / 1_000_000  (fs -> ns)
-     *
-     * Exact:  ticks = us * 1_000_000_000_000 / hpet_period
-     * Avoid overflow for large `us` by splitting:
-     *   ticks = us * (1_000_000_000_000 / hpet_period)  [pre-divided]
-     * For hpet_period in [40000000, 100000000], the quotient is 10–25,
-     * so this fits in 64 bits for any reasonable `us`. */
-    uint64_t ticks_per_us = 1000000000000ULL / hpet_period;  /* floor */
+    /* 1 us = 1_000_000_000 fs, so:
+     *   ticks_needed = us * (1e9 fs / hpet_period fs-per-tick)
+     * For hpet_period in [10^6, 10^8] fs the per-us quotient is 10..1000,
+     * which fits 64 bits for any reasonable `us`. (This used 1e12 before —
+     * a fs-vs-ps mixup that made every HPET delay 1000x too long and threw
+     * the LAPIC timer calibration off by the same factor.) */
+    uint64_t ticks_per_us = 1000000000ULL / hpet_period;  /* floor */
     if (ticks_per_us == 0)
         ticks_per_us = 1;
 

@@ -1,5 +1,9 @@
 #include "usb.h"
 #include "xhci.h"
+#include "uhci.h"
+#include "ohci.h"
+#include "ehci.h"
+#include "usb_core.h"
 
 #include "../include/kprintf.h"
 
@@ -43,7 +47,9 @@ static void usb_try_init_controller(struct usb_controller *ctrl) {
         return;
     }
 
-    if (!ctrl->bar0.valid) {
+    // UHCI keeps its registers in an I/O BAR4, so an empty BAR0 is normal
+    // there; every other controller type needs a valid MMIO BAR0.
+    if (ctrl->kind != USB_HC_UHCI && !ctrl->bar0.valid) {
         kprintf("USB: %s at %x:%x.%x has no usable BAR0\n",
                 usb_hc_name(ctrl->kind),
                 (unsigned int)ctrl->pci.bus,
@@ -52,18 +58,7 @@ static void usb_try_init_controller(struct usb_controller *ctrl) {
         return;
     }
 
-    if (!ctrl->bar0.is_mmio) {
-        kprintf("USB: %s at %x:%x.%x uses I/O BAR0=%x (legacy mode)\n",
-                usb_hc_name(ctrl->kind),
-                (unsigned int)ctrl->pci.bus,
-                (unsigned int)ctrl->pci.device,
-                (unsigned int)ctrl->pci.function,
-                (unsigned int)ctrl->bar0.address);
-        ctrl->initialized = true;
-        return;
-    }
-
-    kprintf("USB: %s at %x:%x.%x MMIO=%p size=%u irq=%u/%u\n",
+    kprintf("USB: %s at %x:%x.%x BAR0=%p size=%u irq=%u/%u\n",
             usb_hc_name(ctrl->kind),
             (unsigned int)ctrl->pci.bus,
             (unsigned int)ctrl->pci.device,
@@ -73,12 +68,23 @@ static void usb_try_init_controller(struct usb_controller *ctrl) {
             (unsigned int)ctrl->irq_line,
             (unsigned int)ctrl->irq_pin);
 
-    if (ctrl->kind == USB_HC_XHCI) {
+    switch (ctrl->kind) {
+    case USB_HC_XHCI:
         ctrl->initialized = xhci_init_controller(ctrl);
         return;
+    case USB_HC_EHCI:
+        ctrl->initialized = ehci_init_controller(ctrl);
+        return;
+    case USB_HC_UHCI:
+        ctrl->initialized = uhci_init_controller(ctrl);
+        return;
+    case USB_HC_OHCI:
+        ctrl->initialized = ohci_init_controller(ctrl);
+        return;
+    default:
+        kprintf("USB: unknown controller type, skipping\n");
+        return;
     }
-
-    ctrl->initialized = true;
 }
 
 // Discover USB host controllers through PCI class/subclass matching:
@@ -130,8 +136,21 @@ void usb_init(void) {
         return;
     }
 
+    // Initialize EHCI/xHCI first: EHCI's CONFIGFLAG decides port routing, so
+    // it must claim (or release) ports before any companion UHCI/OHCI looks
+    // at them — otherwise a device could enumerate twice or get yanked away.
     for (uint32_t i = 0; i < g_usb_controller_count; i++) {
-        usb_try_init_controller(&g_usb_controllers[i]);
+        if (g_usb_controllers[i].kind == USB_HC_EHCI ||
+            g_usb_controllers[i].kind == USB_HC_XHCI) {
+            usb_try_init_controller(&g_usb_controllers[i]);
+        }
+    }
+
+    for (uint32_t i = 0; i < g_usb_controller_count; i++) {
+        if (g_usb_controllers[i].kind != USB_HC_EHCI &&
+            g_usb_controllers[i].kind != USB_HC_XHCI) {
+            usb_try_init_controller(&g_usb_controllers[i]);
+        }
         if (g_usb_controllers[i].initialized) {
             kprintf("USB:   %s %x:%x.%x ports=%u present=%u\n",
                     usb_hc_name(g_usb_controllers[i].kind),
@@ -158,6 +177,12 @@ void usb_init(void) {
     // switch xHCI to interrupt-driven servicing so HID input no longer needs the
     // main loop to poll. (No-op if a controller has no usable legacy IRQ line.)
     xhci_enable_irq();
+}
+
+// Called from the kernel main loop: services interrupt-IN endpoints on the
+// polled legacy controllers (UHCI/OHCI/EHCI). xHCI input is IRQ-driven.
+void usb_poll(void) {
+    usb_core_poll();
 }
 
 uint32_t usb_controller_count(void) {
