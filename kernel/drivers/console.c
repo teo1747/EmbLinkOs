@@ -31,6 +31,7 @@ void console_init(void) {
     cursor_row = 0;
 
     fb_clear(bg_r, bg_g, bg_b);
+    fb_present();
     g_console_ready = true;
 }
 
@@ -49,6 +50,7 @@ void console_set_color(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g
 void console_clear(void){
 
     fb_clear(bg_r, bg_g, bg_b);
+    fb_present();
     cursor_col = 0;
     cursor_row = 0;
 }
@@ -56,39 +58,9 @@ void console_clear(void){
 
 
 static void scroll_up(void) {
-    uint8_t *buffer = fb_get_buffer();
-    const fb_info_t *info = fb_get_info();
-
-    uint32_t row_bytes = info->pitch * FONT_HEIGHT;
-    uint32_t total_bytes = info->pitch * info->height;
-    uint32_t move_bytes = total_bytes - row_bytes;
-
-    // Move everything up by one character row (FONT_HEIGHT pixel rows)
-    // src = pixel row FONT_HEIGHT, dst = pixel row 0
-    uint8_t *dst = buffer; 
-    uint8_t *src = buffer + row_bytes;
-    for (uint32_t i = 0; i < move_bytes; i++) {
-        dst[i] = src[i];
-    }
-
-    // Clear the last character row
-    uint8_t *bottom = buffer + (total_bytes - row_bytes);
-    uint32_t bpp_bytes = info->bpp / 8;
-    for (uint32_t y = 0; y < FONT_HEIGHT; y ++) {
-        for (uint32_t x = 0; x < info->width; x++) {
-            uint8_t *pixel = bottom + (y * info->pitch) + (x * bpp_bytes);
-            if (info->format == FB_FORMAT_RGB) {
-                pixel[0] = bg_r;
-                pixel[1] = bg_g;
-                pixel[2] = bg_b;
-            }else if (info->format == FB_FORMAT_BGR) {
-                pixel[2] = bg_r;
-                pixel[1] = bg_g;
-                pixel[0] = bg_b;
-            }   
-        }
-
-    }
+    // Fast memmove-based scroll in the framebuffer layer, then push the whole
+    // screen (the scroll dirties everything anyway).
+    fb_scroll_up(FONT_HEIGHT, FB_RGB(bg_r, bg_g, bg_b));
 }
 
 void console_putchar(char c) {
@@ -105,6 +77,7 @@ void console_putchar(char c) {
                 scroll_up();
                 cursor_row = rows - 1;
             }
+            fb_present();
             return;
         case '\r':
             cursor_col = 0;
@@ -119,7 +92,7 @@ void console_putchar(char c) {
 
             // Blanck the cell at the new cursor position
             fb_draw_char(' ', cursor_col * FONT_WIDTH, cursor_row * FONT_HEIGHT, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
-            
+            fb_present();
 
             return;
 
@@ -133,6 +106,7 @@ void console_putchar(char c) {
                     scroll_up();
                     cursor_row = rows - 1;
                 }
+                fb_present();
             }
             return;
     }
@@ -151,6 +125,7 @@ void console_putchar(char c) {
             cursor_row = rows - 1;
         }
     }
+    fb_present();
 
 }
 
