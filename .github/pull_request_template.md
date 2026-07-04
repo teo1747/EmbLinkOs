@@ -9,7 +9,7 @@
 
 ## How it was proven
 
-<!-- Helios rule: a change isn't done because it compiles or prints "hello" —
+<!-- EmbLinkOs rule: a change isn't done because it compiles or prints "hello" —
      it's done when a selftest exercises the actual invariant. Describe the
      test and what it proves. Quote the key output if useful. -->
 
@@ -37,7 +37,7 @@ Proof:
 
 ## Known gaps left behind
 
-<!-- Helios discipline: name what this DOESN'T handle rather than pretend it's
+<!-- EmbLinkOs discipline: name what this DOESN'T handle rather than pretend it's
      complete. What's the next thing that will have to deal with the loose end?
      (These become TODO.md entries.) -->
 
