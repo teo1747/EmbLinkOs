@@ -7,6 +7,7 @@
 
 #include "drivers/serial.h"
 #include "drivers/framebuffer.h"
+#include "drivers/gpu.h"
 #include "drivers/console.h"
 #include "drivers/keyboard.h"
 #include "drivers/timer.h"
@@ -85,6 +86,7 @@ void kernel_main(void) {
 
 
     // --- Display + input ---
+    gpu_init();   // pick VirtIO-GPU / Bochs DISPI before the fb comes up
     fb_init();
     console_init();
     keyboard_init();
@@ -182,6 +184,9 @@ void kernel_main(void) {
     for (;;) {
         uint64_t now = lapic_timer_get_ticks();
         if (now >= last + 500) { last = now; }
+        // Legacy USB HCs (UHCI/OHCI/EHCI) are polled: drain any completed
+        // interrupt-IN transfers and re-arm them. xHCI input is IRQ-driven.
+        usb_poll();
         // USB HID input now arrives via the xHCI interrupt (see xhci_enable_irq),
         // which wakes us from the hlt below and injects keys into the keyboard buffer.
         if (keyboard_has_char()) {
