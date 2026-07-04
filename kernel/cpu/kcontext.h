@@ -21,4 +21,12 @@ uint64_t kernel_ctx_save(struct kcontext *ctx);
 // (pass a nonzero value). Does not return to its own caller.
 void kernel_ctx_restore(struct kcontext *ctx, uint64_t val);
 
+/* 
+ * Switch from the current context to another context. Saves the current context
+ * into `save_to` and restores the context from `restore_from`. This function
+ * does not return to its caller; instead, it resumes execution at the point
+ * where `restore_from` was saved.
+*/
+void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from);
+
 #endif /* __KCONTEXT_H__ */
