@@ -20,7 +20,7 @@ struct process {
     uint32_t pid;              /**< Process ID */
     uint64_t pml4_phys;        /**< Physical address of the process's PML4 (page table) */
     struct kcontext ctx;       /**< Saved kernel context for this process */
-    uint16_t kstack_top;       /**< Offset to the top of the kernel stack for this process */
+    uint64_t kstack_top;       /**< Virtual address of the top of the kernel stack for this process */
     uint64_t entry_point;      /**< Entry point for the process (user mode) */
     uint64_t user_rsp;         /**< User mode stack pointer */
     enum process_state state;  /**< Current state of the process */
@@ -57,6 +57,15 @@ void schedule(void);
  * control of the CPU, allowing the scheduler to select another ready process to run.
  */
 void sys_yield(void);
+
+/**
+ * @brief Start the first process.
+ *
+ * This function selects the first READY process, sets up its address space and kernel stack,
+ * marks it as RUNNING, and restores its context to start execution.
+ */
+void process_start_first(void);
+
 
 extern struct process *current_process;  /**< Pointer to the currently running process */
 

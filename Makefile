@@ -35,6 +35,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/ioapic.c \
 			 kernel/cpu/usermode.c \
 			 kernel/cpu/elf.c \
+			 kernel/process/process.c \
              kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \

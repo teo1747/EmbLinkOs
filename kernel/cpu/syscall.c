@@ -4,6 +4,7 @@
 #include "../drivers/serial.h"
 #include "../include/errno.h"
 #include "../include/types.h"
+#include "../process/process.h"
 
 /* Saved kernel context to resume on exit(), defined in usermode.c. */
 extern struct kcontext g_user_exit_ctx;
@@ -43,19 +44,27 @@ static int64_t sys_write(struct regs *r) {
 /* exit(code): for now, just announce and halt. Becomes "end this process and
  * schedule another" onnce processes exist. */
 static int64_t sys_exit(struct regs *r) {
-    int code = (int)r->rdi;
+
+
+    int code = (int)r->rax;  // The exit code is passed in rax
     serial_write_string("\n[syscall] exit code=");
     serial_write_hex(code);
     serial_write_string("\n");
 
-    /* No scheduler yet: unwind back into enter_user_mode (which saved this
-     * context before dropping to ring 3) instead of halting. This abandons the
-     * current int 0x80 frame on the kernel (TSS) stack, which is fine — the next
-     * syscall starts fresh from RSP0. Does not return. Once processes exist this
-     * becomes "tear down this process and schedule another". */
-    kernel_ctx_restore(&g_user_exit_ctx, 1);
+    current_process->exit_code = (int)r->rax;  // Store the exit code
+    current_process->state = PROCESS_ZOMBIE;   // Mark as ZOMBIE
+
+    /* Schedule the next process */
+    schedule();
+
+
+    serial_write_string("[Kernel] pall processes exited; halting\n");
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
 
     return 0; // never reached
+
 }
 
 
