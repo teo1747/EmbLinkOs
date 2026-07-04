@@ -197,7 +197,8 @@ left to do.
 ## Drivers — Display / Console
 
 ### Framebuffer / VBE
-- [ ] VBE mode hardcoded to 0x118 (1024×768×24). Proper selection:
+- [ ] Real-mode VBE path still hardcoded to mode 0x118 (1024×768×24) in stage2;
+  only reached when no GPU driver claims the display. Proper selection:
   1. EDID query (INT 10h AX=4F15h BL=01h), parse detailed timing descriptor 1
      for native resolution; fall back gracefully if unavailable.
   2. Enumerate VBE modes (VbeModeListPtr in VBEInfoBlock @ 0x0E; 0xFFFF-
@@ -208,8 +209,15 @@ left to do.
      final fallback text mode at 0xB8000.
   - Refs: VBE 3.0 (Function 15h DDC), EDID 1.4 (VESA E-EDID).
 - [ ] UEFI GOP path (modern alternative to VBE; needs the UEFI bootloader).
-- [ ] Eventually: GPU acceleration — find GPU via PCI, GPU driver, 2D accel
-  (rectangle blit, glyph cache).
+- [x] ~~GPU acceleration~~ — done: `gpu.c` probes PCI for a GPU driver before
+  `fb_init`; `bochs_vbe.c` does runtime DISPI modeset, `virtio_gpu.c` drives
+  an accelerated guest-memory scan-out (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+  per dirty rect). `framebuffer.c` gained a RAM backbuffer with dirty-rect
+  `fb_present()`, clipped fill/copy rects, lines, circles, alpha-blit.
+  Remaining: `virtio_gpu.c` only negotiates VIRTIO_F_VERSION_1 (no indirect
+  descriptors, no multiple scanouts, no 3D/Virgl); `bochs_vbe.c` has no
+  `-vga qxl` support; no write-combining on the LFB mapping
+  (`vmm_map_mmio_wc` still doesn't exist — see `vmm_map_mmio` entry above).
 
 ### Keyboard
 - [ ] Only ASCII press events. Add release tracking for proper modifier state.
@@ -222,8 +230,42 @@ left to do.
   (AZERTY, Dvorak, …).
 - [ ] No PS/2 controller (8042) init — relies on BIOS leaving it usable.
   Configure via port 0x64: disable mouse port, set scancode set, enable IRQs.
-- [ ] Migrate to USB HID once there's a USB stack.
+- [x] ~~Migrate to USB HID once there's a USB stack~~ — done, see USB section.
 
+---
+
+## USB Host Controllers
+
+All four generations now bring up their root ports and enumerate devices:
+`xhci.c` (own IRQ-driven path, HID + mass storage), `ehci.c` (async
+QH/qTD schedule, periodic interrupt QHs, releases FS/LS ports to a
+companion), `uhci.c` (I/O BAR4, frame-list schedule), `ohci.c` (MMIO,
+ED/TD lists + HCCA periodic table). `usb_core.c` is the shared HCD-agnostic
+layer: enumeration, a HID boot-keyboard driver (with shift map), and a
+mass-storage BOT/SCSI driver that registers block devices. Legacy HCs are
+polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
+
+- [ ] No hub support on the legacy HCs (UHCI/OHCI/EHCI) — a hub interface is
+  detected and logged but its downstream ports are never enumerated. xHCI
+  has the same gap (see `xhci-dma-uses-virtual-addresses` notes: only the
+  first device enumerates).
+- [ ] No isochronous transfers (audio/video class devices unsupported).
+- [ ] No USB3/SuperSpeed on xHCI beyond what already worked before this
+  change — streams, bursting, and the SuperSpeedPlus descriptors are unused.
+- [ ] Static per-controller-type tables (`UHCI_MAX_HC`/`OHCI_MAX_HC`/
+  `EHCI_MAX_HC` = 2, `USB_MAX_DEVICES` = 16) — fine for QEMU testing, will
+  need to become dynamic for real hardware with many devices.
+- [ ] Root ports are scanned once at boot; no hot-plug (connect-status-change
+  interrupt) handling on the legacy HCs.
+- [ ] EHCI/UHCI/OHCI control and bulk transfers are synchronous busy-polls
+  (bounded by a spin-count timeout, not wall-clock) — fine for boot-time
+  enumeration, would stall the kernel if called after multitasking exists.
+- [ ] No automated selftest for the display or USB stack — verification so
+  far is manual QEMU screendumps + serial-log inspection per HC generation.
+  A `test usb` / `test gpu` selftest command (see `selftests.c`'s existing
+  `test <name>` pattern) should assert something concrete: e.g. a specific
+  known-good `usb-storage` block's contents round-trip through the MSC
+  read/write path, or a fill_rect + read-back matches the expected pixels.
 
 ---
 
