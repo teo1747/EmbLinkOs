@@ -9,6 +9,9 @@ CFLAGS = -ffreestanding -nostdlib -nostartfiles \
 IMG = myos.img
 DISK = disk.img
 
+# Userland rules appear before `all`, so pin the default goal explicitly.
+.DEFAULT_GOAL := all
+
 STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
 ISR_ASM     = kernel/cpu/isr.asm
@@ -35,6 +38,9 @@ KERNEL_SRC = kernel/main.c \
              kernel/acpi/acpi.c \
              kernel/drivers/serial.c \
              kernel/drivers/framebuffer.c \
+             kernel/drivers/gpu.c \
+             kernel/drivers/bochs_vbe.c \
+             kernel/drivers/virtio_gpu.c \
              kernel/drivers/font_8x16.c \
              kernel/drivers/console.c \
              kernel/drivers/timer.c \
@@ -43,7 +49,11 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/pit.c \
              kernel/drivers/pci.c \
              kernel/drivers/usb.c \
+             kernel/drivers/usb_core.c \
              kernel/drivers/xhci.c \
+             kernel/drivers/ehci.c \
+             kernel/drivers/uhci.c \
+             kernel/drivers/ohci.c \
              kernel/drivers/ata.c \
              kernel/drivers/bootanim.c \
              kernel/drivers/ahci.c \
@@ -177,7 +187,7 @@ run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
-	    -serial stdio -no-reboot -no-shutdown
+		-vga virtio -serial stdio -no-reboot -no-shutdown -m 4G
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
@@ -247,6 +257,52 @@ run-part-embkfs: $(IMG) $(DISK) part_embkfs.img
 
 run: $(IMG) $(DISK)
 	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown
+
+# ---- Display / GPU test targets ---------------------------------------------
+# stdvga exposes the Bochs DISPI interface -> bochs_vbe.c does a runtime
+# modeset on the LFB. virtio-vga boots via its VBE compat layer, then
+# virtio_gpu.c takes over with an accelerated guest-memory scan-out.
+run-vga-std: $(IMG) $(DISK)
+	qemu-system-x86_64 $(DRIVES) -vga std -serial stdio -no-reboot -no-shutdown
+
+run-virtio-gpu: $(IMG) $(DISK)
+	qemu-system-x86_64 $(DRIVES) -vga virtio -serial stdio -no-reboot -no-shutdown
+
+# ---- USB host-controller test targets ----------------------------------------
+# One target per HC generation. usb-kbd is a full/low-speed HID device;
+# usb-storage is high-speed capable (exercises EHCI bulk).
+USB_STORAGE_IMG = usbdisk.img
+$(USB_STORAGE_IMG):
+	dd if=/dev/zero of=$(USB_STORAGE_IMG) bs=1M count=16
+
+run-usb-uhci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
+	qemu-system-x86_64 $(DRIVES) \
+	    -device piix3-usb-uhci,id=uhci \
+	    -device usb-kbd,bus=uhci.0 \
+	    -drive id=usbstick,file=$(USB_STORAGE_IMG),format=raw,if=none \
+	    -device usb-storage,bus=uhci.0,drive=usbstick \
+	    -serial stdio -no-reboot -no-shutdown
+
+run-usb-ohci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
+	qemu-system-x86_64 $(DRIVES) \
+	    -device pci-ohci,id=ohci \
+	    -device usb-kbd,bus=ohci.0 \
+	    -drive id=usbstick,file=$(USB_STORAGE_IMG),format=raw,if=none \
+	    -device usb-storage,bus=ohci.0,drive=usbstick \
+	    -serial stdio -no-reboot -no-shutdown
+
+run-usb-ehci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
+	qemu-system-x86_64 $(DRIVES) \
+	    -device usb-ehci,id=ehci \
+	    -drive id=usbstick,file=$(USB_STORAGE_IMG),format=raw,if=none \
+	    -device usb-storage,bus=ehci.0,drive=usbstick \
+	    -serial stdio -no-reboot -no-shutdown
+
+run-usb-xhci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
+	qemu-system-x86_64 $(DRIVES) \
+	    -device qemu-xhci,id=xhci \
+	    -device usb-kbd,bus=xhci.0 \
+	    -serial stdio -no-reboot -no-shutdown
 
 debug: $(IMG) $(DISK)
 	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown -s -S
