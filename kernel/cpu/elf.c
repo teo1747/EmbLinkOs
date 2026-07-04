@@ -1,5 +1,8 @@
 /* kernel/cpu/elf.c  (or fold into usermode.c) */
 #include "elf.h"
+#include "../fs/vfs.h"
+#include "../fs/fd.h"
+#include "../include/kmalloc.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include "../drivers/serial.h"
@@ -110,4 +113,46 @@ int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint6
 
     *entry_out = eh->e_entry;
     return EMBK_OK;
+}
+
+/* Read a static ELF64 executable off the filesystem into a kmalloc'd buffer,
+ * then hand it to elf_load — which is source-agnostic, it only ever cared
+ * about an image pointer + length. The buffer is freed here, not by elf_load,
+ * because by the time elf_load returns it has already COPIED every byte it
+ * needs into user pages (the p_filesz copy loop runs synchronously inside
+ * it) — nothing downstream reads from this buffer again. */
+int elf_load_from_file(const char *path, uint64_t pml4_phys,
+                       uint64_t *entry_out)
+{
+    int fd = vfs_open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        serial_write_string("elf_load_from_file: open failed: ");
+        serial_write_hex((uint64_t)(-fd));
+        serial_write_string("\n");
+        return fd;
+    }
+
+    struct vfs_stat st;
+    int rc = vfs_fd_fstat(fd, &st);
+    if (rc != EMBK_OK) { vfs_close(fd); return rc; }
+    if (st.size == 0)  { vfs_close(fd); return -EMBK_EINVAL; }
+
+    uint8_t *buf = kmalloc(st.size);
+    if (!buf) { vfs_close(fd); return -EMBK_ENOMEM; }
+
+    uint64_t total = 0;
+    while (total < st.size) {
+        size_t got = 0;
+        rc = vfs_fd_read(fd, buf + total, (size_t)(st.size - total), &got);
+        if (rc != EMBK_OK) { kfree(buf); vfs_close(fd); return rc; }
+        if (got == 0)      { kfree(buf); vfs_close(fd); return -EMBK_EIO; }
+        total += got;
+    }
+    vfs_close(fd);
+
+    /* Hand the in-memory image to the parser, targeting the PROCESS address
+     * space — elf_load maps each segment into pml4_phys, not the kernel PML4. */
+    rc = elf_load(buf, total, pml4_phys, entry_out);
+    kfree(buf);
+    return rc;
 }
