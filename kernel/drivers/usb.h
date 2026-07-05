@@ -105,4 +105,9 @@ void usb_poll(void);
 uint32_t usb_controller_count(void);
 const struct usb_controller *usb_get_controller(uint32_t index);
 
+// Selftest: cross-checks controller discovery/classification against a
+// fresh PCI scan. Returns 0 on success, -1 on failure. Does not exercise
+// live HID/mass-storage transfers — see usb.c's comment on the function.
+int usb_run_selftests(void);
+
 #endif /* __USB_H__ */

@@ -218,36 +218,255 @@ e820_query:
     ret
 
 
+; ---------------------------------------------------------------------------
+; VBE mode selection: EDID native resolution (best-effort) -> exact-match
+; search through the enumerated VBE mode list -> a fixed resolution
+; preference list -> the ORIGINAL hardcoded mode 0x118 if nothing else
+; panned out. `selected_mode` starts at 0x118 and is ONLY ever overwritten
+; by a mode that find_mode_for_resolution actually confirmed exists and
+; supports a linear framebuffer -- so any bug in the EDID/enumeration code
+; below degrades to exactly today's behavior, never to something worse.
+; (This path only matters at all when no PCI GPU driver claims the display
+; -- see gpu.c -- since Bochs DISPI/VirtIO-GPU both do their own runtime
+; modeset instead of using this VBE info block.)
+; ---------------------------------------------------------------------------
+selected_mode:    dw 0x118
+native_width:     dw 0
+native_height:    dw 0
+mode_list_off:    dw 0
+mode_list_seg:    dw 0
+cur_mode_num:     dw 0
+call_result:      dw 0
+target_width:     dw 0
+target_height:    dw 0
+best_found_mode:  dw 0xFFFF
+best_found_bpp:   db 0
+
+; Ordered fallback preference list, tried in order when EDID is unavailable
+; or its resolution doesn't match any enumerated mode. (0,0) terminates.
+fallback_resolutions:
+    dw 1920, 1080
+    dw 1280, 1024
+    dw 1024, 768
+    dw 800,  600
+    dw 640,  480
+    dw 0,    0
+
+; ---- EDID query: INT 10h AX=4F15h, BL=01h (read EDID block 0). ES:DI ->
+; 128-byte buffer at 0x5300 (clear of the VBE info block at 0x5000-0x51FF
+; and the mode info block at 0x5200-0x52FF). Best-effort: on any failure,
+; or a Detailed Timing Descriptor #1 that doesn't look like one (pixel
+; clock == 0 -- e.g. a monitor-name descriptor in its place), native_width/
+; height are left at 0 and the caller falls through to the fixed
+; preference list instead. Never fails loudly -- there's no serial/BIOS-
+; teletype debugging worth relying on this early, so silence + a safe
+; default is the only sane failure mode here. */
+edid_query:
+    push es
+    push ax
+    push bx
+    push cx
+    push di
+
+    xor ax, ax
+    mov es, ax
+    mov di, 0x5300
+    mov ax, 0x4F15
+    mov bl, 0x01
+    mov bh, 0
+    mov cx, 0
+    int 0x10
+    cmp ax, 0x004F
+    jne .done
+
+    ; Detailed Timing Descriptor #1 starts at EDID offset 0x36 (54).
+    mov ax, [0x5300 + 0x36]      ; pixel clock (10 kHz units)
+    or ax, ax
+    jz .done                     ; zero => not actually a timing descriptor
+
+    ; H active = byte[0x38] | ((byte[0x3A] & 0xF0) << 4)
+    xor ax, ax
+    mov al, [0x5300 + 0x38]
+    mov bl, [0x5300 + 0x3A]
+    and bl, 0xF0
+    xor bh, bh
+    shl bx, 4
+    or ax, bx
+    mov [native_width], ax
+
+    ; V active = byte[0x3B] | ((byte[0x3D] & 0xF0) << 4)
+    xor ax, ax
+    mov al, [0x5300 + 0x3B]
+    mov bl, [0x5300 + 0x3D]
+    and bl, 0xF0
+    xor bh, bh
+    shl bx, 4
+    or ax, bx
+    mov [native_height], ax
+
+.done:
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    ret
+
+; Search the VBE mode list (VideoModePtr, a real-mode far pointer at VBE
+; Info Block offset 0x0E) for a mode with the exact CX x DX resolution,
+; ModeAttributes bits {supported, graphics, LFB} all set, and MemoryModel
+; == 6 (direct color -- a plain RGB framebuffer, not planar/paletted).
+; Among matches, keeps the highest BitsPerPixel. Every BIOS-call result is
+; saved to memory immediately (call_result) and every loop variable is
+; reloaded from memory each iteration rather than trusting register
+; survival across `int 0x10` -- real-mode BIOS calls are not guaranteed to
+; preserve registers beyond their documented outputs.
+; Input: CX = width, DX = height. Output: CF=0 and AX=mode number on a
+; match, CF=1 if nothing in the list qualifies.
+find_mode_for_resolution:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    mov [target_width], cx
+    mov [target_height], dx
+    mov word [best_found_mode], 0xFFFF
+    mov byte [best_found_bpp], 0
+
+    mov ax, [0x5000 + 0x0E]
+    mov [mode_list_off], ax
+    mov ax, [0x5000 + 0x10]
+    mov [mode_list_seg], ax
+
+.next_mode:
+    mov ax, [mode_list_seg]
+    mov fs, ax
+    mov si, [mode_list_off]
+    mov ax, [fs:si]
+    cmp ax, 0xFFFF
+    je .list_done
+    mov [cur_mode_num], ax
+    add si, 2
+    mov [mode_list_off], si
+
+    push es
+    xor ax, ax
+    mov es, ax
+    mov di, 0x5200
+    mov ax, 0x4F01
+    mov cx, [cur_mode_num]
+    int 0x10
+    mov [call_result], ax
+    pop es
+
+    cmp word [call_result], 0x004F
+    jne .next_mode
+
+    mov ax, [0x5200 + 0x00]        ; ModeAttributes
+    test ax, 0x0001                ; bit 0: mode supported by present hardware
+    jz .next_mode
+    test ax, 0x0010                ; bit 4: graphics mode (not text)
+    jz .next_mode
+    test ax, 0x0080                ; bit 7: linear frame buffer available
+    jz .next_mode
+
+    mov al, [0x5200 + 0x1B]        ; MemoryModel
+    cmp al, 6                      ; direct color
+    jne .next_mode
+
+    mov ax, [0x5200 + 0x12]        ; XResolution
+    cmp ax, [target_width]
+    jne .next_mode
+    mov ax, [0x5200 + 0x14]        ; YResolution
+    cmp ax, [target_height]
+    jne .next_mode
+
+    mov al, [0x5200 + 0x19]        ; BitsPerPixel
+    cmp al, [best_found_bpp]
+    jbe .next_mode                 ; not an improvement over the current best
+
+    mov [best_found_bpp], al
+    mov ax, [cur_mode_num]
+    mov [best_found_mode], ax
+    jmp .next_mode
+
+.list_done:
+    mov ax, [best_found_mode]
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    cmp ax, 0xFFFF
+    je .not_found
+    clc
+    ret
+.not_found:
+    stc
+    ret
+
 vbe_init:
     ; This function will initialize the VBE (Video BIOS Extension) and return the address of the VBE control structure
     ; INT 10h AX=4FOOH - get VBE controller info
-    
+
     mov ax, 0x4F00           ; Get VBE controller information
     mov di, 0x5000           ; Address of VBE info buffer
     int 0x10                 ; Call BIOS video interrupt
     cmp ax, 0x004F           ; Check if the function returned successfully
-    jne .vbe_failed 
- 
+    jne .vbe_failed
+
+    mov word [selected_mode], 0x118   ; safe default; overwritten only on a confirmed match below
+
+    call edid_query
+    cmp word [native_width], 0
+    je .try_fallback_list
+    mov cx, [native_width]
+    mov dx, [native_height]
+    call find_mode_for_resolution
+    jc .try_fallback_list
+    mov [selected_mode], ax
+    jmp .mode_chosen
+
+.try_fallback_list:
+    mov si, fallback_resolutions
+.fallback_loop:
+    mov cx, [si]
+    or cx, cx
+    jz .mode_chosen              ; (0,0) terminator: nothing matched, keep the 0x118 default
+    mov dx, [si + 2]
+    push si
+    call find_mode_for_resolution
+    pop si
+    jnc .fallback_found
+    add si, 4
+    jmp .fallback_loop
+.fallback_found:
+    mov [selected_mode], ax
+
+.mode_chosen:
     ; This function will get the mode information for the VBE mode specified by the parameter
     ; INT 10h AX=4F01 - get VBE mode info
-                     
+
     mov ax, 0x4F01           ; Get VBE mode information
-    mov cx, 0x118            ; Mode
+    mov cx, [selected_mode]  ; Mode (0x118, or whatever was found above)
     mov di, 0x5200        ; Address of VBE mode info buffer
     int 0x10                 ; Call BIOS video interrupt
     cmp ax, 0x004F           ; Check if the function returned successfully
-    jne .vbe_failed    
+    jne .vbe_failed
 
 
     ; Set up the VBE mode
     ; INT 10h AX=4F02 - set VBE mode
 
     mov ax, 0x4F02           ; Set VBE mode
-    mov bx, 0x118 | 0x4000  ; Mode 
+    mov bx, [selected_mode]
+    or bx, 0x4000            ; LFB flag
     mov esi, 0x6000          ; Address of VBE mode info buffer
     int 0x10                 ; Call BIOS video interrupt
     cmp ax, 0x004F           ; Check if the function returned successfully
-    jne .vbe_failed 
+    jne .vbe_failed
 
 
 

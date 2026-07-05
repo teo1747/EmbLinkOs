@@ -31,15 +31,17 @@ Proof:
 
 ## Docs synced
 
-- [ ] `PROJECT_STATUS.md` updated if a phase completed or state changed
-- [ ] `ARCHITECTURE.md` updated if a design decision landed or a 🎯 became ✅
-- [ ] `TODO.md` updated — new gaps added, closed items removed
+- [ ] `docs/PROJECT_STATUS.md` updated if a phase completed or state changed
+- [ ] `docs/ARCHITECTURE.md` (and the relevant `docs/architecture/*.md` spec,
+      if one exists for this subsystem) updated if a design decision landed
+      or a 🎯 became ✅
+- [ ] `docs/TODO.md` updated — new gaps added, closed items removed
 
 ## Known gaps left behind
 
 <!-- EmbLinkOs discipline: name what this DOESN'T handle rather than pretend it's
      complete. What's the next thing that will have to deal with the loose end?
-     (These become TODO.md entries.) -->
+     (These become docs/TODO.md entries.) -->
 
 ## Commit hygiene
 
