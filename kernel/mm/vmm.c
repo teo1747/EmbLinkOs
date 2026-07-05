@@ -394,3 +394,71 @@ uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
     // Return the virtual address of the first page
     return virt_base + offset;
 }
+
+// Bump pointer for kernel-stack VA allocation.
+//
+// This MUST land in a PML4 slot that's already populated in the kernel's own
+// page tables before the *first* process address space is ever created:
+// vmm_create_address_space() shares the kernel half by copying PML4 entries
+// *by value* at creation time (kernel_pml4.c: `pml4[i] = kernel_pml4[i]` for
+// i in [256,512)) — a one-time snapshot, not a live reference. A PML4 slot
+// that's still empty (not-present) at that moment copies as not-present
+// forever, even after the kernel's own table later fills it in; a region
+// carved out of genuinely fresh address space (tried first: a dedicated
+// 0xFFFFB0... base) hits exactly this — the first process's own stack
+// mapping, created moments after its address space snapshot, is invisible
+// in its own page tables. #PF on first touch, which then can't even push
+// its own fault frame (same unmapped region backs TSS.RSP0) -> #DF.
+//
+// Fix: reuse MMIO_BASE's PML4 slot instead of a new one. HPET/LAPIC/IOAPIC/
+// the framebuffer all call vmm_map_mmio() during early boot, long before any
+// process exists, which guarantees that slot is already present by the time
+// the first vmm_create_address_space() runs. Offset well clear (256 GiB in,
+// out of the 512 GiB one PML4 entry spans) of where the actual MMIO bump
+// allocator grows (a few hundred KB at most).
+#define KSTACK_REGION_BASE (MMIO_BASE + (1ULL << 38))
+static uint64_t kstack_next_virt = KSTACK_REGION_BASE;
+
+uint64_t vmm_alloc_kernel_stack(uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Reserve a guard page, then the stack pages right above it. The guard
+    // page is deliberately left unmapped: a stack that overflows downward
+    // walks straight into it and takes a #PF at the overflow site instead of
+    // silently corrupting whatever memory used to sit there.
+    uint64_t guard_virt = kstack_next_virt;
+    uint64_t stack_base_virt = guard_virt + PAGE_SIZE;
+    kstack_next_virt = stack_base_virt + (pages * PAGE_SIZE);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) {
+            serial_write_string("FATAL: vmm_alloc_kernel_stack: out of physical memory\n");
+            return 0;
+        }
+        uint64_t virt = stack_base_virt + (i * PAGE_SIZE);
+        if (vmm_map(virt, phys, VMM_WRITABLE | VMM_NX) < 0) {
+            serial_write_string("FATAL: vmm_alloc_kernel_stack: vmm_map failed\n");
+            pmm_free_page(phys);
+            return 0;
+        }
+    }
+
+    return stack_base_virt + (pages * PAGE_SIZE);  // top of stack (RSP seed)
+}
+
+void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t stack_base_virt = stack_top - (pages * PAGE_SIZE);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t virt = stack_base_virt + (i * PAGE_SIZE);
+        uint64_t phys = vmm_get_phys(virt);
+        if (phys) {
+            pmm_free_page(phys);
+        }
+        vmm_unmap(virt);
+    }
+    // The VA range (including the guard page below it) is intentionally not
+    // reclaimed — same bump-allocator trade-off vmm_map_mmio already makes.
+}

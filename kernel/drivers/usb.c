@@ -195,3 +195,64 @@ const struct usb_controller *usb_get_controller(uint32_t index) {
     }
     return &g_usb_controllers[index];
 }
+
+/* Selftest: cross-references the USB controller table against a fresh PCI
+ * scan of class 0x0C/subclass 0x03 (Serial Bus/USB) devices — the exact
+ * criterion usb_discover_controllers() uses — and asserts every one of
+ * them was classified into a real HC kind (not USB_HC_UNKNOWN) and, if it
+ * has a usable MMIO BAR0, actually initialized.
+ *
+ * This is deliberately independent of which HC generation or device (if
+ * any) happens to be attached in a given QEMU config: it's a falsifiable
+ * assertion about the discovery/classification path itself (real code that
+ * could regress — e.g. if the prog_if -> kind mapping broke), not about
+ * live data transfer. HID/mass-storage transfer correctness per HC
+ * generation was verified manually against real device attachments this
+ * session (`make run-usb-uhci`/`-ohci`/`-ehci`/`-xhci`) — see docs/TODO.md's
+ * "no automated selftest for the display or USB stack" entry; this closes
+ * only the discovery-layer half of that gap. */
+int usb_run_selftests(void) {
+    uint32_t pci_usb_devices = 0;
+    for (uint32_t i = 0; i < pci_devices_count(); i++) {
+        const struct pci_device *dev = pci_get_device(i);
+        if (dev && dev->class_code == 0x0C && dev->subclass == 0x03) {
+            pci_usb_devices++;
+        }
+    }
+
+    if (pci_usb_devices != g_usb_controller_count) {
+        kprintf("usb_run_selftests: PCI shows %u USB controller(s), "
+                "usb_init() discovered %u\n",
+                (unsigned int)pci_usb_devices,
+                (unsigned int)g_usb_controller_count);
+        return -1;
+    }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < g_usb_controller_count; i++) {
+        const struct usb_controller *ctrl = &g_usb_controllers[i];
+        if (ctrl->kind == USB_HC_UNKNOWN) {
+            kprintf("usb_run_selftests: controller %u:%u.%u has unrecognized "
+                    "prog_if %x\n",
+                    (unsigned int)ctrl->pci.bus, (unsigned int)ctrl->pci.device,
+                    (unsigned int)ctrl->pci.function,
+                    (unsigned int)ctrl->pci.prog_if);
+            ok = false;
+            continue;
+        }
+        // A UHCI controller legitimately has no MMIO BAR0 (its registers are
+        // I/O-port based, in BAR4) — every other kind needs one to init at all.
+        bool should_init = (ctrl->kind == USB_HC_UHCI) || ctrl->bar0.valid;
+        if (should_init && !ctrl->initialized) {
+            kprintf("usb_run_selftests: controller %u:%u.%u (%d) failed to "
+                    "initialize\n",
+                    (unsigned int)ctrl->pci.bus, (unsigned int)ctrl->pci.device,
+                    (unsigned int)ctrl->pci.function, (int)ctrl->kind);
+            ok = false;
+        }
+    }
+
+    kprintf("usb_run_selftests: %u controller(s) cross-checked against PCI\n",
+            (unsigned int)g_usb_controller_count);
+    return ok ? 0 : -1;
+}

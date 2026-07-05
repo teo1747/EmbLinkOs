@@ -197,16 +197,27 @@ left to do.
 ## Drivers — Display / Console
 
 ### Framebuffer / VBE
-- [ ] Real-mode VBE path still hardcoded to mode 0x118 (1024×768×24) in stage2;
-  only reached when no GPU driver claims the display. Proper selection:
-  1. EDID query (INT 10h AX=4F15h BL=01h), parse detailed timing descriptor 1
-     for native resolution; fall back gracefully if unavailable.
-  2. Enumerate VBE modes (VbeModeListPtr in VBEInfoBlock @ 0x0E; 0xFFFF-
-     terminated uint16 array; call 4F01h per mode for ModeInfoBlock).
-  3. Filter + score: require supported + graphics + LFB + direct-color
-     (MemoryModel 6); score by closeness to native; prefer 32 > 24 > 16 bpp.
-  4. Fallback chain: 1920×1080 → 1280×1024 → 1024×768 → 800×600 → 640×480,
-     final fallback text mode at 0xB8000.
+- [x] ~~Real-mode VBE path hardcoded to mode 0x118~~ — done: `stage2.asm`'s
+  `vbe_init` now does EDID query (INT 10h AX=4F15h BL=01h, Detailed Timing
+  Descriptor #1 for native resolution) → exact-match search through the
+  enumerated VBE mode list (`VideoModePtr` at VBE Info Block offset 0x0E,
+  `find_mode_for_resolution` requiring ModeAttributes
+  {supported, graphics, LFB} and MemoryModel 6/direct-color, preferring
+  higher bpp among matches) → a fixed fallback list (1920×1080 → 1280×1024
+  → 1024×768 → 800×600 → 640×480) → the original hardcoded mode 0x118 if
+  literally nothing else worked. `selected_mode` defaults to 0x118 and is
+  only ever overwritten by a mode `find_mode_for_resolution` actually
+  confirmed exists, so any bug in the new EDID/enumeration path degrades to
+  exactly the old behavior rather than something worse — deliberate, since
+  stage2 has no serial debugging to fall back on if real-mode BIOS calls
+  misbehave. Verified in QEMU with `-vga cirrus` (a device neither
+  `bochs_vbe.c` nor `virtio_gpu.c` claims, so this path actually runs):
+  picked 1280×1024×16bpp from the fallback list (Cirrus doesn't support
+  32/24bpp direct-color there), rendering verified correct via screendump.
+  Remaining: no scoring by "closest to native" when an EXACT resolution
+  match isn't found (only the fixed fallback list is tried in that case);
+  no final text-mode-at-0xB8000 fallback if VBE itself is entirely absent
+  (still `.vbe_failed` → hang, unchanged from before).
   - Refs: VBE 3.0 (Function 15h DDC), EDID 1.4 (VESA E-EDID).
 - [ ] UEFI GOP path (modern alternative to VBE; needs the UEFI bootloader).
 - [x] ~~GPU acceleration~~ — done: `gpu.c` probes PCI for a GPU driver before
@@ -241,31 +252,53 @@ All four generations now bring up their root ports and enumerate devices:
 QH/qTD schedule, periodic interrupt QHs, releases FS/LS ports to a
 companion), `uhci.c` (I/O BAR4, frame-list schedule), `ohci.c` (MMIO,
 ED/TD lists + HCCA periodic table). `usb_core.c` is the shared HCD-agnostic
-layer: enumeration, a HID boot-keyboard driver (with shift map), and a
-mass-storage BOT/SCSI driver that registers block devices. Legacy HCs are
-polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
+layer: enumeration, a HID boot-keyboard driver (with shift map), a
+mass-storage BOT/SCSI driver that registers block devices, and hub support
+(below). Legacy HCs are polled from the main loop (`usb_poll`); xHCI stays
+interrupt-driven.
 
-- [ ] No hub support on the legacy HCs (UHCI/OHCI/EHCI) — a hub interface is
-  detected and logged but its downstream ports are never enumerated. xHCI
-  has the same gap (see `xhci-dma-uses-virtual-addresses` notes: only the
-  first device enumerates).
+- [x] ~~No hub support on the legacy HCs~~ — done for UHCI/OHCI/EHCI:
+  `usb_core.c`'s `usb_hub_attach` fetches the class-specific hub descriptor
+  (port count), then for each port does power-on + reset + status read
+  (mirroring each HCD's own root-port scan, just through class-specific hub
+  requests instead of native port registers) and enumerates whatever's
+  connected — single level only, with a depth guard against a malformed/
+  looping topology. Verified in QEMU: a keyboard behind a `usb-hub` on UHCI
+  enumerates and works (`addr 2`, boot keyboard ready). Deliberately NOT
+  covered: xHCI (separate legacy code path, not `usb_core.c` — still just
+  logs "USB Hub detected" and stops, matching its pre-existing "only the
+  first device enumerates" limitation) and full/low-speed devices behind a
+  high-speed EHCI hub (needs a Transaction Translator, EHCI spec §4.14 — a
+  genuinely separate, larger feature; only same-speed downstream devices
+  are enumerated). Both are documented gaps, not silent ones.
 - [ ] No isochronous transfers (audio/video class devices unsupported).
 - [ ] No USB3/SuperSpeed on xHCI beyond what already worked before this
   change — streams, bursting, and the SuperSpeedPlus descriptors are unused.
 - [ ] Static per-controller-type tables (`UHCI_MAX_HC`/`OHCI_MAX_HC`/
   `EHCI_MAX_HC` = 2, `USB_MAX_DEVICES` = 16) — fine for QEMU testing, will
   need to become dynamic for real hardware with many devices.
-- [ ] Root ports are scanned once at boot; no hot-plug (connect-status-change
-  interrupt) handling on the legacy HCs.
+- [ ] Root ports (and now hub ports) are scanned once at boot; no hot-plug
+  (connect-status-change interrupt) handling anywhere in the USB stack.
 - [ ] EHCI/UHCI/OHCI control and bulk transfers are synchronous busy-polls
   (bounded by a spin-count timeout, not wall-clock) — fine for boot-time
   enumeration, would stall the kernel if called after multitasking exists.
-- [ ] No automated selftest for the display or USB stack — verification so
-  far is manual QEMU screendumps + serial-log inspection per HC generation.
-  A `test usb` / `test gpu` selftest command (see `selftests.c`'s existing
-  `test <name>` pattern) should assert something concrete: e.g. a specific
-  known-good `usb-storage` block's contents round-trip through the MSC
-  read/write path, or a fill_rect + read-back matches the expected pixels.
+  (Multitasking now exists — see Process & Scheduling below — but nothing
+  currently calls into USB from more than one process at a time, so this
+  hasn't bitten yet; revisit before that changes.)
+- [x] ~~No automated selftest for the display or USB stack~~ — partially
+  done: `test usb` (`usb_run_selftests`, `usb.c`) cross-checks the USB
+  controller table against a fresh PCI class 0x0C/subclass 0x03 scan and
+  asserts every discovered controller was classified into a real HC kind
+  and (if it has a usable BAR) actually initialized — deliberately
+  independent of which HC/device happens to be attached, a real assertion
+  about the discovery/classification code path itself. `test gpu`
+  (`fb_run_selftests`, `framebuffer.c`) draws known primitives
+  (`fb_fill_rect`, `fb_copy_rect`) and asserts exact colors read back via
+  `fb_get_pixel`, exercising the actual color pack/unpack path for whatever
+  mode is active. Neither covers live HID/mass-storage data transfer or
+  actual on-screen/on-host rendering — those are still manual-QEMU-only
+  (screendumps + serial-log inspection per HC generation, done this
+  session for UHCI/OHCI/EHCI/xHCI and Bochs DISPI/VirtIO-GPU).
 
 ---
 
@@ -316,12 +349,21 @@ polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
   normalized path). Fine for the single "/" mount.
 
 ### File descriptors
-- [ ] fd table is fixed (64), global, per-boot. No per-process fd tables and no
-  open-file-description sharing (fork / dup / dup2) — arrives with processes.
-  The open-file-description vs fd distinction (shared cursor across dup'd fds)
-  isn't modeled yet; each fd entry currently owns its own cursor.
-- [ ] g_fds is unlocked global mutable state — needs a lock under SMP /
-  preemption (same note as the open-ref and mount tables).
+- [x] ~~fd table is fixed (64), global, per-boot. No per-process fd tables~~ —
+  done: `struct fd_entry` moved to `kernel/fs/fd.h` (public) and `struct
+  process` now embeds `struct fd_entry fds[FD_MAX_OPEN]`. `fd.c` picks the
+  table via a `fd_table()` helper — `current_process->fds` if there is a
+  current process, else a boot-time-only `g_boot_fds` (preserves the
+  existing pre-process `test ring3`/selftest behavior that runs before any
+  process exists). Verified via QEMU: two spawned processes opening
+  different files see independent fd numbering/state, no cross-talk.
+  Open-file-description sharing (fork / dup / dup2, shared cursor across
+  dup'd fds) is still NOT modeled — each fd entry still owns its own
+  cursor; only isolation between processes was added, not fd aliasing
+  within one.
+- [ ] g_boot_fds / per-process fds arrays are unlocked mutable state — needs
+  a lock once syscalls from the same process can race (e.g. real SMP; today
+  preemption exists but a single process only runs one syscall at a time).
 - [ ] O_TRUNC reserved but not honored (blocked on the VFS truncate op above).
 - [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
   stat per write, and a TOCTOU window if writes can race. Acceptable while
@@ -349,16 +391,20 @@ polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
 - [x] Interrupts live during user execution (no CLI mask); IRQs pre-enabled
   before entering ring 3.
 
-### Security — user-pointer validation (HIGH, the real hole)
-- [ ] `sys_write` dereferences a raw user pointer (rsi) with NO validation. A
-  ring-3 caller can pass a KERNEL address → the kernel reads/prints kernel
-  memory, or faults. This is the canonical syscall vuln class (missing
-  copy_from_user / access_ok).
-  - FIX: copy_from_user / copy_to_user with an access_ok-style range check
-    (pointer + len lies entirely within this process's user VA range, and is
-    mapped). Blocked on per-process address spaces — there's no "this process's
-    user range" to check against until then. Becomes mandatory the moment
-    untrusted programs run.
+### Security — user-pointer validation (HIGH, the real hole) — DONE
+- [x] ~~`sys_write` dereferences a raw user pointer with NO validation~~ — done:
+  `kernel/cpu/usercopy.c/h` adds `access_ok(ptr, len)` (checks the range is
+  below the canonical low-half boundary `0x0000800000000000` and every page
+  in it is actually mapped in `current_process->pml4_phys` via
+  `vmm_get_phys_in`), plus `copy_from_user`/`copy_to_user` (access_ok +
+  memcpy, `-EMBK_EFAULT` on failure) and `copy_string_from_user` (bounded,
+  byte-at-a-time, for path arguments). Wired into every syscall that takes a
+  user buffer or path (`sys_write`, `sys_read`, `sys_open`, `sys_stat`,
+  `sys_readdir`, `sys_spawn`). Verified with a temporary test in
+  `user/init.c`: a normal buffer round-trips correctly, and a deliberately
+  bad pointer (a kernel address) is rejected with `-EMBK_EFAULT` instead of
+  being dereferenced — confirmed via QEMU, then the test scaffold was
+  reverted.
 
 ### Userspace loader
 - [x] elf_load partial-load cleanup now happens by loading into a fresh
@@ -372,24 +418,41 @@ polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
   Embedded-blob path removed.
 
 ### Syscall transport
-- [x] `int 0x80` (software gate) implemented: dispatch table (write=1, exit=2).
+- [x] `int 0x80` (software gate) implemented: dispatch table now has 12 calls
+  — write=1, exit=2, yield=3, open=4, close=5, read=6, lseek=7, stat=8,
+  readdir=9, spawn=10, wait=11, getpid=12.
 - [ ] Fast path `syscall`/`sysret` deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE,
   AND swapgs + a per-CPU GS base for the kernel-stack switch (syscall does NOT
   switch stacks via the TSS). Wants per-CPU/SMP infra. GDT already laid out user
   data-before-code for it.
-- [ ] Syscall table: wire the fd/VFS syscalls — open/read/write/close/lseek/stat/readdir —
-  straight through to vfs_open / vfs_fd_read / … so ring 3 can do real file I/O
-  (depends on user-pointer validation above for read/write buffers).
-- [ ] `sys_write` is serial-only and ignores fd. Route through the fd layer
-  once the fd syscalls land (fd 1 = stdout, etc.).
+- [x] ~~Syscall table: wire the fd/VFS syscalls~~ — done: `sys_open`,
+  `sys_close`, `sys_read`, `sys_lseek`, `sys_stat`, `sys_readdir` (via a
+  callback-based `sys_readdir_cb` walking `vfs_readdir`, filling a
+  `struct sys_dirent { ino, type, name[59] }` per entry) all go straight
+  through to the existing `vfs_*`/`vfs_fd_*` layer, guarded by
+  `copy_from_user`/`copy_to_user`/`copy_string_from_user` (see
+  user-pointer validation above).
+- [x] ~~`sys_write` is serial-only and ignores fd~~ — done: fd==1 still goes
+  straight to serial (no fd-table round trip needed for the common case);
+  any other fd routes through `vfs_fd_write` via a bounce buffer.
+- [x] Found bug (not on this list originally): `sys_exit` read the exit code
+  from `r->rax` (the syscall number — always 2) instead of `r->rdi` (the
+  actual argument), so every process's exit code was hardcoded to 2
+  regardless of what it passed. Fixed to read `r->rdi`; verified exit code
+  changes correctly (6 for `/init.elf`'s counter+bss-sum check).
+- [x] Found bug (not on this list originally): `int 0x80` is an interrupt
+  gate, so IF is auto-cleared for the entire syscall handler — any syscall
+  that waits on a hardware completion IRQ (e.g. disk I/O inside `sys_open`)
+  hung forever. Fixed by adding `sti` as the first instruction of
+  `syscall_dispatch()`.
 
 ### Ring-3 / TSS plumbing
 - [x] Ring-3 entry point: enter_user_mode() loads ELF, maps user stack,
   saves kernel context, enters ring 3 via iretq.
-- [ ] `tss_set_rsp0` exists but RSP0 is a single static kernel stack. Once
-  threads/processes exist, RSP0 must be updated on every context switch so an
-  interrupt taken in user mode lands on the CURRENT thread's kernel stack.
-  Deferred to the scheduler.
+- [x] ~~`tss_set_rsp0` exists but RSP0 is a single static kernel stack~~ — done:
+  `schedule()`/`process_start_first()` call `tss_set_rsp0(next->kstack_top)`
+  before every switch. See "Process & Scheduling" below for the subsystem
+  this now belongs to.
 
 ### Per-process address spaces
 - [x] vmm_destroy_address_space walks the user half, frees mapped frames and
@@ -398,6 +461,136 @@ polled from the main loop (`usb_poll`); xHCI stays interrupt-driven.
 - [x] Per-process PML4 (kernel half aliased 256/511, user half private);
   vmm_map_in/get_phys_in; late CR3 switch; higher-half p_vaddr rejected.
 
+---
+
+## Process & Scheduling
+
+Full phased spec, comparative analysis (Linux/Windows/BSD/XNU), and every bug
+below in detail: `docs/architecture/process-and-scheduling.md`. Current
+mechanism: a static `MAX_PROCESSES = 16` PCB table, timer-driven preemptive
+round-robin (100Hz LAPIC tick), wait queues for blocking, an uncatchable
+`process_kill`, and per-process fd tables. `process_create()` builds a fresh
+address space + page-mapped guarded kernel stack from an ELF path and
+fabricates a first context that lands in `process_trampoline`, which
+`iretq`s to ring 3. Phase B (see roadmap in the architecture doc) is now
+substantially complete.
+
+- [x] ~~Ring-3 entry `#GP` on every process start~~ — `process_trampoline`'s
+  inline-asm `iretq` frame pushed the literal `$2` instead of the `%2`
+  operand (the real `0x23` selector) for CS. Loading CS from the resulting
+  null-descriptor selector faulted immediately. Fixed.
+- [x] ~~`kstack_top` truncated to 16 bits~~ — `struct process::kstack_top` was
+  `uint16_t` but stored a 64-bit heap address; `tss_set_rsp0()` read the
+  truncated field. Would have corrupted RSP0 on the first ring-3 interrupt.
+  Now `uint64_t`. Fixed.
+- [x] ~~Zombie processes never reclaimed~~ — nothing transitioned
+  `PROCESS_ZOMBIE` back to `PROCESS_UNUSED`; after exactly `MAX_PROCESSES`
+  exits, `process_create` would fail forever. Fixed: `process_reap()`, deferred
+  one `schedule()` call behind the actual exit (can't free a stack still being
+  executed on). Not yet exercised in practice — `main.c` only ever creates one
+  process today, so the deferred-reap path has never actually fired; needs
+  either a second process or the `test sched reap` selftest below to prove it.
+- [x] ~~No kernel-stack guard page~~ — `alloc_kernel_stack` was a flat
+  `kmalloc`, silently corrupting whatever sat next to it on overflow. Fixed:
+  `vmm_alloc_kernel_stack`/`vmm_free_kernel_stack` page-map the stack with an
+  unmapped guard page directly below it.
+- [x] ~~Kernel-stack region invisible in the first process's own page
+  tables~~ — introduced *while fixing* the guard-page bug above: the new
+  region was placed in a PML4 slot untouched before boot.
+  `vmm_create_address_space()` shares the kernel half by copying PML4 entries
+  *by value* at creation time, not by live reference — a slot that's
+  not-present at that moment stays not-present in that process forever, even
+  after the kernel's own table fills it in moments later. `#PF` on first
+  touch, which can't even push its own fault frame (same region backs
+  `TSS.RSP0`) → `#DF`. Fixed by reusing `MMIO_BASE`'s already-populated PML4
+  slot (256 GiB in, clear of the real MMIO bump allocator) instead of a fresh
+  one.
+- [x] ~~No preemption~~ — done: `lapic_timer_handler` (`lapic.c`) now calls
+  `schedule()` after `lapic_send_eoi()`, at the existing 100Hz tick rate.
+  Genuine timer-driven round-robin, verified via `test sched roundrobin`
+  (two kthreads interleave without either calling `sys_yield`/`sys_exit`).
+- [x] ~~No blocking / wait queues~~ — done: `struct wait_queue { struct
+  process *head; }` plus an intrusive `wait_next` link on `struct process`.
+  `wait_queue_block()` marks the caller `PROCESS_BLOCKED`, links it in, and
+  calls `schedule()`; `wait_queue_wake_one`/`wait_queue_wake_all` unlink and
+  mark `PROCESS_READY`. Verified via `test sched roundrobin`'s blocking
+  variant.
+- [ ] No priority — strict round-robin, no bands, no aging/anti-starvation.
+- [x] ~~No uncatchable kernel-level kill~~ — done: `process_kill(pid)`
+  (`process.c`) forces `PROCESS_ZOMBIE` regardless of current state, unlinks
+  the target from any wait queue it's blocked on, and reaps it immediately
+  unless it's the currently-running process (in which case it defers via
+  the existing `g_pending_reap` mechanism, same as a normal exit). Matches
+  `docs/ARCHITECTURE.md` §3.3's requirement that a process which never
+  cooperates can still be stopped. Verified via `test sched kill`.
+- [x] ~~No per-process file descriptor table~~ — done, see "File
+  descriptors" under Filesystem above (`struct process::fds`, `fd_table()`
+  helper in `fs/fd.c`).
+- [x] ~~No `sys_wait`/`sys_spawn` syscalls~~ — done: `sys_spawn` calls
+  `process_create()` on a user-supplied path (via `copy_string_from_user`);
+  `sys_wait` busy-polls (`process_find` + `sys_yield`) until the target
+  hits `PROCESS_ZOMBIE`, then `process_reap()`s it and returns its exit
+  code. `sys_yield` is now wired to syscall number 3. Also added
+  `sys_getpid`. Verified via a temporary `user/init.c` scaffold: a parent
+  spawns a child, waits, and observes the child's real exit code; reverted
+  after verification.
+- [x] ~~`process_create`/`proc_alloc` both increment `next_pid`~~ — fixed:
+  removed the redundant `proc->pid = next_pid++` from `process_create()`;
+  `proc_alloc()` is now the sole assigner.
+- [x] ~~No automated selftest~~ — done: `test sched roundrobin`, `test sched
+  kill`, `test sched reap`, `test sched stackguard` (`process_test_*` in
+  `process.c`, wired into `selftests.c`), matching the four selftests
+  `docs/architecture/process-and-scheduling.md` §12 specifies. `reap` in
+  particular exercises the deferred-reap path noted above, which nothing
+  had actually triggered before (main.c previously only ever created one
+  process).
+- [ ] Single core only — `current_process` is one global pointer, not
+  per-CPU; no locking around the process table (fine until SMP or
+  preemption reentrancy exist — see the spec's Synchronization section for
+  what changes then). NOTE: preemption reentrancy now DOES exist
+  (timer-driven `schedule()` above) — this note is closer to load-bearing
+  than when it was written; the process table itself has held up so far
+  only because everything that mutates it currently runs with a single
+  logical CPU and interrupts are the only source of reentrancy (handled by
+  each ISR being non-reentrant, not by an explicit lock).
+
+### New bugs found while building preemption/syscalls/spawn (not on this list originally)
+- [x] **RFLAGS.IF corruption in context switch.** `kernel_ctx_switch`/
+  `kernel_ctx_save` (`kcontext.asm`) capture RFLAGS via `pushfq`/`pop rax`
+  and are always called from inside an interrupt-gate ISR (timer IRQ,
+  `int 0x80`), which auto-clears IF on entry — so the *live* flags always
+  read IF=0 at the capture point, regardless of the outgoing process's true
+  state. Saving that corrupted snapshot meant every resumed process came
+  back with interrupts permanently masked, hanging after its first
+  preemption. Found via `test sched roundrobin` (scheduler hung after one
+  cycle). Fixed by forcing `or rax, 0x200` (set IF) before storing to the
+  RFLAGS field in both functions — safe because reaching that save point at
+  all proves the process had IF=1 moments earlier (a maskable IRQ can't
+  fire with IF=0, and ring-3 can't execute cli/sti, it's privileged and
+  would #GP).
+- [x] **`int 0x80` leaves IF=0 for the whole syscall.** Same root cause as
+  above, different symptom: any syscall that blocks on a hardware
+  completion IRQ (disk I/O inside `sys_open`/`sys_read`/`sys_spawn`'s ELF
+  load) hung forever because the IRQ that would satisfy it could never
+  fire. Found while verifying file I/O syscalls. Fixed with `sti` as the
+  first instruction of `syscall_dispatch()`.
+- [x] **`proc_alloc()` race between allocation and initialization.** Found
+  while verifying `sys_spawn`: with real preemption now active, a second
+  `process_create()` call (from a live syscall context) could be preempted
+  mid-setup during its slow ELF-load disk I/O — but `proc_alloc()` had
+  already marked the new slot `PROCESS_READY` immediately, so the scheduler
+  could pick a half-initialized PCB (no pml4/kstack/ctx yet) and crash.
+  Fixed: `proc_alloc()` now marks the slot `PROCESS_BLOCKED` instead;
+  `process_create()`'s own final step is the only place that sets
+  `PROCESS_READY`, after everything is actually built.
+- [x] **PCB leak on `process_create()` error paths.** Found via code review
+  while fixing the race above: none of the four early-return failure paths
+  (address-space creation, ELF load, user-stack alloc, kernel-stack alloc)
+  reset `proc->state` back to `PROCESS_UNUSED`, so a failed `process_create`
+  permanently leaked the PCB slot. Fixed by adding the reset to all four
+  paths.
+
+---
 
 ## Core / Library
 

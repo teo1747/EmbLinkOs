@@ -5,6 +5,7 @@
 #include "../mm/pmm.h"
 #include "../include/kstring.h"
 #include "../include/kmalloc.h"
+#include "../include/kprintf.h"
 #include <stdint.h>
 #include "font_8x16.h"
 
@@ -493,4 +494,52 @@ const fb_info_t *fb_get_info(void) {
 
 uint8_t *fb_get_buffer(void) {
     return fb_draw;
+}
+
+/* Selftest: draws known primitives, then reads them back via fb_get_pixel
+ * and asserts the exact color — a real, falsifiable assertion (not "it
+ * didn't crash"), and one that exercises the actual color pack/unpack path
+ * for whatever mode is currently active (16/24/32bpp, RGB or BGR).
+ *
+ * Test colors are pure primaries (each channel either 0x00 or 0xFF) so the
+ * round trip is lossless at every supported bit depth, including 16bpp's
+ * 5-6-5 truncation — this test is about drawing correctness, not color
+ * precision, so precision loss shouldn't be able to fail it.
+ *
+ * This only covers software drawing correctness. It does not verify actual
+ * on-screen/on-host output (Bochs DISPI modeset, VirtIO-GPU accelerated
+ * scan-out) — those were verified manually via QEMU screendumps this
+ * session; see docs/TODO.md's "no automated selftest for the display or
+ * USB stack" entry, which this closes only the software-drawing half of. */
+int fb_run_selftests(void) {
+    const fb_info_t *info = fb_get_info();
+    if (info->width < 32 || info->height < 16) {
+        kprintf("fb_run_selftests: resolution too small to test (%ux%u)\n",
+                (unsigned int)info->width, (unsigned int)info->height);
+        return -1;
+    }
+
+    bool ok = true;
+
+    // Two adjacent 16x16 squares, red then green — also checks the boundary
+    // column on each side doesn't bleed into the other.
+    fb_fill_rect(0, 0, 16, 16, FB_RGB(255, 0, 0));
+    fb_fill_rect(16, 0, 16, 16, FB_RGB(0, 255, 0));
+
+    ok = ok && (fb_get_pixel(5, 5)   == FB_RGB(255, 0, 0));
+    ok = ok && (fb_get_pixel(15, 5)  == FB_RGB(255, 0, 0));   // last red column
+    ok = ok && (fb_get_pixel(16, 5)  == FB_RGB(0, 255, 0));   // first green column
+    ok = ok && (fb_get_pixel(20, 5)  == FB_RGB(0, 255, 0));
+
+    // fb_copy_rect: overwrite the red square with a copy of the green one.
+    fb_copy_rect(0, 0, 16, 0, 16, 16);
+    ok = ok && (fb_get_pixel(5, 5) == FB_RGB(0, 255, 0));
+
+    // Restore the touched area (cosmetic best-effort, not part of the test).
+    fb_fill_rect(0, 0, 32, 16, FB_RGB(0, 0, 0));
+    fb_present();
+
+    kprintf("fb_run_selftests: fill_rect/get_pixel/copy_rect round-trip %s\n",
+            ok ? "OK" : "FAIL");
+    return ok ? 0 : -1;
 }

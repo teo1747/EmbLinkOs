@@ -10,12 +10,13 @@ assignees: ''
 ## What to build
 
 <!-- The component, and where it sits in the stack / roadmap (see
-     ARCHITECTURE.md §2, §5). -->
+     docs/ARCHITECTURE.md §2, §5). -->
 
 ## Why / what it unblocks
 
 <!-- What's blocked or missing without it? If there's a design fork, note the
-     alternatives — the decision gets recorded in ARCHITECTURE.md. -->
+     alternatives — the decision gets recorded in docs/ARCHITECTURE.md (or a
+     docs/architecture/*.md subsystem spec, for anything substantial). -->
 
 ## Concept first
 
@@ -37,6 +38,6 @@ assignees: ''
 
 ## Docs to update on completion
 
-- [ ] `PROJECT_STATUS.md` (phase status)
-- [ ] `ARCHITECTURE.md` (🎯 → ✅, or a decision recorded)
-- [ ] `TODO.md` (close the item)
+- [ ] `docs/PROJECT_STATUS.md` (phase status)
+- [ ] `docs/ARCHITECTURE.md` (🎯 → ✅, or a decision recorded)
+- [ ] `docs/TODO.md` (close the item)

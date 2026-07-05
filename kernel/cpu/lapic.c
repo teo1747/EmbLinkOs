@@ -127,7 +127,19 @@ void lapic_timer_init(uint8_t vector) {
 
 void lapic_timer_handler(void){
     lapic_ticks++; // Increment the LAPIC timer tick count
-    lapic_send_eoi(); // Acknowledge the timer interrupt
+    lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
+                      // below, so the LAPIC can keep delivering interrupts to
+                      // whichever process ends up running next.
+
+    /* Timer-driven preemption (docs/architecture/process-and-scheduling.md
+     * §13 Phase B): give every READY process a turn every tick (100 Hz, a
+     * 10 ms quantum) even if the current one never calls sys_yield/sys_exit.
+     * schedule() is a cheap no-op if there's no process yet (current_process
+     * == NULL) or nothing else is runnable — same mechanism sys_exit already
+     * uses to reach a different process's saved context via
+     * kernel_ctx_switch, just triggered by the timer instead of a syscall. */
+    extern void schedule(void);
+    schedule();
 }
 
 uint64_t lapic_timer_get_ticks(void) {

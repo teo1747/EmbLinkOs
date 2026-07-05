@@ -84,4 +84,9 @@ const fb_info_t  *fb_get_info(void);
 // Get the virtual address of the DRAW target (backbuffer if double buffered)
 uint8_t *fb_get_buffer(void);
 
+// Selftest: draws known primitives and reads them back, asserting exact
+// colors. Returns 0 on success, -1 on failure. Software drawing correctness
+// only — see framebuffer.c's comment on the function.
+int fb_run_selftests(void);
+
 #endif /* _FRAMEBUFFER_H_ */

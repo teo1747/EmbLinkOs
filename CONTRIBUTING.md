@@ -7,9 +7,11 @@ project stays coherent and every change is something you could rebuild and
 explain.
 
 If you're returning to this after time away, or picking it up fresh, start by
-reading **`ARCHITECTURE.md`** (the intended design and the decisions behind it),
-then **`PROJECT_STATUS.md`** and **`TODO.md`** (what's actually built vs. what's
-left). The repo is ground truth; the docs describe intent.
+reading **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** (the intended design
+and the decisions behind it — plus per-subsystem deep dives under
+`docs/architecture/`), then **[`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md)**
+and **[`docs/TODO.md`](docs/TODO.md)** (what's actually built vs. what's left).
+The repo is ground truth; the docs describe intent.
 
 ## The core principle
 
@@ -28,7 +30,8 @@ proves it does the thing it claims."
    *first*. Cite it in comments and the PR.
 2. **Justify the decision.** Don't skip the "why." At a fork, say why this
    approach over the alternatives. Design decisions get recorded in
-   `ARCHITECTURE.md`, not lost in a commit body.
+   `docs/ARCHITECTURE.md` (or a `docs/architecture/*.md` subsystem spec for
+   anything substantial), not lost in a commit body.
 3. **Write it, one piece at a time.** Go slow. A subsystem is built and
    verified incrementally, not dumped in whole. Isolate the one new concept
    from the plumbing around it.
@@ -64,10 +67,11 @@ for the right reason.
 
 Documentation drift is the default failure mode. Update, in the same change:
 
-- **`PROJECT_STATUS.md`** — when a phase completes or the build state changes.
-- **`ARCHITECTURE.md`** — when a design decision lands, or a planned item
-  (🎯) becomes built (✅).
-- **`TODO.md`** — add gaps the change leaves behind; remove items it closes.
+- **`docs/PROJECT_STATUS.md`** — when a phase completes or the build state changes.
+- **`docs/ARCHITECTURE.md`** (and the relevant `docs/architecture/*.md` spec,
+  if one exists for that subsystem) — when a design decision lands, or a
+  planned item (🎯) becomes built (✅).
+- **`docs/TODO.md`** — add gaps the change leaves behind; remove items it closes.
 
 Naming what a change *doesn't* handle is part of the discipline. A known,
 tracked limitation is fine; a silent one is a trap for whoever hits it next.
@@ -85,9 +89,9 @@ hardware changes, docs synced, and gaps left behind. Fill it honestly — the
   SMP-safe where it's cheap (avoid hidden global mutable state; prefer passing
   state explicitly over stashing it in a global).
 - **Kernel:** higher half at `0xFFFFFFFF80100000`. Boot is a custom two-stage
-  BIOS bootloader (UEFI is on `TODO`).
+  BIOS bootloader (UEFI is on `docs/TODO.md`).
 - **Diverge from Unix only with a concrete technical justification** (see
-  `ARCHITECTURE.md` §3). Bless the clean native primitive; provide the
+  `docs/ARCHITECTURE.md` §3). Bless the clean native primitive; provide the
   compatible one as an opt-in layer.
 - **Formatting:** `%lu`/`%lx` for 64-bit in `kprintf`, `%08X` (cast) for 32-bit.
 - **No `-Wall` in build flags** (it fights the packed-struct access the on-disk

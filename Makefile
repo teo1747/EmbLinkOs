@@ -31,6 +31,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/cpu/spinlock.c \
              kernel/cpu/rwlock.c \
              kernel/cpu/syscall.c \
+             kernel/cpu/usercopy.c \
              kernel/cpu/lapic.c \
              kernel/cpu/ioapic.c \
 			 kernel/cpu/usermode.c \

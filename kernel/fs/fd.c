@@ -3,42 +3,45 @@
 #include "../include/errno.h"
 #include "../include/kprintf.h"
 #include "../include/kstring.h"
+#include "../process/process.h"
 #include <stdint.h>
 
 
 
-/* Fds 0/1/2 are reserved for stdin, stdout, stderr, so returned fds start at
- * FD_BASE and map to slot (fd - FD_BASE). */
+/* Boot-time fd table: used only while current_process is NULL (early boot,
+ * before any real process exists -- e.g. `test fd`/`test ring3` selftests
+ * and enter_user_mode()'s legacy path, all of which run at that point).
+ * Once a real process exists, every fd operation uses ITS OWN
+ * current_process->fds table instead -- see fd_table() below. This keeps
+ * every pre-existing caller working unchanged while giving real processes
+ * genuine per-process fd isolation (docs/architecture/process-and-
+ * scheduling.md's "no per-process fd table" gap, now closed). */
+static struct fd_entry g_boot_fds[FD_MAX_OPEN];
 
-#define FD_BASE 3
-#define FD_MAX_OPEN 64
-
-
-struct fd_entry {
-    bool used;
-    struct vnode vn;
-    uint64_t pos;
-    int flags;
-};
-
-static struct fd_entry g_fds[FD_MAX_OPEN];
+/* The fd table THIS call should operate on: the calling process's own table
+ * if one exists, else the shared boot-time table. */
+static struct fd_entry *fd_table(void)
+{
+    return current_process ? current_process->fds : g_boot_fds;
+}
 
 void vfs_fd_init(void)
 {
+    struct fd_entry *fds = fd_table();
     for (int i = 0; i < FD_MAX_OPEN; i++) {
-        g_fds[i].used = false;
-        g_fds[i].pos = 0;
-        g_fds[i].flags = 0;
+        fds[i].used = false;
+        fds[i].pos = 0;
+        fds[i].flags = 0;
     }
 }
 
-/* Map an fd to its live table entry. */
+/* Map an fd to its live table entry (in the CALLING process's own table). */
 static struct fd_entry *fd_lookup(int fd)
 {
     if (fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN)
         return NULL;
 
-    struct fd_entry *e = &g_fds[fd - FD_BASE];
+    struct fd_entry *e = &fd_table()[fd - FD_BASE];
     if (!e->used)
         return NULL;
 
@@ -173,9 +176,10 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         return err;
     }
 
+    struct fd_entry *fds = fd_table();
     int fd = -1;
     for (int i = 0; i < FD_MAX_OPEN; i++) {
-        if (!g_fds[i].used) {
+        if (!fds[i].used) {
             fd = i + FD_BASE;
             break;
         }
@@ -189,16 +193,16 @@ int vfs_open(const char *path, int flags, uint32_t mode)
             return err;
     }
 
-    g_fds[fd - FD_BASE].used = true;
-    g_fds[fd - FD_BASE].vn = vn;
-    g_fds[fd - FD_BASE].pos = 0;
-    g_fds[fd - FD_BASE].flags = flags;
+    fds[fd - FD_BASE].used = true;
+    fds[fd - FD_BASE].vn = vn;
+    fds[fd - FD_BASE].pos = 0;
+    fds[fd - FD_BASE].flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            g_fds[fd - FD_BASE].pos = st.size;
+            fds[fd - FD_BASE].pos = st.size;
     }
 
     return fd;
