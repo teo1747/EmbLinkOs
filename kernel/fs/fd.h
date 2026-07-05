@@ -20,6 +20,19 @@
 #define O_TRUNC      0x0200  /* reserved (needs a truncate op)*/
 #define O_APPEND     0x0400  /* reserved  (write is cursor-driven for now)*/
 
+/* Fds 0/1/2 are reserved for stdin, stdout, stderr, so returned fds start at
+ * FD_BASE and map to slot (fd - FD_BASE). Public (not fd.c-local) because
+ * struct process (process.h) embeds a table of these -- each process gets
+ * its own fd namespace rather than sharing one global table. */
+#define FD_BASE 3
+#define FD_MAX_OPEN 64
+
+struct fd_entry {
+    bool used;
+    struct vnode vn;
+    uint64_t pos;
+    int flags;
+};
 
 void vfs_fd_init(void);
 

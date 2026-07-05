@@ -63,4 +63,18 @@ void vmm_switch_address_space(uint64_t pml4_phys);
 
 uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) ;
 
+// Allocate a kernel-mode stack of `size` bytes (rounded up to a whole number
+// of pages) with one unmapped guard page immediately below it, so a stack
+// overflow faults immediately instead of silently corrupting whatever memory
+// happens to sit below it (as a plain kmalloc'd stack would). Returns the
+// virtual address of the TOP of the stack (the seed value for RSP — x86
+// stacks grow down), or 0 on failure. VA space is bump-allocated and not
+// reclaimed (same simplification as vmm_map_mmio); only the backing physical
+// pages are freed, by vmm_free_kernel_stack.
+uint64_t vmm_alloc_kernel_stack(uint64_t size);
+
+// Free the physical pages backing a stack returned by vmm_alloc_kernel_stack.
+// `size` must be the same value passed to the matching alloc call.
+void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size);
+
 #endif

@@ -410,6 +410,136 @@ static void usb_parse_config(struct usb_device *dev,
     }
 }
 
+// ---------------------------------------------------------------------------
+// USB hubs (single level; shared by UHCI/OHCI/EHCI via usb_core's HCD-
+// agnostic control-transfer path -- a downstream device is just another
+// address on the same physical bus/HC as far as usb_hcd_ops is concerned,
+// so no per-HC hub routing is needed for that part).
+//
+// Deliberately NOT handled here: xHCI (which enumerates hubs through its
+// own separate legacy code path, not usb_core.c -- still just logs
+// "USB Hub detected" and stops, matching its pre-existing "only the first
+// device enumerates" limitation) and full/low-speed devices behind a
+// high-speed EHCI hub (needs a Transaction Translator -- EHCI spec §4.14 --
+// a genuinely separate, larger feature; only same-speed downstream devices
+// are enumerated here). Both are documented gaps, not silent ones.
+// ---------------------------------------------------------------------------
+
+#define USB_DESC_HUB 0x29
+
+// Class-specific hub requests (USB 2.0 spec §11.24.2). bmRequestType:
+// 0xA0 = device-to-host/class/device (descriptor fetch),
+// 0xA3 = device-to-host/class/other (port status),
+// 0x23 = host-to-device/class/other (port feature set/clear).
+#define USB_HUB_REQ_GET_STATUS         0x00
+#define USB_HUB_REQ_CLEAR_FEATURE      0x01
+#define USB_HUB_REQ_SET_FEATURE        0x03
+
+#define USB_PORT_FEAT_CONNECTION       0
+#define USB_PORT_FEAT_ENABLE           1
+#define USB_PORT_FEAT_RESET            4
+#define USB_PORT_FEAT_POWER            8
+#define USB_PORT_FEAT_LOW_SPEED        9
+#define USB_PORT_FEAT_C_CONNECTION     16
+#define USB_PORT_FEAT_C_RESET          20
+
+#define USB_MAX_HUB_DEPTH 4   // defensive bound against a malformed/looping topology
+
+static uint8_t g_hub_depth = 0;
+
+// Class-specific hub descriptor (USB 2.0 spec §11.23.2.1). Only the fixed
+// leading fields are needed here (port count); the variable-length
+// DeviceRemovable/PortPwrCtrlMask bitmaps that follow are unused.
+struct usb_hub_descriptor {
+    uint8_t  bDescLength;
+    uint8_t  bDescriptorType;   // USB_DESC_HUB
+    uint8_t  bNbrPorts;
+    uint16_t wHubCharacteristics;
+    uint8_t  bPwrOn2PwrGood;
+    uint8_t  bHubContrCurrent;
+} __attribute__((packed));
+
+static bool usb_hub_get_port_status(struct usb_device *hub, uint8_t port,
+                                    uint16_t *status, uint16_t *change) {
+    uint8_t buf[4];
+    int rc = usb_control(hub, 0xA3, USB_HUB_REQ_GET_STATUS, 0, port, buf, 4);
+    if (rc < 4) return false;
+    *status = (uint16_t)(buf[0] | (buf[1] << 8));
+    *change = (uint16_t)(buf[2] | (buf[3] << 8));
+    return true;
+}
+
+static void usb_hub_set_port_feature(struct usb_device *hub, uint8_t port, uint16_t feature) {
+    usb_control(hub, 0x23, USB_HUB_REQ_SET_FEATURE, feature, port, NULL, 0);
+}
+
+static void usb_hub_clear_port_feature(struct usb_device *hub, uint8_t port, uint16_t feature) {
+    usb_control(hub, 0x23, USB_HUB_REQ_CLEAR_FEATURE, feature, port, NULL, 0);
+}
+
+// Bring up one downstream port: power it, reset it, read back the resulting
+// speed, and enumerate whatever's attached. Mirrors each HCD's own root-port
+// scan (uhci_port_scan() et al.) but through class-specific hub requests
+// instead of the HC's native port registers.
+static void usb_hub_port_attach(struct usb_device *hub, uint8_t port) {
+    usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_POWER);
+    pit_delay_ms(20);   // bPwrOn2PwrGood is in 2 ms units; 20 ms covers any real hub
+
+    uint16_t status, change;
+    if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
+    if (!(status & (1 << USB_PORT_FEAT_CONNECTION))) return;   // nothing plugged in
+
+    usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_RESET);
+    pit_delay_ms(50);
+
+    if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
+
+    // W1C the change bits the reset/connect sequence set, same as a root port.
+    if (change & (1 << (USB_PORT_FEAT_C_RESET - 16)))
+        usb_hub_clear_port_feature(hub, port, USB_PORT_FEAT_C_RESET);
+    if (change & (1 << (USB_PORT_FEAT_C_CONNECTION - 16)))
+        usb_hub_clear_port_feature(hub, port, USB_PORT_FEAT_C_CONNECTION);
+
+    if (!(status & (1 << USB_PORT_FEAT_ENABLE))) {
+        kprintf("USB hub: port %u failed to enable\n", (unsigned int)port);
+        return;
+    }
+
+    uint8_t speed = (status & (1 << USB_PORT_FEAT_LOW_SPEED)) ? USB_SPEED_LOW : USB_SPEED_FULL;
+    kprintf("USB hub: port %u connected (%s speed)\n", (unsigned int)port,
+            speed == USB_SPEED_LOW ? "low" : "full");
+
+    struct usb_device *child = usb_alloc_device(hub->ops, hub->hc, NULL, speed);
+    if (!child) return;
+    if (usb_enumerate(child) != 0) {
+        usb_free_device(child);
+    }
+}
+
+static bool usb_hub_attach(struct usb_device *hub) {
+    if (g_hub_depth >= USB_MAX_HUB_DEPTH) {
+        kprintf("USB hub: max nesting depth reached, not descending further\n");
+        return false;
+    }
+
+    struct usb_hub_descriptor hd;
+    int rc = usb_control(hub, 0xA0, USB_REQ_GET_DESCRIPTOR,
+                         (uint16_t)(USB_DESC_HUB << 8), 0, &hd, sizeof(hd));
+    if (rc < (int)sizeof(hd)) {
+        kprintf("USB hub: GET_DESCRIPTOR failed (%d)\n", rc);
+        return false;
+    }
+
+    kprintf("USB hub: %u downstream port(s)\n", (unsigned int)hd.bNbrPorts);
+
+    g_hub_depth++;
+    for (uint8_t port = 1; port <= hd.bNbrPorts; port++) {
+        usb_hub_port_attach(hub, port);
+    }
+    g_hub_depth--;
+    return true;
+}
+
 int usb_enumerate(struct usb_device *dev) {
     static uint8_t cfg_buf[256];
     uint8_t buf[18];
@@ -485,7 +615,7 @@ int usb_enumerate(struct usb_device *dev) {
     } else if (dev->if_class == 0x08) {
         usb_msc_attach(dev);
     } else if (dev->if_class == 0x09) {
-        kprintf("USB: hub detected (not supported on legacy HCs yet)\n");
+        usb_hub_attach(dev);
     }
 
     return 0;

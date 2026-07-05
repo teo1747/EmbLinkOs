@@ -1,6 +1,6 @@
 # Security
 
-EmbLink0s is an **operating system under active development**, built
+EmbLinkOs is an **operating system under active development**, built
 from scratch to understand every layer. It is **not production software** and is
 not intended to run untrusted workloads on real hardware. It runs in QEMU during
 development. There are no releases, no supported versions, and no users to
@@ -35,7 +35,7 @@ attack surface, and hardware side-channels are **out of scope** at this stage.
   execute), enforced per ELF segment via `p_flags`. Verified: a write to a code
   page from ring 3 faults #PF (W=1).
 
-## Known gaps (deliberately deferred — tracked in `TODO.md`)
+## Known gaps (deliberately deferred — tracked in `docs/TODO.md`)
 
 These are *known* and *tracked*, not hidden. Naming a limitation is part of the
 project's discipline.
@@ -54,7 +54,7 @@ project's discipline.
 
 ## Reporting
 
-This is a solo for now but I will like to make it collaborative with any one who wants to contribute (github.com/teo1747/EmbLink0s). If you're reading
+This is a solo for now but I will like to make it collaborative with any one who wants to contribute (github.com/teo1747/EmbLinkOs). If you're reading
 the code and spot a security-relevant bug — an isolation break, a way for ring 3
 to reach kernel memory, a fault the kernel mishandles — open a GitHub issue using
 the `[bug]` template (include the fault dump). There's no formal disclosure

@@ -25,6 +25,18 @@ kernel_ctx_switch:
 
     pushfq                       ; save RFLAGS to stack
     pop rax                      ; pop RFLAGS into rax
+    ; Force IF=1 in the saved snapshot. kernel_ctx_switch is called from
+    ; inside interrupt-gate handlers (the LAPIC timer ISR, or a syscall via
+    ; int 0x80) which auto-clear IF on entry -- so the LIVE flags at this
+    ; exact instruction read IF=0 regardless of what the outgoing process
+    ; was actually running with. But reaching this point at all (a hardware
+    ; IRQ was serviced, or a software int 0x80 fired) proves the outgoing
+    ; process had IF=1 the moment it was interrupted/trapped: a maskable
+    ; IRQ literally cannot be taken while IF=0, and ring 3 can't execute
+    ; cli/sti at all (privileged, #GP). Storing the raw mid-ISR flags here
+    ; instead would make this process resume with interrupts permanently
+    ; off after its first preemption -- its next hlt would never wake.
+    or rax, 0x200
     mov [rdi + 64], rax          ; save RFLAGS
 
     ; --- restore incoming context RSI (restore_from) ---
@@ -63,6 +75,9 @@ kernel_ctx_save:
     mov [rdi + 56], rax
     pushfq                       ; save RFLAGS to stack
     pop rax                      ; pop RFLAGS into rax
+    or rax, 0x200                ; force IF=1 on resume -- see kernel_ctx_switch's
+                                  ; comment; kept consistent even though today's
+                                  ; only caller (usermode.c) isn't inside an ISR.
     mov [rdi + 64], rax          ; save RFLAGS
 
     xor eax, eax                 ; the direct call returns 0

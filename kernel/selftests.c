@@ -8,6 +8,9 @@
 #include "fs/fd.h"
 #include "cpu/rwlock.h"
 #include "cpu/usermode.h"
+#include "process/process.h"
+#include "drivers/usb.h"
+#include "drivers/framebuffer.h"
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -248,6 +251,12 @@ static void selftests_print_commands(void)
     kprintf("  test fat32 vfs\n");
     kprintf("  test rwlock\n");
     kprintf("  test ring3\n");
+    kprintf("  test sched roundrobin\n");
+    kprintf("  test sched kill\n");
+    kprintf("  test sched reap\n");
+    kprintf("  test sched stackguard\n");
+    kprintf("  test usb\n");
+    kprintf("  test gpu\n");
 }
 
 static void run_embkfs_all(void)
@@ -353,6 +362,46 @@ int selftests_handle_command(const char *cmd)
         // down the process address space on both exit and load failure.
         enter_user_mode();
         kprintf("\n[cmd] test ring3: returned to kernel\n");
+        return 1;
+    }
+
+    // docs/architecture/process-and-scheduling.md §12. Each of these
+    // temporarily takes over current_process/the scheduler and restores it
+    // to NULL before returning — don't run them while a real process is
+    // scheduled (they'd fight over current_process with it).
+    if (strcmp(cmd, "test sched roundrobin") == 0) {
+        int rc = process_test_roundrobin();
+        kprintf("\n[cmd] test sched roundrobin: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sched kill") == 0) {
+        int rc = process_test_kill();
+        kprintf("\n[cmd] test sched kill: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sched reap") == 0) {
+        int rc = process_test_reap();
+        kprintf("\n[cmd] test sched reap: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sched stackguard") == 0) {
+        int rc = process_test_stackguard();
+        kprintf("\n[cmd] test sched stackguard: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test usb") == 0) {
+        int rc = usb_run_selftests();
+        kprintf("\n[cmd] test usb: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test gpu") == 0) {
+        int rc = fb_run_selftests();
+        kprintf("\n[cmd] test gpu: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 

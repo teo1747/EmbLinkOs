@@ -34,4 +34,7 @@ uint32_t lapic_get_id(void);
 // Calibrate against the PIT to determine the correct initial count value for the desired frequency
 void lapic_timer_init(uint8_t vector);
 
+// Ticks elapsed since lapic_timer_init (100 Hz -> 10 ms per tick)
+uint64_t lapic_timer_get_ticks(void);
+
 #endif /* __LAPIC_H__ */
