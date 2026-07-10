@@ -15,6 +15,12 @@
 
 #define ATA_PRIMARY_IRQ  14
 #define ATA_PRIMARY_VECTOR 46   // IDT vector for IRQ14 (32 + 14)
+#define ATA_SECONDARY_IRQ  15
+#define ATA_SECONDARY_VECTOR 47 // IDT vector for IRQ15 (32 + 15)
+
+// Secondary channel's Bus Master IDE registers live at BAR4+0x08 (primary's
+// are at BAR4+0x00) -- same register layout, different channel.
+#define BMIDE_SECONDARY_OFFSET 0x08
 
 // Bus Master IDE register offsets (from BAR4 base, Primary channel)
 #define BMIDE_COMMAND      0x00
@@ -63,32 +69,53 @@ static uint8_t ata_dma_bounce[ATA_DMA_BOUNCE_MAX_BYTES] __attribute__((aligned(4
 // Bus master I/O base (BAR4 of the IDE controller)
 static uint16_t bmide_base;
 
-static volatile bool ata_irq_fired = false;
+// Each IDE channel (primary/secondary) has its own IRQ line and fires
+// independently, so each needs its own completion flag -- a single shared
+// flag would let a primary-channel completion be mistaken for a pending
+// secondary-channel transfer (or vice versa), and a drive on the secondary
+// channel would wait forever on a flag only the primary handler ever sets.
+static volatile bool ata_irq_fired_primary = false;
+static volatile bool ata_irq_fired_secondary = false;
 
 static struct ata_drive drives[ATA_MAX_DRIVES];
 static uint32_t drive_count = 0;
 
+static inline volatile bool *ata_irq_flag(uint16_t io_base) {
+    return (io_base == ATA_SECONDARY_IO) ? &ata_irq_fired_secondary : &ata_irq_fired_primary;
+}
 
-static void ata_irq_handler(void) {
+// Secondary channel's Bus Master IDE registers are offset from the primary's
+// within the same BAR4 region.
+static inline uint16_t bmide_channel_base(const struct ata_drive *d) {
+    return (d->io_base == ATA_SECONDARY_IO) ? (uint16_t)(bmide_base + BMIDE_SECONDARY_OFFSET) : bmide_base;
+}
+
+static void ata_irq_handler_primary(void) {
     // Reading the status register acknowledge the interrupt at the drive.
     // Without this, the controller never sends another interrupt.
     inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
-    ata_irq_fired = true;
+    ata_irq_fired_primary = true;
     // LAPIC EOI (End Of Interrupt) is sent by the common irq_handler() after return.
 }
 
-static int ata_wait_irq(void){
+static void ata_irq_handler_secondary(void) {
+    inb(ATA_SECONDARY_IO + ATA_REG_STATUS);
+    ata_irq_fired_secondary = true;
+}
+
+static int ata_wait_irq(uint16_t io_base){
     // Sleep until the ATA IRQ sets the flag. the 100 hz timer guarantees
     // We wake periodically to re-check even if we miss the exact moment.
+    volatile bool *flag = ata_irq_flag(io_base);
     int timeout = 0;
-    while (!ata_irq_fired) {
+    while (!*flag) {
         __asm__ volatile ("hlt");
         if (++timeout > 1000000) {
         kprintf("ATA IRQ timeout\n");
         return -1; // safety: never hang forever on bad hardware
         }
     }
-    ata_irq_fired = false;
+    *flag = false;
     return 0;
 }
 
@@ -301,13 +328,13 @@ int ata_read_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, void *bu
 
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
 
-    ata_irq_fired = false; // Clear the flag for the first sector's IRQ
+    *ata_irq_flag(d->io_base) = false; // Clear the flag for the first sector's IRQ
     ata_setup_lba(d, lba, count); // Setup LBA and count
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_READ_PIO); // Send Read command
 
     // Read each sector
     for (int i = 0; i < count; i++) {
-        if (ata_wait_irq() < 0){
+        if (ata_wait_irq(d->io_base) < 0){
             kprintf("ATA: IRQ wait timeout at sctor %u\n", (unsigned int)i);
             return -1; // Wait for DRQ to set;
         }
@@ -316,8 +343,8 @@ int ata_read_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, void *bu
         }
         buffer16 += 256; // Move buffer pointer forward
         // Clear the flag for the next sector's IRQ
-        ata_irq_fired = false;
-    }   
+        *ata_irq_flag(d->io_base) = false;
+    }
     return 0;
 }
 
@@ -330,7 +357,7 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
 
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
 
-    ata_irq_fired = false;
+    *ata_irq_flag(d->io_base) = false;
     ata_setup_lba(d, lba, count);
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO); // Send Write command
 
@@ -345,15 +372,16 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
         }
 
         // Write 256 bytes to the drive
-        ata_irq_fired = false;
+        *ata_irq_flag(d->io_base) = false;
         for (int j = 0; j < 256; j++) {
             outw(d->io_base + ATA_REG_DATA, buffer16[j]); // Write 256 bytes
         }
         buffer16 += 256; // Move buffer pointer forward
 
-        // Now that the drive write to the platter and raises IRQ 14 WHEN done.
+        // Now that the drive write to the platter and raises the channel's
+        // completion IRQ (14 for primary, 15 for secondary) WHEN done.
         // Wait for the completion IRQ
-        if (ata_wait_irq() < 0) {
+        if (ata_wait_irq(d->io_base) < 0) {
             kprintf("ATA: IRQ wait timeout at sector %u\n", (unsigned int)i);
             return -1; // Wait for DRQ to set
         }
@@ -372,6 +400,7 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
     if (bmide_base == 0) return -1; // DMA not available without valid bus master I/O base
 
     const struct ata_drive *d = &drives[drive_index]; // Get drive pointer
+    const uint16_t bmide = bmide_channel_base(d); // Primary vs secondary channel's BMIDE registers
 
     // Transfer size in bytes. Multi-PRD allows >64KB, but the buffer still
     // must be physically contiguous (KV2P linear range).
@@ -403,40 +432,40 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
     uint64_t prdt_phys = KV2P(dma_prdt); // Physical address of the PRDT
 
     // 2. Stop any previous DMA, then program the PRDT physical address and start the transfer
-    outb(bmide_base + BMIDE_COMMAND, 0); // Stop any previous DMA
-    outl(bmide_base + BMIDE_PRDT, (uint32_t)prdt_phys); // Program PRDT physical address
+    outb(bmide + BMIDE_COMMAND, 0); // Stop any previous DMA
+    outl(bmide + BMIDE_PRDT, (uint32_t)prdt_phys); // Program PRDT physical address
 
     // 3. Set direction = read (controller writes into Ram)
-    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_READ); // Set direction = read
+    outb(bmide + BMIDE_COMMAND, BMIDE_CMD_READ); // Set direction = read
 
-    // 4. Clear interrupt + error status bits by writing 1s 
-    uint8_t status = inb(bmide_base + BMIDE_STATUS);
-    outb(bmide_base + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
+    // 4. Clear interrupt + error status bits by writing 1s
+    uint8_t status = inb(bmide + BMIDE_STATUS);
+    outb(bmide + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
 
     // 5. Program the ATA registers (drive, LBA, count) - same as PIO
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
     ata_setup_lba(d, lba, count);
 
     // 6. Clear IRQ fired flag, issue READ DMA command to the drive (different from PIO command)
-    ata_irq_fired = false;
+    *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_READ_DMA); // Send READ DMA command
 
     // 7. Start the bus master engine (set start bit, keep read direction)
-    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_READ | BMIDE_CMD_START); // Start the transfer
+    outb(bmide + BMIDE_COMMAND, BMIDE_CMD_READ | BMIDE_CMD_START); // Start the transfer
 
     // 8. Wait for completion IRQ, check for errors
-    if (ata_wait_irq() < 0) {
+    if (ata_wait_irq(d->io_base) < 0) {
         kprintf("ATA: IRQ wait timeout\n");
-        outb(bmide_base + BMIDE_COMMAND, 0); // Stop the bus master
+        outb(bmide + BMIDE_COMMAND, 0); // Stop the bus master
         return -1; // Wait for DRQ to set
     }
 
     // 9. Stop the bus master engine
-    outb(bmide_base + BMIDE_COMMAND, 0); // Stop the transfer
+    outb(bmide + BMIDE_COMMAND, 0); // Stop the transfer
 
     // 10. Check for errors
-    uint8_t st = inb(bmide_base + BMIDE_STATUS);
-    outb(bmide_base + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
+    uint8_t st = inb(bmide + BMIDE_STATUS);
+    outb(bmide + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
     if (st & BMIDE_STATUS_ERROR) {
         kprintf("ATA DMA read error: status %x\n", (unsigned int)st);
         return -1;
@@ -457,6 +486,7 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     if (bmide_base == 0) return -1;
 
     const struct ata_drive *d = &drives[drive_index];
+    const uint16_t bmide = bmide_channel_base(d);
 
     uint32_t bytes = (uint32_t)count * ATA_SECTOR_SIZE;
 
@@ -487,49 +517,49 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     uint64_t prdt_phys = KV2P(dma_prdt);
 
     // 2. Stop, program PRDT address
-    outb(bmide_base + BMIDE_COMMAND, 0);
-    outl(bmide_base + BMIDE_PRDT, (uint32_t)prdt_phys);
+    outb(bmide + BMIDE_COMMAND, 0);
+    outl(bmide + BMIDE_PRDT, (uint32_t)prdt_phys);
 
     // 3. Set direction = WRITE (controller reads RAM). Direction bit CLEARED.
-    outb(bmide_base + BMIDE_COMMAND, 0);   // direction bit 3 = 0 means RAM->disk
+    outb(bmide + BMIDE_COMMAND, 0);   // direction bit 3 = 0 means RAM->disk
 
     // 4. Clear interrupt + error status
-    uint8_t st = inb(bmide_base + BMIDE_STATUS);
-    outb(bmide_base + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
+    uint8_t st = inb(bmide + BMIDE_STATUS);
+    outb(bmide + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
 
     // 5. Program ATA registers
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
     ata_setup_lba(d, lba, count);
 
     // 6. Clear IRQ flag, issue WRITE DMA command
-    ata_irq_fired = false;
+    *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_DMA);
 
     // 7. Start the bus master (start bit set, direction bit 0 for write)
-    outb(bmide_base + BMIDE_COMMAND, BMIDE_CMD_START);
+    outb(bmide + BMIDE_COMMAND, BMIDE_CMD_START);
 
     // 8. Wait for completion IRQ
-    if (ata_wait_irq() < 0) {
+    if (ata_wait_irq(d->io_base) < 0) {
         kprintf("ATA DMA: write IRQ timeout\n");
-        outb(bmide_base + BMIDE_COMMAND, 0);
+        outb(bmide + BMIDE_COMMAND, 0);
         return -1;
     }
 
     // 9. Stop bus master
-    outb(bmide_base + BMIDE_COMMAND, 0);
+    outb(bmide + BMIDE_COMMAND, 0);
 
     // 10. Check error, clear status
-    uint8_t status = inb(bmide_base + BMIDE_STATUS);
-    outb(bmide_base + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
+    uint8_t status = inb(bmide + BMIDE_STATUS);
+    outb(bmide + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
     if (status & BMIDE_STATUS_ERROR) {
         kprintf("ATA DMA: write error (status %x)\n", (unsigned int)status);
         return -1;
     }
 
     // 11. Flush the drive cache so data is durable on the platter
-    ata_irq_fired = false;
+    *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
-    if (ata_wait_irq() < 0) {
+    if (ata_wait_irq(d->io_base) < 0) {
         ata_wait_not_busy(d->io_base);   // fallback if no flush IRQ
     }
 
@@ -552,9 +582,9 @@ int ata_flush(uint32_t drive_index) {
     outb(d->io_base + ATA_REG_DRIVE, d->is_slave ? 0xF0 : 0xE0);
     ata_io_wait(d->ctrl_base);
 
-    ata_irq_fired = false;
+    *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
-    if (ata_wait_irq() < 0) {
+    if (ata_wait_irq(d->io_base) < 0) {
         if (ata_wait_not_busy(d->io_base) < 0) return -1;  // fallback if no flush IRQ
     }
     return 0;
@@ -668,10 +698,19 @@ void ata_init(void) {
     } else {
         kprintf("ATA: %u drive(s) detected.\n", (unsigned int)drive_count);
     }
-    // Install IRQ handler, routing to IRQ14 via IOAPIC
-    irq_register(ATA_PRIMARY_IRQ, ata_irq_handler);
+    // Install IRQ handlers, routing both channels via IOAPIC. Without routing
+    // IRQ15 too, any transfer targeting a secondary-channel drive (index 2/3)
+    // would wait on a completion interrupt that never arrives -- it would
+    // eventually give up via ata_wait_irq()'s timeout, but only after ~1e6
+    // 100Hz hlt-wakeups (~2.7 hours), which looks indistinguishable from a
+    // dead hang to anything with a normal test timeout.
+    irq_register(ATA_PRIMARY_IRQ, ata_irq_handler_primary);
     ioapic_route(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0, false); // Route to CPU 0, unmasked
     kprintf("ATA: IRQ14 routed to vector %u\n", (unsigned int)ATA_PRIMARY_VECTOR);
+
+    irq_register(ATA_SECONDARY_IRQ, ata_irq_handler_secondary);
+    ioapic_route(ATA_SECONDARY_IRQ, ATA_SECONDARY_VECTOR, 0, false);
+    kprintf("ATA: IRQ15 routed to vector %u\n", (unsigned int)ATA_SECONDARY_VECTOR);
 
     // Register block devices for each detected drive
     ata_register_block_devices();

@@ -243,16 +243,25 @@ static int64_t sys_readdir(struct regs *r) {
     return (int64_t)ctx.count;
 }
 
-/* spawn(path) -> pid, or -errno. docs/ARCHITECTURE.md §3.2's spawn() shape:
- * builds a fresh address space directly from an ELF path, no fork+exec. This
- * is a thin wrapper around process_create() (process.c), which already does
- * exactly that -- the only syscall-specific work is copying the path in
- * from user space. The new process is left PROCESS_READY; it isn't run
- * synchronously here, it starts getting real CPU time the next time
- * schedule() (cooperative or timer-driven) picks it up, same as any other
- * READY process. No file-actions list yet (§3.2's fuller model) and no
- * capability-style handle (§3.4) -- returns the raw pid, the simplest thing
- * that works given neither exists yet. */
+/* spawn(path) -> handle, or -errno. docs/ARCHITECTURE.md §3.2's spawn()
+ * shape: builds a fresh address space directly from an ELF path, no
+ * fork+exec. This is a thin wrapper around process_create() (process.c),
+ * which already does exactly that -- the only syscall-specific work is
+ * copying the path in from user space. The new process is left
+ * PROCESS_READY; it isn't run synchronously here, it starts getting real
+ * CPU time the next time schedule() (cooperative or timer-driven) picks it
+ * up, same as any other READY process. No file-actions list yet (§3.2's
+ * fuller model).
+ *
+ * Returns an opaque per-caller HANDLE (docs/ARCHITECTURE.md §3.4/§3.5), not
+ * the raw pid -- process_create() already recorded current_process as the
+ * child's parent, so the handle is really just a capability wrapper around
+ * that same relationship: only the parent (or whoever it hands the handle
+ * to) can ever name this child via sys_wait/sys_kill, closing the
+ * confused-deputy gap a bare pid argument would leave open at this
+ * boundary (any ring-3 process could otherwise wait()/kill() any pid it
+ * could guess). If the handle table is full, the orphaned child is killed
+ * immediately rather than leaked unreferenced. */
 static int64_t sys_spawn(struct regs *r) {
     const char *user_path = (const char *)r->rdi;
 
@@ -262,40 +271,67 @@ static int64_t sys_spawn(struct regs *r) {
         return len;
     }
 
-    return process_create(path);
+    int pid = process_create(path);
+    if (pid < 0) {
+        return pid;
+    }
+
+    int handle = process_handle_alloc(current_process, (uint32_t)pid);
+    if (handle < 0) {
+        process_kill((uint32_t)pid);
+        return handle;   // -EMBK_EMFILE
+    }
+    return handle;
 }
 
-/* wait(pid) -> exit_code, or -errno (-EMBK_ECHILD if no such pid). Busy-
- * polls (yielding every round) until the target reaches PROCESS_ZOMBIE,
- * then reaps it and returns its exit code.
- *
- * This is a real, working wait(), but not the eventual one: a proper
- * implementation blocks the caller on a per-process wait queue woken by the
- * target's own exit, rather than spinning -- that needs parent/child
- * tracking (docs/architecture/process-and-scheduling.md §6.2's `parent`
- * field, Phase D, not built yet). Busy-polling is a correct stand-in until
- * then: process_kill()'s existing "reap the moment it's not current_process"
- * path is what actually clears it out; this just waits for that to happen. */
+/* wait(handle) -> exit_code, or -errno (-EMBK_EINVAL for a bad/unknown
+ * handle, -EMBK_ECHILD if it doesn't/no-longer names one of our children).
+ * Resolves the handle to a pid, then blocks on process_wait() (process.c)
+ * -- a REAL block via the target's parent's child_wait queue, woken by the
+ * child's own exit/kill, not a busy-poll. Frees the handle on return either
+ * way (successful reap or a stale/invalid handle): a handle is single-use
+ * for waiting, matching the one-shot nature of an exit status. */
 static int64_t sys_wait(struct regs *r) {
-    uint32_t pid = (uint32_t)r->rdi;
+    int handle = (int)r->rdi;
 
-    for (;;) {
-        struct process *target = process_find(pid);
-        if (!target) {
-            return -EMBK_ECHILD;
-        }
-        if (target->state == PROCESS_ZOMBIE) {
-            int code = target->exit_code;
-            process_reap(pid);
-            return code;
-        }
-        sys_yield();
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, handle, &pid);
+    if (rc != 0) {
+        return rc;   // -EMBK_EINVAL
     }
+
+    int code = process_wait(pid);
+    process_handle_free(current_process, handle);
+    return code;
+}
+
+/* kill(handle) -> 0, or -EMBK_EINVAL for a bad/unknown handle. The
+ * userspace-reachable edge of the uncatchable kill
+ * (docs/ARCHITECTURE.md §3.3, docs/architecture/process-and-scheduling.md
+ * §15.2) -- process_kill() itself (process.c) has existed since Phase B,
+ * used internally by the scheduler selftests, but was never exposed to
+ * ring 3 until now. Does NOT free the handle: the caller still needs it to
+ * sys_wait() afterward and collect the exit code (-1, "killed") the same
+ * way a normal exit would be collected. */
+static int64_t sys_kill(struct regs *r) {
+    int handle = (int)r->rdi;
+
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, handle, &pid);
+    if (rc != 0) {
+        return rc;   // -EMBK_EINVAL
+    }
+
+    process_kill(pid);
+    return 0;
 }
 
 /* getpid() -> this process's pid. Trivial, but a real primitive a spawn()
  * caller needs -- e.g. to tell itself apart from a child that's about to
- * run the exact same binary from the same entry point. */
+ * run the exact same binary from the same entry point. Deliberately still
+ * the real pid, not a handle: a process always has ambient authority over
+ * itself, so there's no confused-deputy concern for getpid() the way there
+ * is for naming some OTHER process via spawn/wait/kill. */
 static int64_t sys_getpid(struct regs *r) {
     (void)r;
     return current_process->pid;
@@ -328,6 +364,55 @@ static int64_t sys_yield_syscall(struct regs *r) {
     return 0;
 }
 
+/* thread_create(entry, arg) -> tid, or -errno. The ring-3 edge of Phase 5's
+ * multi-thread primitive (docs/architecture/process-and-scheduling.md) --
+ * an ADDITIONAL thread under the CALLER's own process, sharing its address
+ * space, with its own dedicated user stack (thread_create_user(), process.c).
+ *
+ * `entry` is validated with access_ok() before ever being handed to the
+ * scheduler: unlike sys_spawn's path (a fresh ELF's own entry point, chosen
+ * by the trusted loader, not by the caller), this entry point is an
+ * ARBITRARY ring-3-supplied address, so it gets the same "must be mapped in
+ * the CALLER's own address space" check every other user pointer this
+ * syscall layer accepts gets (usercopy.h) -- cheap insurance against a
+ * caller (accidentally or not) pointing a brand-new thread at unmapped or
+ * kernel-half memory before it ever gets to run.
+ *
+ * Returns a raw tid (thread_table[] slot index), not a capability handle --
+ * see thread_create_user()'s doc comment (process.h) for why a thread
+ * doesn't need the same confused-deputy protection sys_spawn's handle does:
+ * a tid only ever names a thread of the CALLER's OWN process, there's no
+ * cross-process thread naming at all. */
+static int64_t sys_thread_create(struct regs *r) {
+    uint64_t entry_point = r->rdi;
+    uint64_t arg = r->rsi;
+
+    if (!access_ok((const void *)entry_point, 1)) {
+        return -EMBK_EFAULT;
+    }
+
+    return thread_create_user(current_process, entry_point, arg);
+}
+
+/* thread_join(tid) -> exit_code, or -errno. Blocks (a real block, via
+ * proc->join_wait -- not a busy-poll, same shape as sys_wait/process_wait())
+ * until thread `tid` of the CALLER's own process exits, then reaps it and
+ * returns its exit code. -EMBK_EINVAL for an unknown/wrong-process/
+ * non-joinable/already-joined tid (thread_join(), process.c). */
+static int64_t sys_thread_join(struct regs *r) {
+    int tid = (int)r->rdi;
+    return thread_join(current_process, tid);
+}
+
+/* thread_exit(code): mark the CALLING thread a zombie and hand off to the
+ * scheduler -- ends only this thread, not necessarily the whole process
+ * (thread_exit_self(), process.c). If it happens to be the process's last
+ * thread, this completes the process exactly like sys_exit would. */
+static int64_t sys_thread_exit(struct regs *r) {
+    int code = (int)r->rdi;
+    thread_exit_self(code);   // noreturn
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -343,6 +428,10 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_spawn   10
 #define SYS_wait    11
 #define SYS_getpid  12
+#define SYS_kill    13
+#define SYS_thread_create 14
+#define SYS_thread_join   15
+#define SYS_thread_exit   16
 
 
 static syscall_handler_t syscall_table[] = {
@@ -358,6 +447,10 @@ static syscall_handler_t syscall_table[] = {
     [SYS_spawn]   = sys_spawn,
     [SYS_wait]    = sys_wait,
     [SYS_getpid]  = sys_getpid,
+    [SYS_kill]    = sys_kill,
+    [SYS_thread_create] = sys_thread_create,
+    [SYS_thread_join]   = sys_thread_join,
+    [SYS_thread_exit]   = sys_thread_exit,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

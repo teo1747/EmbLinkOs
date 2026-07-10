@@ -26,7 +26,7 @@ bool access_ok(const void *user_ptr, size_t len) {
     if (end > USER_VA_LIMIT) {
         return false;   // spills into (or sits entirely in) kernel VA space
     }
-    if (!current_process) {
+    if (!current_thread) {
         return false;   // no process context to validate against
     }
 

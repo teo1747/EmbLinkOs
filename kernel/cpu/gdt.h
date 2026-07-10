@@ -3,8 +3,20 @@
 
 #include <stdint.h>
 
+/* Generous capacity for per-core metadata (TSS slots below, and
+ * kernel/cpu/percpu.h's struct cpu_data table) -- defined here rather than
+ * in percpu.h specifically to avoid a circular include (percpu.h needs
+ * `struct tss` from this header; this header's GDT_ENTRIES needs a CPU
+ * count). Distinct from ACPI_MAX_CPUS (256, acpi.h), which is MADT-parsing
+ * capacity, a different concern. */
+#define MAX_CPUS 32
 
-#define GDT_ENTRIES 7      // Number of GDT entries: null, kernel code, kernel data, user code, user data, TSS (2 entries)
+/* 5 shared entries (null, kernel code, kernel data, user data, user code)
+ * plus one 16-byte (2-GDT-entry) TSS descriptor PER CORE -- was a single
+ * TSS for the whole kernel; every core now needs its own (each takes
+ * ring-3->ring-0 interrupts on its own kernel stack, so TSS.RSP0 can't be
+ * shared). See gdt_init_this_cpu()'s comment for the selector math. */
+#define GDT_ENTRIES (5 + 2 * MAX_CPUS)
 
 // GDT entry structure (8 bytes)
 struct gdt_entry {
@@ -57,9 +69,26 @@ struct tss {
 
 
 
-// Build the kernel GDT and load it
-void gdt_init(void);
-void tss_set_rsp0(uint64_t rsp0);  // Set the RSP0 field in the TSS (kernel stack pointer for ring 0)
+/* Build the shared part of the GDT (the 5 code/data descriptors) and load
+ * it for the BSP -- called exactly once, very early in kernel_main(),
+ * BEFORE acpi_init()/lapic_init() (so this_cpu() isn't usable yet; this
+ * function operates on cpu_table[0] directly, which is always the BSP by
+ * definition). Internally calls gdt_load_and_set_tss(0) to finish setting
+ * up the BSP's own TSS/segment registers/task register -- see that
+ * function's comment for why AP bring-up (Phase 2) doesn't duplicate this
+ * logic. */
+void gdt_init_bsp(void);
+
+/* Called by an AP (Phase 2's ap_main()) once it has a working C
+ * environment: loads the (already-built, shared) GDT, sets up THIS core's
+ * own TSS descriptor slot and RSP0/IST1 stacks, reloads segment registers,
+ * and does `ltr` with this core's own TSS selector. Requires this_cpu() to
+ * already resolve correctly (i.e. percpu_init_topology() must have already
+ * run on the BSP) -- true by the time any AP reaches this call, since APs
+ * only start after the BSP has gotten through ACPI/LAPIC init. */
+void gdt_init_this_cpu(void);
+
+void tss_set_rsp0(uint64_t rsp0);  // Set the RSP0 field in THIS core's own TSS (kernel stack pointer for ring 0)
 
 
 

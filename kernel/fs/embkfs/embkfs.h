@@ -23,6 +23,7 @@
 #define EMBK_TYPE_DIR_ENTRY  16
 #define EMBK_TYPE_EXTENT     32
 #define EMBK_TYPE_XATTR      48
+#define EMBK_TYPE_SNAPSHOT   64   /* v2.2 Phase 5b: {ROOT_OBJECT_ID, SNAPSHOT, slot} */
 
 
 /* ---- Mount-time constants (read-only, v2.2) ------------------------- */
@@ -32,9 +33,23 @@
  * keeps it from ever drifting from the layout: 160 - 8 = 152. */
 #define EMBKFS_SB_BODY_SIZE   (sizeof(struct embk_superblock) - sizeof(uint64_t))
 
-/* Feature bits this reader understands — none yet. So any set incompat bit
- * means refuse; any set ro_compat bit means mount read-only. */
-#define EMBKFS_KNOWN_INCOMPAT   0ULL
+/* Feature bits this reader understands. Any OTHER set incompat bit means
+ * refuse to mount; any other set ro_compat bit means mount read-only.
+ * COMPRESSION (v2.2 Phase 3): set on the superblock the first time a write
+ * actually produces a COMPRESSED extent, so an older/non-aware reader
+ * refuses the volume instead of silently serving compressed bytes as if
+ * they were plaintext. ENCRYPTED (v2.2 Phase 4): set at format time,
+ * requires the mount-time passphrase flow (see embk_crypto_header below)
+ * before the volume's contents can be trusted at all. VERIFIED_ROOT
+ * (v2.2 Phase 5d): set at format time, requires the mount-time HMAC check
+ * (see embk_verify_header below) to pass before the volume is trusted --
+ * INCOMPAT (not ro_compat/compat) so an older/non-checking reader can't
+ * be used to bypass the check. */
+#define EMBKFS_INCOMPAT_COMPRESSION   0x0000000000000001ULL
+#define EMBKFS_INCOMPAT_ENCRYPTED     0x0000000000000002ULL
+#define EMBKFS_INCOMPAT_VERIFIED_ROOT 0x0000000000000004ULL
+#define EMBKFS_KNOWN_INCOMPAT   (EMBKFS_INCOMPAT_COMPRESSION | EMBKFS_INCOMPAT_ENCRYPTED | \
+                                 EMBKFS_INCOMPAT_VERIFIED_ROOT)
 #define EMBKFS_KNOWN_RO_COMPAT  0ULL
 
 /* Highest major version we know how to read. */
@@ -169,9 +184,26 @@ struct embk_inode_item {
     uint64_t ctime;        /* 56 */
     uint64_t btime;        /* 64 */
     uint64_t generation;   /* 72 */
-    uint8_t  reserved[48]; /* 80  must be 0                             */
+    uint8_t  reserved[48]; /* 80  reserved[0..3] = writer_pid (v2.2 Phase 5c),
+                             *     rest must be 0                          */
 } __attribute__((packed));
 _Static_assert(sizeof(struct embk_inode_item) == 128, "inode must be 128 bytes");
+
+/* Process-provenance (v2.2 Phase 5c): which process's write last touched
+ * this object's content, sourced from current_process->pid at every
+ * content-mutating call (embkfs_make_object at creation,
+ * embkfs_write_file at every write -- the same "did the DATA change"
+ * distinction those two already use for btime vs mtime). 0 means
+ * "unknown" (e.g. an inode from an image written by the mkfs oracle,
+ * which has no process context to record). */
+static inline uint32_t embk_inode_writer_pid(const struct embk_inode_item *ino) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) v |= ((uint32_t)ino->reserved[i]) << (8 * i);
+    return v;
+}
+static inline void embk_inode_set_writer_pid(struct embk_inode_item *ino, uint32_t pid) {
+    for (int i = 0; i < 4; i++) ino->reserved[i] = (uint8_t)(pid >> (8 * i));
+}
 
 /* §9.2  Directory entry. Fixed part 16 B, then name_len UTF-8 bytes. */
 struct embk_dir_entry_item {
@@ -196,7 +228,113 @@ struct embk_extent_item {
 } __attribute__((packed));
 _Static_assert(sizeof(struct embk_extent_item) == 64, "extent must be 64 bytes");
 
-#define EMBKFS_EXTENT_F_HOLE 0x00000001u
+#define EMBKFS_EXTENT_F_HOLE       0x00000001u
+#define EMBKFS_EXTENT_F_COMPRESSED 0x00000002u
+#define EMBKFS_EXTENT_F_ENCRYPTED  0x00000004u
+
+/* When EMBKFS_EXTENT_F_COMPRESSED is set, reserved1[0..7] holds the actual
+ * compressed payload length (bytes) within the block-rounded run -- the
+ * exact reserved-byte use the spec's own "future extent attributes
+ * (compression metadata)" comment anticipated (v2.2 Phase 3). logical_size
+ * keeps its existing meaning (the true, decompressed byte count); length
+ * (in blocks) shrinks to whatever the compressed payload actually needs. */
+static inline uint64_t embk_extent_compressed_size(const struct embk_extent_item *e) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)e->reserved1[i]) << (8 * i);
+    return v;
+}
+static inline void embk_extent_set_compressed_size(struct embk_extent_item *e, uint64_t v) {
+    for (int i = 0; i < 8; i++) e->reserved1[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* ---- Encryption (v2.2 Phase 4) --------------------------------------
+ * Gated by EMBKFS_INCOMPAT_ENCRYPTED. The crypto header lives at a fixed
+ * offset within the SAME 512-byte sector as the superblock struct itself
+ * (both superblock copies already get read as one sector each), but past
+ * EMBKFS_SB_BODY_SIZE -- so it is NOT covered by the superblock's own
+ * checksum. That's a deliberate scope reduction, not an oversight:
+ * corruption here fails CLOSED (mount refused, or a legitimate passphrase
+ * gets rejected) rather than open, so it costs availability, never
+ * confidentiality/integrity of the encrypted data itself. Documented in
+ * docs/EMBKFS_spec_v2.2.md alongside the other Phase 4 design decisions
+ * (deterministic per-block-number XTS tweak, no ciphertext stealing). */
+#define EMBKFS_CRYPTO_HEADER_OFFSET  200
+#define EMBKFS_CRYPTO_HEADER_MAGIC   0x315952434B424D45ULL /* "EMBKCRY1" */
+
+struct embk_crypto_header {
+    uint64_t magic;                    /*  0  EMBKFS_CRYPTO_HEADER_MAGIC   */
+    uint8_t  kdf_salt[16];             /*  8  PBKDF2 salt                  */
+    uint32_t kdf_iterations;           /* 24  PBKDF2 iteration count       */
+    uint8_t  key_check_ciphertext[16]; /* 28  XTS-encrypted known constant */
+    uint8_t  reserved[8];              /* 44  must be 0                    */
+} __attribute__((packed));
+_Static_assert(sizeof(struct embk_crypto_header) == 52, "crypto header must be 52 bytes");
+
+/* ---- Verified-root boot check (v2.2 Phase 5d) -----------------------
+ * Gated by EMBKFS_INCOMPAT_VERIFIED_ROOT -- deliberately an INCOMPAT bit,
+ * not compat/ro_compat: the entire point is that an implementation which
+ * doesn't enforce the check must REFUSE the volume, not silently skip
+ * verification (a ro_compat/compat bit would let a bypass be as simple as
+ * mounting with an older reader).
+ *
+ * HONEST SCOPE (flagged, not silently reduced): this is HMAC-SHA256
+ * authentication with a KEY EMBEDDED IN THE KERNEL BINARY
+ * (EMBKFS_VERIFY_ROOT_KEY, embkfs.c), not real asymmetric signing. Anyone
+ * with a copy of this kernel's source/binary can compute a valid HMAC for
+ * any root they like -- this does NOT defend against an attacker who has
+ * the kernel image, only against OFFLINE tampering by someone who
+ * doesn't (a raw-disk edit, a swapped drive, a different/unmodified
+ * kernel's write path). A true asymmetric upgrade (Ed25519 or similar) is
+ * a natural v2.x follow-up, itself another crypto-primitive-sized body of
+ * work on top of Phase 2's SHA-256/AES -- documented here and in
+ * docs/EMBKFS_spec_v2.2.md rather than silently passed off as more than
+ * it is.
+ *
+ * The HMAC is recomputed and re-stored by embkfs_write_superblock() on
+ * EVERY commit (same atomic write as generation/root/free_blocks), over
+ * exactly the bytes that matter -- the new root block_ptr (32 bytes) and
+ * the new generation (8 bytes) -- so it stays valid across ordinary
+ * writes made BY THIS KERNEL, and only ever mismatches when something
+ * else touched the volume. */
+#define EMBKFS_VERIFY_HEADER_OFFSET 260
+#define EMBKFS_VERIFY_HEADER_MAGIC  0x315245564B424D45ULL /* "EMBKVER1" */
+
+struct embk_verify_header {
+    uint64_t magic;      /*  0  EMBKFS_VERIFY_HEADER_MAGIC                 */
+    uint8_t  hmac[32];   /*  8  HMAC-SHA256(key, root(32) || generation(8)) */
+    uint8_t  reserved[8]; /* 40  must be 0                                 */
+} __attribute__((packed));
+_Static_assert(sizeof(struct embk_verify_header) == 48, "verify header must be 48 bytes");
+
+/* ---- Snapshots (v2.2 Phase 5b) --------------------------------------
+ * A snapshot is nothing but a FROZEN root block_ptr: taking one is O(1)
+ * (the tree it points at is already immutable, CoW guarantees no future
+ * write ever mutates it in place). Stored as ordinary tree items --
+ * {EMBKFS_ROOT_OBJECT_ID, EMBK_TYPE_SNAPSHOT, slot} -- reusing the exact
+ * same transactional put/commit machinery as everything else, rather than
+ * inventing a separate registry format.
+ *
+ * KNOWN LIMITATION (documented, not silently worked around): because the
+ * registry lives INSIDE the same versioned tree it's tracking versions
+ * of, rolling back to an OLDER snapshot reverts the ENTIRE tree including
+ * the registry itself -- any snapshot taken AFTER the rollback target
+ * stops existing in the restored tree (the same way `git reset --hard`
+ * to an old commit drops refs that only existed in now-abandoned history
+ * unless kept somewhere else). A follow-up could fix this by keeping the
+ * registry in superblock-adjacent space instead of the tree; out of scope
+ * here. Single create-then-rollback workflows (this phase's own verify
+ * criteria) are unaffected. */
+#define EMBKFS_MAX_SNAPSHOTS    16
+#define EMBKFS_SNAPSHOT_NAME_MAX 31   /* +1 reserved pad byte = 32 total */
+
+struct embk_snapshot_item {
+    uint8_t  name[32];       /*  0  NUL-padded; NOT guaranteed NUL-terminated
+                               *     if the name uses the full 31 usable bytes */
+    struct embk_block_ptr root; /* 32  the frozen root pointer                */
+    uint64_t generation;     /* 64  live generation at snapshot time          */
+    uint64_t timestamp;      /* 72  rtc_now_ns() at snapshot time             */
+} __attribute__((packed));
+_Static_assert(sizeof(struct embk_snapshot_item) == 80, "snapshot item must be 80 bytes");
 
 
 /* ---- In-memory mount state ---------------------------------------- */
@@ -223,6 +361,27 @@ struct embkfs_volume {
     struct embk_block_ptr root;      /* pointer into the metadata tree */
     bool     read_only;              /* forced RO by an ro_compat bit  */
     bool     mounted;                /* true once the SB validated     */
+    uint64_t feature_incompat;       /* mirrors the on-disk field; only ever
+                                       * gains bits (e.g. COMPRESSION the
+                                       * first time a write actually
+                                       * compresses an extent) -- v2.2 */
+    bool     encrypted;               /* true if unlocked via a correct passphrase
+                                       * at mount (v2.2 Phase 4) */
+    /* Opaque storage for a `struct aes_xts_ctx` (kernel/crypto/xts.h) --
+     * kept as raw bytes here rather than including xts.h so this widely-
+     * included header stays free of a crypto-library type dependency.
+     * embkfs.c static_asserts this is big enough and casts it. Valid only
+     * when `encrypted` is true. */
+    uint8_t  xts_opaque[512] __attribute__((aligned(16)));
+
+    uint32_t snapshot_count;         /* cached count of EMBK_TYPE_SNAPSHOT
+                                      * items, refreshed at mount and kept
+                                      * in sync on create/delete -- >0 makes
+                                      * the allocator hold freed blocks
+                                      * instead of reclaiming them (v2.2
+                                      * Phase 5b; see the snapshot section
+                                      * above for why this is conservative
+                                      * rather than exact refcounting) */
 };
 
 
@@ -267,8 +426,28 @@ struct embk_txn {
 
 
 /* ---- Public API (grows over the next steps) ----------------------- */
+/* v2.2 (Phase 1): how many EMBKFS volumes embkfs_init() will mount
+ * simultaneously -- previously the mount-probe loop stopped at the FIRST
+ * block device with a valid superblock; every other one, including a
+ * USB-attached volume sharing the machine with an internal disk, was
+ * silently ignored. Small and fixed like MAX_PROCESSES/MAX_CPUS elsewhere
+ * in this kernel -- revisit only if this is ever actually hit in practice. */
+#define EMBKFS_MAX_VOLUMES 4
+
 void embkfs_init(void);
+/* The PRIMARY volume: the first one embkfs_init() found and mounted,
+ * always registered at "/" by main.c. Every existing internal caller
+ * (the selftests, in particular) operates on this one implicitly and is
+ * completely unaffected by additional volumes existing alongside it --
+ * see embkfs_volume_count()/embkfs_volume_at() below for those. */
 struct embkfs_volume *embkfs_live_volume(void);
+
+/* How many volumes are currently mounted (0..EMBKFS_MAX_VOLUMES), and a
+ * mounted volume by index in mount order (index 0 == embkfs_live_volume()).
+ * main.c uses these to register every volume BEYOND the primary at its own
+ * VFS mount point; NULL for an out-of-range index. */
+uint32_t embkfs_volume_count(void);
+struct embkfs_volume *embkfs_volume_at(uint32_t index);
 int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 
 /* Probe one block device: read + verify the superblock at byte 65536, and on
@@ -293,8 +472,23 @@ int embkfs_run_path_selftests(void);
 int embkfs_run_allocator_selftests(void);
 int embkfs_run_tree_selftests(void);
 int embkfs_run_object_selftests(void);
+int embkfs_run_timestamp_selftests(void);
+int embkfs_run_multivol_selftests(void);
+int embkfs_run_compress_selftests(void);
+int embkfs_run_selfheal_selftests(void);
+int embkfs_run_snapshot_selftests(void);
+int embkfs_run_provenance_selftests(void);
+int embkfs_run_verifyboot_selftests(void);
 int embkfs_run_namespace_selftests(void);
 int embkfs_run_boot_diagnostics(void);
+
+/* Snapshots (v2.2 Phase 5b). `out_items`/`max` may be NULL/0 to just get
+ * *out_n. `name` is truncated to EMBKFS_SNAPSHOT_NAME_MAX bytes. */
+int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name);
+int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name);
+int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name);
+int embkfs_snapshot_list(struct embkfs_volume *vol, struct embk_snapshot_item *out_items,
+                         uint32_t max, uint32_t *out_n);
 
 /* Namespace/data mutators. */
 int embkfs_create_file(struct embkfs_volume *vol, uint64_t dir_oid,
@@ -307,6 +501,10 @@ int embkfs_mkdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path, uint64_t *out_oid);
 int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
                         const uint8_t *data, uint64_t len);
+/* `stat`-style metadata lookup: copies oid's raw inode item (size, mode,
+ * links, uid/gid, flags, atime/mtime/ctime/btime, generation) out to *out. */
+int embkfs_stat_object(struct embkfs_volume *vol, uint64_t oid,
+                       struct embk_inode_item *out);
 int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
                        uint8_t *buf, uint64_t buf_sz,
                        uint64_t *out_read);

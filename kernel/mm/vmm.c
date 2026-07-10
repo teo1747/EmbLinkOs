@@ -1,12 +1,32 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "../drivers/serial.h"
+#include "../cpu/spinlock.h"
 #include <stdint.h>
 
 
 static uint64_t kernel_pml4_phys = 0;     // physical address of the kernel PML4
 static int vmm_direct_map_active = 0;     // 0 during early init, 1 after the CR3 switch
 extern uint8_t kernel_end[];
+
+/* Guards every page-table STRUCTURE mutation (vmm_map_in/vmm_unmap/
+ * vmm_create_address_space/vmm_destroy_address_space, all of which walk or
+ * rewrite shared PML4/PDPT/PD/PT pages via get_or_create_table()/
+ * vmm_destroy_table()) plus the kstack/MMIO bump-pointer VA reservations
+ * below. Unlike pmm_lock/heap_lock (added alongside this one, same reason),
+ * this one was missing when Phase 3's SMP scheduler integration first
+ * landed: process_create_kthread() calls vmm_alloc_kernel_stack() ->
+ * vmm_map() with NO g_sched_lock held (proc_alloc() already released it),
+ * while process_reap_slot() calls vmm_free_kernel_stack()/
+ * vmm_destroy_address_space() -> vmm_unmap() WITH g_sched_lock held -- two
+ * DIFFERENT locks (one of them nonexistent), so a kthread creation on one
+ * core and a reap on another could walk/rewrite the exact same shared
+ * page-table page at the same time. Observed directly: a double fault
+ * inside vmm_flush_tlb() (a bare invlpg) with a live, non-zero RBP --
+ * config consistent with corrupted page-table structure, not a fresh/
+ * never-run context (which is the OTHER class of bug already fixed
+ * elsewhere in this file's callers). */
+static spinlock_t vmm_lock = SPINLOCK_INIT;
 
 
 // Map a physical page-table page to a usable virtual pointer.
@@ -55,17 +75,20 @@ uint64_t vmm_create_address_space(void) {
         return 0;
     }
 
+    spin_lock(&vmm_lock);
+
     uint64_t *pml4 = (uint64_t *)vmm_table(pml4_phys);    // virtual pointer to the new PML4
     uint64_t *kernel_pml4 = vmm_pml4(); // virtual pointer to the kernel's PML4
 
     for (int i = 0; i < 512; i++) {
         pml4[i] = 0;                    // empty user half + identity-map kernel half
     }
-    
+
     for (int i = 256; i < 512; i++) {
         pml4[i] = kernel_pml4[i];      // copy kernel half from the current PML4
     }
 
+    spin_unlock(&vmm_lock);
     return pml4_phys;
 }
 
@@ -101,6 +124,8 @@ void vmm_destroy_address_space(uint64_t pml4_phys) {
         return;
     }
 
+    spin_lock(&vmm_lock);
+
     uint64_t *pml4 = vmm_table(pml4_phys);
     for (int i = 0; i < 256; i++) {
         uint64_t entry = pml4[i];
@@ -112,6 +137,7 @@ void vmm_destroy_address_space(uint64_t pml4_phys) {
         pml4[i] = 0;
     }
 
+    spin_unlock(&vmm_lock);
     pmm_free_page(pml4_phys);
 }
 
@@ -152,27 +178,34 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
  which address space it belongs to (page-table pages are reachable via the
  direct map no matter whose tree they're in). */
  int vmm_map_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags){
+    spin_lock(&vmm_lock);
+
     uint64_t *pml4 = vmm_table(pml4_phys);
 
     uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  flags);
     if (!pdpt) {
+        spin_unlock(&vmm_lock);
         return -1;
     }
 
     uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt_addr), flags);
     if (!pd) {
+        spin_unlock(&vmm_lock);
         return -1;
     }
 
     uint64_t *pt = get_or_create_table(pd, pd_index(virt_addr), flags);
     if (!pt) {
+        spin_unlock(&vmm_lock);
         return -1;
     }
 
     // set the page table entry
-    uint64_t page_index = pt_index(virt_addr); // 12 bits for 4K pages 
+    uint64_t page_index = pt_index(virt_addr); // 12 bits for 4K pages
     pt[page_index] = (phys_addr & VMM_ADDR_MASK )| VMM_PRESENT | flags;
     vmm_flush_tlb(virt_addr);// flush TLB to update mapping /* harmless if the target address space isn't active */
+
+    spin_unlock(&vmm_lock);
     return 0;
  }
 
@@ -189,18 +222,23 @@ uint64_t vmm_get_kernel_pml4(void) {
 
 
 void vmm_unmap(uint64_t virt_addr){
+    spin_lock(&vmm_lock);
+
     uint64_t *pml4 = vmm_pml4();
     if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
         return;
     }
     uint64_t *pdpt = (uint64_t *)vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
         return;
     }
     uint64_t *pd = (uint64_t *)vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
 
     if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
         return;
     }
     uint64_t *pt = (uint64_t *)vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
@@ -208,6 +246,8 @@ void vmm_unmap(uint64_t virt_addr){
     uint64_t page_index = pt_index(virt_addr); // represents 12 bits for 4K pages
     pt[page_index] = 0; // clear the page table entry
     vmm_flush_tlb(virt_addr); // flush TLB to update mapping
+
+    spin_unlock(&vmm_lock);
 }
 
 /* Look up the physical address a VA maps to IN A GIVEN address space.
@@ -238,15 +278,30 @@ void vmm_flush_tlb(uint64_t virt_addr) {
 
 
 
-// Initialize the virtual memory manager
-void vmm_init(void) {
-    serial_write_string("\n=== VMM init ===\n");
-
-    /* enable NX: EFER.NXE (bit 11) — required before any PTE sets bit 63 */
+/* EFER.NXE (bit 11) is a PER-CORE MSR, not a paging-structure-wide setting:
+ * every core that ever walks a page table with VMM_NX (bit 63) set in any
+ * entry needs its OWN EFER.NXE=1, or that core treats bit 63 as a plain
+ * reserved bit and takes a reserved-bit page fault the moment it touches
+ * that mapping -- regardless of what any other core's EFER says. The BSP
+ * gets this from vmm_init() below; every AP must call this too (ap_main(),
+ * kernel/cpu/smp.c) before it can safely touch ANY VMM_NX-mapped memory,
+ * which in practice means immediately (kernel stacks are mapped
+ * VMM_WRITABLE | VMM_NX). Missing this on the APs was a real bug: it
+ * surfaced as a double fault (escalated from an unhandled reserved-bit
+ * #PF) the first time an AP's schedule_locked() switched into a fresh
+ * kthread's stack. */
+void vmm_enable_nx_this_cpu(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
     lo |= (1 << 11);                        /* NXE */
     __asm__ volatile("wrmsr" : : "c"(0xC0000080), "a"(lo), "d"(hi));
+}
+
+// Initialize the virtual memory manager
+void vmm_init(void) {
+    serial_write_string("\n=== VMM init ===\n");
+
+    vmm_enable_nx_this_cpu();
 
     // step 1:Allocate a new page for the kernel PML4
     // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it
@@ -369,8 +424,10 @@ uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
     pages = total_size  / PAGE_SIZE;
 
     // Reserve the virtual address range
+    spin_lock(&vmm_lock);
     uint64_t virt_base = mmio_next_virt;
     mmio_next_virt += total_size;
+    spin_unlock(&vmm_lock);
 
     serial_write_string("vmm_map_mmio: phys=");
     serial_write_hex(phys_algned);
@@ -426,9 +483,11 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
     // page is deliberately left unmapped: a stack that overflows downward
     // walks straight into it and takes a #PF at the overflow site instead of
     // silently corrupting whatever memory used to sit there.
+    spin_lock(&vmm_lock);
     uint64_t guard_virt = kstack_next_virt;
     uint64_t stack_base_virt = guard_virt + PAGE_SIZE;
     kstack_next_virt = stack_base_virt + (pages * PAGE_SIZE);
+    spin_unlock(&vmm_lock);
 
     for (uint64_t i = 0; i < pages; i++) {
         uint64_t phys = pmm_alloc_page();
