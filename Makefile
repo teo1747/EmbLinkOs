@@ -23,11 +23,24 @@ SYSCALL_ASM = kernel/cpu/syscall_entry.asm
 SYSCALL_OBJ = kernel/cpu/syscall_entry.o
 KCONTEXT_OBJ = kernel/cpu/kcontext.o
 
+# --- SMP: AP entry stub (linked into the kernel image) + the real-mode
+# trampoline (a separate flat binary, embedded via incbin -- see
+# kernel/cpu/ap_trampoline_blob.asm's comment for why this mirrors the
+# tree's old init_blob.asm technique).
+AP_ENTRY_ASM         = kernel/cpu/ap_entry.asm
+AP_ENTRY_OBJ         = kernel/cpu/ap_entry.o
+AP_TRAMPOLINE_ASM    = kernel/cpu/ap_trampoline.asm
+AP_TRAMPOLINE_BIN    = kernel/cpu/ap_trampoline.bin
+AP_TRAMPOLINE_BLOB_ASM = kernel/cpu/ap_trampoline_blob.asm
+AP_TRAMPOLINE_BLOB_OBJ = kernel/cpu/ap_trampoline_blob.o
+
 KERNEL_SRC = kernel/main.c \
              kernel/cpu/isr.c \
              kernel/cpu/pic.c \
              kernel/cpu/irq.c \
              kernel/cpu/gdt.c \
+             kernel/cpu/percpu.c \
+             kernel/cpu/smp.c \
              kernel/cpu/spinlock.c \
              kernel/cpu/rwlock.c \
              kernel/cpu/syscall.c \
@@ -49,6 +62,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/hpet.c \
              kernel/drivers/keyboard.c \
              kernel/drivers/pit.c \
+             kernel/drivers/rtc.c \
              kernel/drivers/pci.c \
              kernel/drivers/usb.c \
              kernel/drivers/usb_core.c \
@@ -66,8 +80,14 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/vmm.c \
              kernel/mm/kheap.c \
              kernel/mm/kmalloc.c \
+             kernel/crypto/sha256.c \
+             kernel/crypto/hmac.c \
+             kernel/crypto/pbkdf2.c \
+             kernel/crypto/aes.c \
+             kernel/crypto/xts.c \
              kernel/fs/fat32.c \
 			 kernel/fs/embkfs/embkfs.c \
+			 kernel/fs/embkfs/embkfs_compress.c \
 			 kernel/fs/embkfs/crc32c.c \
 			 kernel/fs/embkfs/embk_vfs.c \
 			 kernel/fs/fd.c \
@@ -137,8 +157,20 @@ $(KCONTEXT_OBJ): $(KCONTEXT_ASM)
 $(KENTRY_OBJ): $(KENTRY_ASM)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ)
+$(AP_ENTRY_OBJ): $(AP_ENTRY_ASM)
+	$(ASM) -f elf64 $< -o $@
+
+# Flat binary, NOT linked into the kernel -- an AP starts in 16-bit real
+# mode and must execute below 1MB, which the kernel's higher-half ELF is
+# not. Embedded as data via the incbin wrapper below instead.
+$(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM)
+	$(ASM) -f bin $< -o $@
+
+$(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN)
+	$(ASM) -f elf64 $< -o $@
+
+$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
@@ -189,7 +221,7 @@ run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
-		-vga virtio -serial stdio -no-reboot -no-shutdown -m 4G
+		-vga virtio -serial stdio -no-reboot -no-shutdown -m 4G -smp 4
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
@@ -205,6 +237,19 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
+
+# Encrypted EMBKFS test volume (v2.2 Phase 4). Passphrase is the fixed test
+# string "correcthorsebattery" -- NEVER a real credential, just a KAT-style
+# fixture so this target is scriptable. Boots straight to the kernel's
+# mount-time passphrase prompt; type it at the keyboard (masked echo).
+embkfs_encrypted.img: embkfs_mkfs/mkfs_embkfs.py user/init.elf
+	python3 embkfs_mkfs/mkfs_embkfs.py --encrypted embkfs_encrypted.img correcthorsebattery
+
+run-embkfs-encrypted: $(IMG) $(DISK) embkfs_encrypted.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs_encrypted.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown
 
 
@@ -306,6 +351,29 @@ run-usb-xhci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
 	    -device usb-kbd,bus=xhci.0 \
 	    -serial stdio -no-reboot -no-shutdown
 
+# EMBKFS-formatted USB mass-storage image, exercised specifically over xHCI
+# (its own separate MSC implementation, distinct from usb_core.c's UHCI/
+# OHCI/EHCI path) -- proves EMBKFS mounts over USB, not just ATA/AHCI.
+usbdisk_embkfs.img: embkfs_mkfs/mkfs_embkfs.py user/init.elf
+	python3 embkfs_mkfs/mkfs_embkfs.py usbdisk_embkfs.img
+
+run-usb-embkfs: $(IMG) $(DISK) usbdisk_embkfs.img
+	qemu-system-x86_64 $(DRIVES) \
+	    -device qemu-xhci,id=xhci \
+	    -drive id=usbembkfs,file=usbdisk_embkfs.img,format=raw,if=none \
+	    -device usb-storage,bus=xhci.0,drive=usbembkfs \
+	    -serial stdio -no-reboot -no-shutdown
+
+# Two independent EMBKFS volumes mounted at once (sdb -> "/", sdc -> "/sdc"),
+# both on plain IDE -- exercises embkfs_init()'s multi-volume mount table
+# without needing USB. Pair with `test embkfs multivol` at the shell.
+run-multivol: $(IMG) $(DISK) embkfs.img usbdisk_embkfs.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=usbdisk_embkfs.img,if=ide,index=2 \
+	    -serial stdio -no-reboot -no-shutdown
+
 debug: $(IMG) $(DISK)
 	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown -s -S
 
@@ -330,6 +398,7 @@ run-all: $(IMG) ahci.img fat32.img
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) \
 	      $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ)\
+	      $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BIN) $(AP_TRAMPOLINE_BLOB_OBJ) \
 	      user/init.o user/init.elf user/init.bin user/init_blob.o
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs
+.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted

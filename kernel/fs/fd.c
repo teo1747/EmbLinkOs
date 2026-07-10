@@ -22,7 +22,7 @@ static struct fd_entry g_boot_fds[FD_MAX_OPEN];
  * if one exists, else the shared boot-time table. */
 static struct fd_entry *fd_table(void)
 {
-    return current_process ? current_process->fds : g_boot_fds;
+    return current_thread ? current_process->fds : g_boot_fds;
 }
 
 void vfs_fd_init(void)

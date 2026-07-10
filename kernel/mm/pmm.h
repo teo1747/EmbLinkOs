@@ -60,6 +60,15 @@ uint64_t pmm_alloc_page(void);
 // takes a physical address and frees the corresponding virtual page
 void pmm_free_page(uint64_t phys_addr);
 
+// Explicitly mark one specific page as used, without allocating it via the
+// normal first-fit scan. For physical addresses that something OUTSIDE the
+// allocator's own bookkeeping needs to own at a fixed location (e.g. the
+// AP trampoline, which must sit at a page-aligned, known address the SMP
+// bring-up code pokes machine code into directly) rather than wherever
+// pmm_alloc_page() happens to return. Idempotent: reserving an
+// already-reserved page is a harmless no-op.
+void pmm_reserve_page(uint64_t phys_addr);
+
 
 
 

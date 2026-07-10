@@ -1,5 +1,16 @@
 #include <stdint.h>
 #include "../drivers/serial.h"
+#include "spinlock.h"
+
+/* Guards the exception dump below. Deliberately never unlocked: if a
+ * second core also faults while this one is dumping/halted, it should
+ * just wait here forever rather than interleave its own dump into this
+ * one byte-by-byte (serial_write_* has no locking of its own -- observed
+ * directly as two simultaneous double faults on different cores producing
+ * an unreadable interleaved crash dump under -smp 4). One core's crash
+ * report is what matters; a second one competing for the same UART just
+ * needs to not corrupt the first. */
+static spinlock_t panic_lock = SPINLOCK_INIT;
 
 
 // structure to hold the CPU register state during an interrupt
@@ -48,7 +59,8 @@ static const char *exception_messages[] = {
 
 
 void isr_handler(struct registers *regs) {
-    
+    spin_lock(&panic_lock);   // never released -- see panic_lock's own comment
+
     serial_write_string("\n=== Exception ===\n");
     serial_write_string("Vector: ");
     serial_write_hex(regs->vector);

@@ -11,7 +11,7 @@ void spin_lock(spinlock_t *lock) {
     // Disable interrupts and save previous state
     uint64_t flags;
     __asm__ volatile ("pushfq; pop %0" : "=r"(flags) :: "memory");
-    
+
     __asm__ volatile ("cli" ::: "memory"); // disable interrupts on this core
 
     // Spin until we can set locked from 0 to 1
@@ -32,7 +32,6 @@ void spin_lock(spinlock_t *lock) {
 void spin_unlock(spinlock_t *lock) {
     uint64_t flags = lock->saved_flags;
 
-    
     //  Release the lock with release semantics (all our writes visible first)
     __atomic_store_n(&lock->locked, 0, __ATOMIC_RELEASE);
 

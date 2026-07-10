@@ -171,6 +171,30 @@ EXTENT_FLAG_ENCRYPTED  = 1 << 2
 # Kernel-header naming aliases.
 EMBKFS_EXTENT_F_HOLE = EXTENT_FLAG_HOLE
 
+# Superblock feature_incompat bits -- a SEPARATE bit space from the extent
+# flags above (EMBKFS_INCOMPAT_COMPRESSION == 0x1, NOT the same value as
+# EXTENT_FLAG_COMPRESSED == 0x2 -- easy to conflate, they're unrelated
+# fields at different offsets). Mirrors embkfs.h exactly (v2.2 Phase 3/4).
+EMBKFS_INCOMPAT_COMPRESSION = 1 << 0
+EMBKFS_INCOMPAT_ENCRYPTED   = 1 << 1
+
+# ---- Crypto header (v2.2 Phase 4) ----------------------------------------
+# Lives at a fixed offset within the SAME 512-byte sector as the superblock
+# struct itself, past SB_BODY_SIZE -- NOT covered by the superblock's own
+# checksum (see embkfs.h's embk_crypto_header comment for why that's a
+# deliberate tradeoff). Mirrors struct embk_crypto_header exactly:
+#   magic(8) kdf_salt(16) kdf_iterations(4) key_check_ciphertext(16) reserved(8)
+CRYPTO_HEADER_OFFSET = 200
+CRYPTO_HEADER_FMT = "<Q16sI16s8s"
+CRYPTO_HEADER_SIZE = struct.calcsize(CRYPTO_HEADER_FMT)
+assert CRYPTO_HEADER_SIZE == 52, CRYPTO_HEADER_SIZE
+EMBKFS_CRYPTO_HEADER_MAGIC = struct.unpack("<Q", b"EMBKCRY1")[0]
+
+# Fixed 16-byte plaintext the key-check ciphertext is built from -- must
+# match kernel/fs/embkfs/embkfs.c's EMBKFS_KEY_CHECK_PLAINTEXT exactly.
+KEY_CHECK_PLAINTEXT = b"EMBKFS-KEY-CHECK"
+assert len(KEY_CHECK_PLAINTEXT) == 16
+
 def pack_extent(disk_block, length_blocks, logical_size, data_checksum,
                 generation=0, flags=0):
     return struct.pack(EXTENT_FMT,
