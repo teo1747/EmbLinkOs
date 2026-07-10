@@ -6,6 +6,7 @@
 #include "../mm/vmm.h"
 #include "../drivers/pit.h"
 #include "idt.h"
+#include "percpu.h"
 #include <stdint.h>
 
 
@@ -44,6 +45,25 @@ static inline void wrmsr(uint32_t msr, uint64_t value){
 #define A32_APIC_BASE_ENABLE (1 << 11)
 
 
+/* The MSR enable bit + spurious-vector register write are PER-CORE
+ * hardware state -- every core has its own local APIC and must do this
+ * itself. Split out from lapic_init() so an AP (kernel/cpu/smp.c's
+ * ap_main()) can call just this part, via lapic_init_this_cpu() below,
+ * without repeating the ACPI lookup + vmm_map_mmio() call, both of which
+ * must happen exactly once (the LAPIC MMIO window maps to the same
+ * physical address on every core -- see percpu.h's comment -- so mapping
+ * it again would just waste MMIO_BASE bump-allocator space for no
+ * benefit). */
+static void lapic_enable_this_core(void) {
+    // Enable the local APIC by setting the enable bit in the Spurious Interrupt Vector Register
+    uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
+    base |= A32_APIC_BASE_ENABLE; // Set the enable bit
+    wrmsr(IA32_APIC_BASE_MSR, base);
+
+    // Software enable the APIC by setting the spurious interrupt vector and enable bit in the Spurious Interrupt Vector Register
+    lapic_write(LAPIC_REG_SPURIOUS, LAPIC_SVR_ENABLE | 0xFF); // Use vector 0xFF for spurious interrupts
+}
+
 void lapic_init(void) {
 
     serial_write_string("\n=== LAPIC INIT ===\n");
@@ -62,15 +82,80 @@ void lapic_init(void) {
     }
     kprintf("LAPIC; MMIO mapped at %p (phys %p)\n", lapic_base, (void *)acpi->local_apic_address);
 
-    // Enable the local APIC by setting the enable bit in the Spurious Interrupt Vector Register
-    uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
-    base |= A32_APIC_BASE_ENABLE; // Set the enable bit
-    wrmsr(IA32_APIC_BASE_MSR, base);
-
-    // Software enable the APIC by setting the spurious interrupt vector and enable bit in the Spurious Interrupt Vector Register
-    lapic_write(LAPIC_REG_SPURIOUS, LAPIC_SVR_ENABLE | 0xFF); // Use vector 0xFF for spurious interrupts
+    lapic_enable_this_core();
     kprintf("LAPIC: enable, id=%u, version=%x\n",
         (unsigned int)lapic_get_id(),(unsigned int) lapic_read(LAPIC_REG_VERSION) & 0xFF);
+}
+
+void lapic_init_this_cpu(void) {
+    /* lapic_base is already mapped (by the BSP's lapic_init() call, which
+     * always runs first) and is valid on every core -- see this file's
+     * lapic_enable_this_core() comment for why. Just the per-core enable
+     * bit + spurious vector, nothing else. */
+    lapic_enable_this_core();
+}
+
+/* Wait for the ICR's own delivery-status bit (bit 12 of the low dword) to
+ * clear, meaning the last IPI this core sent has actually been accepted by
+ * the bus -- sending a second ICR write before this clears is undefined
+ * per the SDM. A bounded spin, not indefinite: on real hardware or a
+ * correctly emulated APIC this always clears quickly; looping forever on
+ * a hypothetical stuck bit would hang the BSP's whole boot instead of
+ * just failing this one AP. */
+static void lapic_wait_icr_idle(void) {
+    for (int i = 0; i < 100000; i++) {
+        if ((lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) == 0) {
+            return;
+        }
+        __asm__ volatile ("pause");
+    }
+}
+
+/* Minimum-wait delay for the gaps in the INIT-SIPI-SIPI sequence below.
+ * Millisecond granularity is coarser than the SDM's suggested 200us
+ * between the two SIPIs, but waiting longer than the minimum is always
+ * safe -- only waiting less would be a problem. Mirrors the existing
+ * HPET-preferred-else-PIT pattern lapic_timer_init() already uses. */
+static void smp_min_delay(void) {
+    if (hpet_available()) {
+        hpet_delay_us(200);
+    } else {
+        pit_delay_ms(1);
+    }
+}
+
+void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys) {
+    uint32_t dest = dest_apic_id << LAPIC_ICR_DEST_SHIFT;
+    uint8_t sipi_vector = (uint8_t)(trampoline_phys >> 12);
+
+    // 1. INIT IPI (assert)
+    lapic_write(LAPIC_REG_ICR_HIGH, dest);
+    lapic_write(LAPIC_REG_ICR_LOW, LAPIC_ICR_DELIVERY_INIT | LAPIC_ICR_LEVEL_ASSERT | LAPIC_ICR_TRIGGER_LEVEL);
+    lapic_wait_icr_idle();
+
+    // 2. INIT IPI deassert
+    lapic_write(LAPIC_REG_ICR_HIGH, dest);
+    lapic_write(LAPIC_REG_ICR_LOW, LAPIC_ICR_DELIVERY_INIT | LAPIC_ICR_TRIGGER_LEVEL);
+    lapic_wait_icr_idle();
+
+    if (hpet_available()) {
+        hpet_delay_ms(10);
+    } else {
+        pit_delay_ms(10);
+    }
+
+    // 3. First SIPI
+    lapic_write(LAPIC_REG_ICR_HIGH, dest);
+    lapic_write(LAPIC_REG_ICR_LOW, LAPIC_ICR_DELIVERY_STARTUP | sipi_vector);
+    lapic_wait_icr_idle();
+    smp_min_delay();
+
+    // 4. Second SIPI (per SDM recommendation for older processors; a
+    // harmless no-op extra nudge on anything modern enough to have
+    // started from the first one already).
+    lapic_write(LAPIC_REG_ICR_HIGH, dest);
+    lapic_write(LAPIC_REG_ICR_LOW, LAPIC_ICR_DELIVERY_STARTUP | sipi_vector);
+    lapic_wait_icr_idle();
 }
 
 
@@ -126,7 +211,17 @@ void lapic_timer_init(uint8_t vector) {
 }
 
 void lapic_timer_handler(void){
-    lapic_ticks++; // Increment the LAPIC timer tick count
+    /* Once every core has its own LAPIC timer firing independently (SMP),
+     * incrementing this SHARED counter from every core's handler would
+     * silently change its meaning from "wall-clock ticks" to "sum of every
+     * core's ticks" -- e.g. selftest_wait_ticks() (process.c) would need a
+     * different tick budget depending on how many cores happen to be
+     * online. Keep it a true wall clock: only the BSP's own timer
+     * advances it. Every core (BSP and every AP) still unconditionally
+     * calls schedule() below on its OWN tick -- that part doesn't change. */
+    if (this_cpu_is_bsp()) {
+        lapic_ticks++; // Increment the LAPIC timer tick count
+    }
     lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
                       // below, so the LAPIC can keep delivering interrupts to
                       // whichever process ends up running next.

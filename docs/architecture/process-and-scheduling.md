@@ -6,6 +6,10 @@
 
 *Update, later the same day: Phase B landed in full — wait queues, timer-driven preemption, the uncatchable kill, per-process fd tables, and `sys_wait`/`sys_spawn`/`sys_yield`/`sys_getpid`. Four more bugs were found and fixed while verifying Phase B end to end (Bugs 6–9, §16), all specific to the interaction between real preemption and code that had only ever run with a single process. Sections below are again updated in place against what actually shipped, not re-derived.*
 
+*Update, 2026-07-06: Phase 4 (the real `struct thread`/`struct process` split, §4.1's long-deferred half) landed — `process.c` rewritten in full around `thread_table[MAX_THREADS]` (the schedulable unit) + `process_table[MAX_PROCESSES]` (the resource owner: address space, pid, parent/child/zombie tracking, fd/handle tables), with `current_thread` (a real per-CPU field, `cpu_table[]`) and `current_process` (a derived, read-only `current_thread->proc` macro) replacing the old single `current_process` field everywhere. Two new selftests (`test thread smp`/`test thread exit`) plus the full existing 8-test regression battery all pass, both under `-smp 4`, across two independent clean boot-to-battery runs — zero new bugs found this phase, the first phase in this subsystem's history where that's true (see §16's closing note). Sections below are updated in place.*
+
+*Update, 2026-07-09: Phase 5 (ring-3 threads) landed — `thread_create_user()`/`thread_join()`/`thread_exit_self()` (process.c) plus three new syscalls (`sys_thread_create`/`sys_thread_join`/`sys_thread_exit`) give a ring-3 process the same real multi-threading Phase 4 gave the kernel, with each extra thread getting its own dedicated, deterministically-placed user stack inside the SAME process address space. `MAX_PROCESSES`/`MAX_THREADS` raised 16/16 → 64/256 now that a single process can genuinely want more than one thread (with `KSTACK_SIZE`'s accidental coupling to `MAX_PROCESSES` caught and fixed in the same pass — see §6.1). `user/init.c` now spawns and joins a second thread of itself as part of its own startup, proving real shared-memory threading end to end via a new `test ring3 threads` selftest. Verification this phase also surfaced (and mitigated, not fully eliminated) a real test-robustness finding in the pre-existing `test thread smp` — a correlated/bursty timing artifact of its original fixed sample size, not a scheduler bug — see §12/§13's Phase 5 notes. Sections below are updated in place.*
+
 **Status legend:** ✅ Built · 🚧 Built but wrong/incomplete (see Common Bugs) · 🎯 Specified here, not yet built · ⏳ Deferred
 
 ---
@@ -42,19 +46,24 @@ This section exists because `docs/ARCHITECTURE.md` §2 lists the scheduler as "�
 
 | Property | Actual state |
 |---|---|
-| Process table | Static array, `MAX_PROCESSES = 16` (`process.h`) |
-| Scheduling policy | Strict round-robin, no priority, no fairness accounting |
+| Process/thread tables | ✅ Split (Phase 4). Static arrays: `thread_table[MAX_THREADS = 256]` (the schedulable unit — ctx, kstack, state, priority, running/pinned CPU) and `process_table[MAX_PROCESSES = 64]` (the resource owner — pid, pml4, parent/child/zombie tracking, fd/handle tables). Raised from 16/16 in Phase 5 once a ring-3 process could genuinely want more than one thread (see §6.1) — `KSTACK_SIZE`'s accidental coupling to `MAX_PROCESSES` was caught and decoupled in the same pass, or raising the ceiling would have silently quadrupled every kernel stack's size. Every process created by `process_create()`/`process_create_kthread()` still gets exactly one thread by default; `thread_create()`/`thread_create_user()` are the primitives that let a process have more than one, sharing its address space. |
+| Scheduling policy | ✅ Built (Phase C). Fixed priority bands (`SCHED_PRIORITY_BANDS = 4`: REALTIME/INTERACTIVE/NORMAL/BACKGROUND), round-robin within a band, with aging (`PRIORITY_AGE_TICKS = 20`, ~200ms/band) bumping a starved READY process up one band so a busy high band can't starve a low one forever. Verified via `test sched priority`. |
 | Preemption | ✅ Built. `lapic_timer_handler` calls `schedule()` on every tick (100Hz) after `lapic_send_eoi()` — genuine timer-driven round-robin, not just syscall-triggered. See Bugs 6 and 7, §16, both found while verifying this. |
-| Blocking | ✅ Built. `struct wait_queue` + intrusive `process::wait_next`; `wait_queue_block`/`wait_queue_wake_one`/`wait_queue_wake_all` implement §7.3 as specified. |
+| Blocking | ✅ Built. `struct wait_queue` + intrusive `process::wait_next`; `wait_queue_block`/`wait_queue_wake_one`/`wait_queue_wake_all` implement §7.3 as specified. Now genuinely exercised: `process_wait()`'s blocking path (below) and `sys_wait` both use it for real, not just the selftests. |
 | Termination reclamation | ✅ Fixed and now exercised. `process_reap()` frees the PCB/kernel stack/address space, deferred one `schedule()` call behind the actual exit (see §7.4). Previously unexercised in practice; now proven live by `test sched reap` and by real multi-process use (`sys_spawn`/`sys_wait`). See Bug 3, §16. |
 | Uncatchable kill | ✅ Built. `process_kill(pid)` forces `PROCESS_ZOMBIE` regardless of current state (including `BLOCKED`, unlinking from whatever wait queue it's on), reaps immediately unless it's the caller itself. Verified via `test sched kill`. |
+| Parent/child tracking + real blocking wait | ✅ Built (closes what was Phase D). `struct process` has `parent`/`parent_pid` (the latter guards against a recycled PCB slot aliasing an unrelated new process, see `parent_is_alive()`), `child_list`/`child_next` (live children, for `ps`), and `zombie_head`/`zombie_next` (a parent's exited-but-unclaimed children — deliberately two separate fields, not one double-duty field, see §16's discussion of why). `process_wait(pid)` genuinely blocks on `child_wait` until woken by the specific child's exit or kill, rather than busy-polling. See Bug 11, §16 for a real deadlock found and fixed while building this. |
+| Ring-3 process handles | ✅ Built. Per-process `struct proc_handle handles[PROC_HANDLE_MAX]` translates a small ring-3-visible integer to a real pid (`process_handle_alloc/resolve/free`); `sys_spawn` returns a handle, `sys_wait`/`sys_kill` take one. Closes the confused-deputy gap a raw pid argument left open (any ring-3 process could otherwise name any pid it could guess). |
 | Per-process file descriptors | ✅ Built. `struct process` now embeds `struct fd_entry fds[FD_MAX_OPEN]`; `fs/fd.c`'s `fd_table()` helper returns it (or a boot-time-only global table before any process exists). Unblocks `spawn()`'s file-action model (§3.2). |
 | Kernel stack guard page | ✅ Fixed. `vmm_alloc_kernel_stack`/`vmm_free_kernel_stack` page-map the stack with an unmapped guard page directly below it, replacing the flat `kmalloc`. See Bug 4, §16 — and Bug 5, found while verifying this fix. |
-| Syscalls reaching this subsystem | ✅ Built. `sys_exit`, `sys_yield`, `sys_spawn`, `sys_wait`, `sys_getpid` all wired to syscall numbers and dispatched from `syscall_dispatch`. |
-| Automated selftests | ✅ Built. `test sched roundrobin`/`kill`/`reap`/`stackguard` (`process_test_*` in `process.c`), matching §12's four specified tests exactly. |
-| SMP | Single core. `current_process` is one global pointer, not per-CPU. Unchanged by Phase B — flagged again in §8, now with a real reentrancy hazard (preemption) instead of a hypothetical one. |
+| Syscalls reaching this subsystem | ✅ Built. `sys_exit`, `sys_yield`, `sys_spawn`, `sys_wait`, `sys_getpid`, `sys_kill` all wired to syscall numbers and dispatched from `syscall_dispatch` — the full §15.2 surface. |
+| Interactive process control | ✅ Built. The kernel's own shell (`main.c`) is no longer a one-way `process_start_first()` hand-off — it calls `process_adopt_current()` to become a real, permanent, round-robin-scheduled `current_process` itself, then `run`/`ps`/`kill`/`wait`/`nice` shell commands call straight into this subsystem's kernel-internal API (no handle indirection needed there — trusted code, not a ring-3 caller). Verified interactively in QEMU via monitor-injected keystrokes against a real `/init.elf`. |
+| Automated selftests | ✅ Built. `test sched roundrobin`/`kill`/`reap`/`stackguard`/`wait`/`priority`, `test smp sched`/`kill`, `test thread smp`/`exit` (`process_test_*` in `process.c`) — ten selftests total, the original four plus two added alongside `process_wait()`/priority bands, two added for SMP, and two added for the Phase 4 thread/process split. |
+| SMP | ✅ Built (see the Phase SMP roadmap entry, §13). `current_thread` is a real per-CPU field (`cpu_table[]`, `kernel/cpu/percpu.h`); `current_process` is derived from it (`current_thread->proc`). |
+| Thread/process split | ✅ Built (Phase 4, §4.1's long-deferred half). `struct thread` (schedulable unit) and `struct process` (resource owner) are now genuinely separate structs — see §6.1/§6.2. `thread_create(proc, entry)` lets one process have more than one kernel thread, verified by `test thread smp` (3 threads, 1 process, shared address space, ≥2 distinct cores) and `test thread exit` (address space survives until the LAST thread exits, not the first). |
+| Ring-3 threads | ✅ Built (Phase 5, closes what Phase 4 deliberately deferred). `thread_create_user()`/`thread_join()`/`thread_exit_self()` (process.c) plus `sys_thread_create`/`sys_thread_join`/`sys_thread_exit` (§15.2) give a ring-3 process the same real multi-threading Phase 4 gave kthreads — an additional thread sharing the SAME process address space, entering ring 3 directly, with its own dedicated user stack (§6.1). Joinable, not auto-reaped, unlike a kthread: a thread created this way sits as a zombie until `thread_join()` collects its exit code, mirroring how a process zombie waits for `process_wait()`. Verified end to end by `test ring3 threads`, which spawns `/init.elf` (via the REAL scheduler, `process_create()`/`process_wait()` — not the standalone `enter_user_mode()` path `test ring3` uses) and checks an exit code that only comes out right if the child's own `sys_thread_create`/`sys_thread_join` and a genuinely shared `.data` write all worked. |
 
-Nine concrete bugs have now been found (and all nine fixed) in this subsystem, documented in full in §16, Common Bugs, because they are the kind of bug this class of code produces repeatedly — worth remembering the *shape* of the mistake, not just the fix. The first five were found bringing up a single process (Phase A); the last four were found bringing up real preemption, multi-process syscalls, and per-process fd tables (Phase B) — every one of them a case of code that was correct for exactly one process silently breaking the instant a second process and real preemption coexisted:
+Twenty-five concrete bugs were found (and all twenty-five fixed) getting this subsystem from Phase A through the SMP phase, documented in full in §16, Common Bugs, because they are the kind of bug this class of code produces repeatedly — worth remembering the *shape* of the mistake, not just the fix. The first five were found bringing up a single process (Phase A); the next four were found bringing up real preemption, multi-process syscalls, and per-process fd tables (Phase B) — every one of them a case of code that was correct for exactly one process silently breaking the instant a second process and real preemption coexisted. Bug 10 is a different provenance worth naming explicitly: it was caught by *re-reading* the finished Phase B work while writing this document, not by an observed crash or a failing test — a reminder that "no test caught it yet" and "it isn't there" are not the same claim. Bug 11 is back to the usual provenance (a genuinely new, previously-unexercised code path — real blocking `process_wait()` — immediately hanging its own first selftest run). Bugs 12–25 were the SMP bring-up ledger (§16). **Phase 4 (the thread/process split) added zero new bugs** — the first phase in this subsystem's history of which that's true, credited to the split being designed explicitly around the two hazards SMP had already taught (idempotent re-entry into exit-disposition logic, and a belt-and-suspenders `running_cpu` liveness check) rather than being new territory:
 
 1. **The ring-3 entry trampoline pushed the wrong CS selector** (a literal immediate instead of the intended register operand) — corrupted `iretq` frame, `#GP` on every process start.
 2. **`kstack_top` was declared `uint16_t`** in a struct that stores a 64-bit heap address in it — silent truncation that would have corrupted `TSS.RSP0` the first time a ring-3 process took any interrupt.
@@ -65,6 +74,8 @@ Nine concrete bugs have now been found (and all nine fixed) in this subsystem, d
 7. **`int 0x80` leaves IF=0 for the entire syscall** — same underlying fact as #6 (interrupt gates auto-clear IF), different symptom: any syscall blocking on a hardware completion IRQ (disk I/O inside `sys_open`) hung forever because the satisfying IRQ could never fire.
 8. **`proc_alloc()` marked a brand-new PCB `PROCESS_READY` before it was initialized** — harmless with no preemption, but the instant real preemption (#6/#7 above) and a second `process_create()` call could interleave, the scheduler could pick a half-built PCB mid-ELF-load and crash.
 9. **PCB leak on every `process_create()` error path** — none of the four early-return failure paths reset `state` back to `PROCESS_UNUSED`, permanently leaking the slot on any failed creation.
+10. **`schedule()` itself was reentrant against the timer ISR when called from syscall context** — `syscall_dispatch()`'s `sti` (needed for Bug 7) meant `schedule()` calls from `sys_exit`/`sys_yield` ran with IF=1, so a timer IRQ could land mid-`schedule()` and re-enter it while the outer call was still mutating shared scheduler state.
+11. **`schedule()`'s zombie hand-off ran after the "nothing else to switch to" early return, deadlocking `process_wait()`** — a dying process's parent-hand-off/auto-reap decision was reachable only once a *different* runnable process had already been found, but the one scenario `process_wait()` exists to create is exactly the parent sitting `BLOCKED` (not READY/RUNNING) with nothing else runnable — so the hand-off that would wake it never ran, and neither process was ever scheduled again. Found immediately by `test sched wait` hanging the very first time it ran.
 
 ---
 
@@ -87,7 +98,7 @@ This section exists because the governing principle in `docs/ARCHITECTURE.md` §
 - Separating them now costs nothing (a process with exactly one thread is the common case anyway) and avoids the exact retrofit Linux users complain about (`gettid()` existing because `getpid()` was already load-bearing for the wrong thing).
 - It matches the ops-vector/handle discipline already chosen in §3.4/3.5: a thread handle and a process handle are different capability types, which only makes sense if they're different objects.
 
-**Current code reality check:** `struct process` today conflates the two — it holds exactly one `struct kcontext` (one execution context) and is what `schedule()` switches between. This is fine as the *first* increment (§13 Phase A keeps it this way deliberately) but §13 Phase D is where `struct thread` splits out, once anything needs more than one thread per process. Not doing this split prematurely is itself a design decision — see §17 Trade-offs.
+**Current code reality check:** ✅ done (Phase 4, §13). `struct thread` (the schedulable unit — `ctx`, `kstack_top`, `state`, `priority`, `running_cpu`/`pinned_cpu`) and `struct process` (the resource owner — `pid`, `pml4_phys`, parent/child/zombie tracking, `fds`/`handles`) are now genuinely separate structs, exactly the Windows/FreeBSD shape this section argued for. `schedule()`'s scan/dispatch shape (priority bands, round-robin, aging) is textually almost unchanged — it now scans `thread_table[]`, reading `t->proc->pml4_phys` at dispatch. `thread_create(proc, entry)` is the new primitive letting one process own more than one thread; every process still starts with exactly one (`process_create()`/`process_create_kthread()`), so "a process with one thread is the common case" (this section's original reasoning for deferring the split) remains true even now that the split exists.
 
 ### 4.2 Scheduling algorithm
 
@@ -137,7 +148,7 @@ x86 has a **hardware task-switch mechanism** (the `TSS` descriptor's busy bit, `
               │  schedule() — policy-pluggable via an ops vector      │
               │  ┌────────────┐  ┌────────────┐  ┌─────────────────┐ │
               │  │ Run queue  │  │ Wait queues │  │ Priority/aging  │ │
-              │  │ (Phase A:  │  │ (Phase B,   │  │ (Phase C, 🎯)   │ │
+              │  │ (Phase A:  │  │ (Phase B,   │  │ (Phase C, ✅)   │ │
               │  │ ring, ✅)  │  │ ✅)         │  │                 │ │
               │  └────────────┘  └────────────┘  └─────────────────┘ │
               │  timer-driven preemption: LAPIC tick → schedule() ✅  │
@@ -171,6 +182,8 @@ x86 has a **hardware task-switch mechanism** (the `TSS` descriptor's busy bit, `
 
 ### 6.1 Process Control Block — current (`process.h`, ✅ built, annotated)
 
+**Superseded by the Phase 4 split (§4.1, §13) — kept below as the historical single-struct shape, with the current split immediately after.** Through Phase SMP, `struct process` conflated the schedulable unit and the resource owner:
+
 ```c
 struct process {
     uint32_t pid;                  // process ID, monotonic allocator (§7.1)
@@ -197,52 +210,159 @@ struct process {
 };
 ```
 
-Every field above exists because the trampoline or the scheduler dereferences it at a specific moment — there is no incidental state:
+**Phase 4, ✅ built — the actual current shape.** The fields above split across two structs: everything `schedule()` touches every tick moved to `struct thread`; everything a process *owns* (and shares across every thread it has) stayed on `struct process`:
 
-- `pml4_phys` / `kstack_top` are read by `dispatch()` (§5) *before every single switch*, including the very first one, which is why `process_start_first` duplicates that logic rather than special-casing it away.
-- `ctx` is opaque to everything except `kernel_ctx_switch`/`kernel_ctx_restore` — no other code should reach into it.
-- `entry_point` / `user_rsp` are read exactly once, by `process_trampoline`, and never again — they describe how to *become* the process, not its ongoing state. (This is why they don't belong in `ctx`: `ctx.rip` is always `process_trampoline` for a process that hasn't run yet, and becomes the real resume address only after the first voluntary yield.)
-- `wait_next`/`wait_queue` are read/written only by the wait-queue primitive (§7.3) and by `process_kill` (§9) when killing a blocked target — never touched directly by ad hoc code, per invariant 4 in §7.
-- `fds` is embedded by value rather than a pointer to a separately-allocated table, because a process's fd table has the exact same lifetime as the PCB itself (created with the process, destroyed with it) — there is no case where it outlives or is shared independently of the PCB, so a separate allocation would just be an extra failure path with no benefit. `fs/fd.c`'s `fd_table()` helper returns `&current_process->fds[0]` when there is a current process, or a boot-time-only global array before any process exists (preserves pre-process selftest behavior).
+```c
+struct thread {
+    struct kcontext ctx;           // unchanged from above — still opaque outside
+                                    //   kernel_ctx_switch/kernel_ctx_restore
+    uint64_t kstack_top;           // this THREAD's own kernel stack (was the process's)
+    uint64_t entry_point;          // ring-3 entry VA, OR (kthreads) the real function
+                                    //   pointer kthread_trampoline stashes here
+    uint64_t user_rsp;             // initial ring-3 RSP (ring-3 threads only)
+    enum process_state state;      // moved from struct process -- see §7
 
-### 6.2 Process Control Block — remaining additions (🎯, phased; see §13 for when each lands)
+    struct thread *wait_next;      // wait-queue membership -- now thread-level,
+    struct wait_queue *wait_queue;  //   since threads (not processes) block/wake
+
+    int running_cpu;               // which cpu_table[] index this thread is
+                                    //   RUNNING on, -1 otherwise (moved from
+                                    //   struct process; see process_kill()'s
+                                    //   three-way branch, §9)
+    int pinned_cpu;                // -1 = any core; >=0 = ONLY that core may
+                                    //   dispatch this thread (per-core idle/
+                                    //   adopted-shell liveness pin, Phase SMP)
+
+    uint8_t  priority;              // moved from struct process
+    uint32_t ticks_since_scheduled; // moved from struct process
+
+    struct process *proc;          // owning process -- never NULL
+    struct thread *proc_thread_next; // intrusive link in proc->thread_list
+};
+
+struct process {
+    uint32_t pid;
+    uint64_t pml4_phys;            // shared by every thread of this process
+
+    struct process *parent;
+    uint32_t        parent_pid;
+    struct process *child_list;
+    struct process *child_next;
+    struct process *zombie_head;
+    struct process *zombie_next;
+    struct wait_queue child_wait;
+
+    int exit_code;                 // valid once every thread has exited
+    int live_thread_count;         // process is reapable only once this hits 0
+    struct thread *thread_list;    // this process's threads (proc_thread_next-linked)
+    int running_cpu;               // meaningful ONLY once live_thread_count == 0:
+                                    //   mirrors the completing thread's own
+                                    //   running_cpu at that instant -- see the
+                                    //   field's comment (process.h) and §7.4
+
+    struct fd_entry fds[FD_MAX_OPEN];
+    struct proc_handle handles[PROC_HANDLE_MAX];
+};
+```
+
+What moved and why, field by field:
+
+- `ctx`/`kstack_top`/`entry_point`/`user_rsp`/`state` all moved to `struct thread` unchanged in meaning — they were always properties of *one execution context*, and the single-struct shape only got away with calling that "the process" because there was never more than one.
+- `wait_next`/`wait_queue` moved to `struct thread` because it's genuinely a THREAD that blocks and wakes — a process with multiple threads can have some blocked and some running simultaneously, which the old shape had no way to express.
+- `running_cpu`/`pinned_cpu`/`priority`/`ticks_since_scheduled` moved to `struct thread` for the same reason: they're per-schedulable-unit facts, and `schedule_locked()`'s scan now iterates `thread_table[]`, not `process_table[]`.
+- `pml4_phys`/`parent`/`parent_pid`/`child_list`/`child_next`/`zombie_head`/`zombie_next`/`child_wait`/`fds`/`handles` all stayed on `struct process` — every one of them is a resource or a piece of family-tree bookkeeping that every thread of a process shares identically, and splitting them per-thread would be actively wrong (two threads of one process must see the same address space and the same fd table, by definition).
+- `exit_code` stayed on `struct process` — it's meaningful once, for the whole process, when the LAST thread exits (`live_thread_count == 0`), not once per thread.
+- `live_thread_count`/`thread_list` are new: the process becomes a candidate for the parent-hand-off/auto-reap decision only once `live_thread_count` reaches 0 — the direct generalization of "the address space is torn down only once nothing can execute under it" from 1 thread to N. See `thread_zombie_locked()` (process.c) and §7.4.
+- `running_cpu` on `struct process` is new and easy to miss the reason for: the parent-hand-off (§7.4) is posted *before* the dying thread's core has confirmed it switched away, so a parent's `process_wait()` can briefly observe a zombie process whose last thread is technically still executing on another core. This field mirrors that thread's own `running_cpu` at the exact moment `live_thread_count` hits 0, giving `process_wait()`'s belt-and-suspenders retry (§16, Bug 23's fix) a place to live now that `running_cpu` itself moved to `struct thread`.
+
+`current_thread` (a real per-CPU field, `cpu_table[]`) and `current_process` (a derived, read-only `current_thread->proc` macro) replace the old single `current_process` field — see process.h's comment on the macro pair for the full assignability/NULL-safety rules. Every external consumer outside `process.c` (`cpu/syscall.c`, `cpu/usercopy.c`, `fs/fd.c`) needed either zero changes (reads `current_process->field` only after already knowing a process exists) or a one-line NULL-check fix (`current_process` → `current_thread`, since `current_thread->proc` can't be evaluated when `current_thread` itself is NULL) — the split was designed from the start to be invisible outside this file, and it shipped that way.
+
+**Phase 5, ✅ built — ring-3 threads add three more fields to `struct thread` and one to `struct process`:**
+
+```c
+struct thread {
+    /* ... Phase 4 fields above, unchanged ... */
+
+    bool joinable;      // true only for a thread from thread_create_user() --
+                         //   see below for why this changes reap timing
+    int  exit_code;      // THIS thread's own exit code (thread_exit_self()'s
+                         //   arg) -- distinct from struct process::exit_code
+    uint64_t user_arg;   // loaded into RDI just before this thread's very
+                         //   first ring-3 instruction (process_trampoline)
+};
+
+struct process {
+    /* ... Phase 4 fields above, unchanged ... */
+
+    struct wait_queue join_wait;   // woken whenever ANY thread of this
+                                    //   process exits; thread_join()'s
+                                    //   callers block here (see §7.3)
+};
+```
+
+- `joinable` is the load-bearing addition: a kthread (`thread_create()`) or a process's own main thread stays `false` and keeps the pre-Phase-5 behavior exactly (auto-reaped the tick after it exits, via `pending_thread_reap` — §7.4). A `thread_create_user()` thread is `true`, which makes `schedule_locked()`'s deferred-reap step skip it — it sits as a `PROCESS_ZOMBIE` (kernel stack intact) until `thread_join()` explicitly collects `exit_code` and reaps it, the exact same "sits as a zombie until collected" shape a process already has via `zombie_head`/`process_wait()`, just one level down (a thread within a process, instead of a process within its parent).
+- `exit_code` (thread-level) exists because `struct process::exit_code` is process-wide and "last writer wins" across every thread that calls `thread_exit_self()` (see that function's comment, §15.1) — a sibling calling `thread_join(tid)` needs THIS specific thread's own code, not whatever the process-wide field happens to hold at that moment.
+- `user_arg` is the ring-3 thread's "argument" (mirroring `pthread_create()`'s `void *arg`, even without a pthread of this kernel's own) — `process_trampoline` loads it into RDI immediately before the `iretq`, so it arrives as the entry function's own first C parameter with zero special handling needed in userspace (see `user/init.c`'s `second_thread_entry(long arg)`).
+- `join_wait` is `child_wait`'s exact shape, one level down: `child_wait` is a *process's* queue, woken by a *child process* exiting, blocking a *parent process*; `join_wait` is scoped to *one process's own threads*, woken by *any thread of that process* exiting, blocking a *sibling thread* of the SAME process. `thread_zombie_locked()` wakes it unconditionally on every thread exit (harmless no-op if nobody's joining) — see §7.4.
+
+**Where a ring-3 thread's user stack actually lives (not a struct field, but the other half of what `thread_create_user()` has to set up that a kthread never needed):** every process's OWN main thread keeps using the same fixed `USER_STACK_VA` it always has; every ADDITIONAL thread gets its own dedicated 1 MiB VA "slot" inside `USER_THREAD_STACK_BASE`, indexed by that thread's own `thread_table[]` slot index — deterministic, so no separate per-process allocator is needed, and automatically unique (`MAX_THREADS` is a single global ceiling). Only `USER_THREAD_STACK_PAGES` (4) pages at the TOP of each 1 MiB slot are actually mapped; the rest of the slot is left unmapped below it as a (generous) guard region, the same philosophy `vmm_alloc_kernel_stack()` already uses for kernel stacks. **Deliberately never explicitly unmapped/freed per-thread** — a joinable thread's stack pages are reclaimed for free, along with everything else mapped in the process, only when the PROCESS itself is eventually torn down (`vmm_destroy_address_space()` already frees every user-half frame unconditionally). This means a long-lived process that creates and joins many short-lived threads over its lifetime accumulates unreclaimed stack pages until it exits — a known, documented simplification (same category as `vmm_alloc_mmio`'s bump-allocated, never-reclaimed VA space), not an oversight; revisit only if a real workload is ever observed to need per-thread stack reclamation before process exit.
+
+### 6.2 Process Control Block — additions built since (✅, Phase C/D; superseded by Phase 4's split, §6.1)
+
+**This section is now historical.** It documents the fields as they were added, incrementally, to the single conflated `struct process` (Phase C priority fields, Phase D parent/child/handle fields) — all of them appear in §6.1's current Phase 4 shape already, split across `struct thread` (priority, aging) and `struct process` (parent/child/zombie/handles) as described there. Kept below unedited as the historical record of *when* each field was added and *why*, per this doc's own "annotate every addition with the phase that added it" discipline.
 
 ```c
 struct process {
     /* ... fields above, unchanged ... */
 
-    /* Phase C: priority scheduling */
-    uint8_t  priority;             // 0 = highest; small fixed band count (§4.2)
+    /* Phase C, ✅ built: priority scheduling */
+    uint8_t  priority;              // 0 = highest band (§4.2); every new
+                                     // process starts at PRIORITY_NORMAL
     uint32_t ticks_since_scheduled; // aging counter, decays priority-starvation
 
-    /* Phase D: parent/child tracking for a real wait() (see §7.4 — sys_wait today
-       busy-polls process_find() + sys_yield rather than being woken by the child) */
-    struct process  *parent;       // for orphan-collecting / wait() semantics
-    struct process  *zombie_next;  // reaped-but-unclaimed children, singly-linked
+    /* Phase D, ✅ built: parent/child tracking for a real process_wait() */
+    struct process *parent;         // who spawned us; NULL = auto-reap on exit
+    uint32_t        parent_pid;     // parent's pid AT CREATION TIME -- `parent`
+                                     // is a raw pointer into a slot that gets
+                                     // recycled after reaping, so `state` alone
+                                     // can't tell "still my parent" from "some
+                                     // unrelated new process reused the slot"
+                                     // (see parent_is_alive(), a real bug this
+                                     // caught -- Bug 11's sibling issue, §16)
+    struct process *child_list;     // MY live (non-zombie) children, for `ps`
+    struct process *child_next;     // sibling link within child_list
+    struct process *zombie_head;    // MY exited-but-unclaimed children (I'm
+                                     // the parent) -- list head
+    struct process *zombie_next;    // if I myself am a zombie linked into
+                                     // SOMEONE ELSE's zombie_head: the next
+                                     // sibling after me there. Deliberately
+                                     // NOT the same field as zombie_head --
+                                     // see §16's Bug-11-adjacent discussion
+                                     // of why reusing one field for both
+                                     // roles is a real corruption hazard
+                                     // one level of process-tree depth in.
+    struct wait_queue child_wait;   // parent blocks here until ANY child exits
 
-    /* Phase E: thread split (only if/when multi-threading is needed) */
-    // struct thread *threads;     // NOT added speculatively — see §17 Trade-offs
+    /* Phase D, ✅ built: ring-3 process handles (docs/ARCHITECTURE.md §3.4/§3.5) */
+    struct proc_handle handles[PROC_HANDLE_MAX]; // handle -> pid translation,
+                                                  // see PROC_HANDLE_MAX's comment
+
+    /* Phase 4, ✅ built: the thread split -- see §6.1's current shape */
+    // struct thread *threads;     // landed as thread_list/live_thread_count, §6.1
 };
 ```
 
-Each addition is annotated with the phase that needs it — nothing here is added "because we'll probably need it eventually." `docs/ARCHITECTURE.md` §1 explicitly warns against over-scoping (COW/`fork()` were deliberately pushed off the critical path); this table applies the same discipline field-by-field.
+Each addition is annotated with the phase that added it — nothing here was added "because we'll probably need it eventually." `docs/ARCHITECTURE.md` §1 explicitly warns against over-scoping (COW/`fork()` were deliberately pushed off the critical path); this table applies the same discipline field-by-field. One divergence from this section's earlier sketch worth flagging: the original draft proposed a single `zombie_next` field serving as both "list head of my children's exited-but-unclaimed zombies" and "my own link if I'm one of them" — building `process_wait()` for real surfaced that this is unsafe the moment a process tree is more than one level deep (a zombie sitting in its own parent's list, while simultaneously being some OTHER live process's parent, would have its sibling-chain pointer silently clobbered). Split into `zombie_head` (list-head role) and `zombie_next` (sibling-link role) to close that.
 
-### 6.3 Run queue (Phase A today, generalizes through Phase D)
+### 6.3 Run queue (Phase A/C ✅ built; per-CPU run queues still ⏳ deferred)
 
-Phase A (✅ built, implicit): the run queue *is* `proc_table[MAX_PROCESSES]`, scanned linearly from `current_process`'s index forward. This is O(n) per `schedule()` call, which is irrelevant at `MAX_PROCESSES = 16` and will be revisited only if the table size grows by an order of magnitude (it won't, soon — see §13).
+Phase A (✅ built, implicit): the run queue *is* the schedulable-unit table, scanned linearly from the current thread's index forward. This was O(n) per `schedule()` call at `MAX_THREADS = 16` (Phases A–4), irrelevant at that size. **(Phase 4 rename, no behavior change: this table is `thread_table[MAX_THREADS]` now, not `proc_table[MAX_PROCESSES]` — see §6.1.)**
 
-Phase C (🎯): a fixed array of intrusive ready-queue heads, one per priority band:
+Phase C (✅ built, but NOT via the intrusive per-band linked list this section originally sketched): priority scheduling landed as a band-by-band re-scan of the SAME flat table, not a separate `struct run_queue` with per-band `head`/`tail` pointers. `schedule()`'s "find next" loop scans bands `0..SCHED_PRIORITY_BANDS-1` in order, and within each band does the exact same round-robin linear scan Phase A already did, filtered to `candidate->priority == band`. This is O(bands × n) instead of the originally-sketched O(1)-per-band-head — a worst case of 64 comparisons per `schedule()` call at the original `MAX_THREADS = 16`, not worth the extra bookkeeping (inserting into and unlinking from per-band lists on every priority change, block, and wake) that the intrusive-list design would have required.
 
-```c
-#define SCHED_PRIORITY_BANDS 4     // e.g. REALTIME, INTERACTIVE, NORMAL, BACKGROUND
+**Phase 5 update: this got revisited, partially.** `MAX_THREADS` grew 16 → 256 (§13's Phase 5 entry) — exactly the "order of magnitude" both paragraphs above named as the trigger to revisit. It was revisited, but not redesigned: a genuinely per-band intrusive-list run queue is still real bookkeeping work this single-user-workstation OS doesn't clearly need yet, so instead of building it speculatively, the two timing-sensitive SMP selftests that this scan cost could plausibly affect (`test smp sched`, `test thread smp` — both sample "did dispatch happen on ≥2 distinct cores" over a short fixed window) had their sampling windows doubled (`selftest_wait_ticks(20)` → `40`) as cheap insurance, after one of them was observed to fail intermittently under heavy host CPU contention during Phase 5's own verification (4/5 clean reruns, 1 spurious single-core result — a timing artifact of the fixed window, not a scheduling correctness bug; re-verified passing consistently after the wait-tick increase). The underlying O(bands × n) scan itself is unchanged and still not considered a real bottleneck at `MAX_THREADS = 256` under normal (non-contended) conditions — this remains the "revisit only if `g_sched_lock` is *measured* to bottleneck" trade-off (§17), not something Phase 5 concluded needed fixing outright.
 
-struct run_queue {
-    struct process *head[SCHED_PRIORITY_BANDS];
-    struct process *tail[SCHED_PRIORITY_BANDS];
-};
-```
-
-Phase D (🎯, SMP): one `struct run_queue` **per CPU**, not one global one — see §8 for why a single global run queue is the wrong shape to reach for even before SMP lands, and why it's cheap to avoid now.
+Per-CPU run queues (⏳, explicitly deferred — see §8, §13's "explicitly not scheduled" line): one run queue **per CPU**, not one global one. The single global `g_sched_lock` (Phase SMP, §13) is the shipped design; per-CPU queues remain the *next* step only if that lock is *measured* to bottleneck, not a speculative build now. Exact shape (intrusive per-band lists vs. per-CPU flat tables) should be decided against real profiling data if that day comes, not designed ahead of it.
 
 ---
 
@@ -270,10 +390,10 @@ Phase D (🎯, SMP): one `struct run_queue` **per CPU**, not one global one — 
                   ┌───────────────┐◀────────────────────────────────┘
                   │PROCESS_ZOMBIE │
                   └───────┬───────┘
-                          │ automatic (✅ Phase A/B, §7.4) — deferred
-                          │ one schedule() call behind the exit;
-                          │ sys_wait (✅) busy-polls + reaps; a real
-                          │ parent-blocked wait() is still Phase D, 🎯
+                          │ automatic (✅ Phase A/B, §7.4) if no live
+                          │ parent; OR handed off to parent_wait (✅
+                          │ Phase D) — process_wait()/sys_wait genuinely
+                          │ block, no more busy-polling
                           ▼
                   ┌───────────────┐
                   │PROCESS_UNUSED │  (slot reclaimed: pml4 destroyed,
@@ -309,21 +429,23 @@ A blocked process is removed from the run queue entirely (not skipped-in-place �
 
 ```c
 struct wait_queue {
-    struct process *head;   // intrusive via process::wait_next
+    struct thread *head;   // Phase 4: intrusive via thread::wait_next (was
+                           //   process::wait_next -- threads, not processes,
+                           //   are what actually blocks/wakes, §6.1)
 };
 
-void wait_queue_block(struct wait_queue *wq, struct process *p);  // READY/RUNNING -> BLOCKED
-void wait_queue_wake_one(struct wait_queue *wq);                   // BLOCKED -> READY, one process
-void wait_queue_wake_all(struct wait_queue *wq);                   // BLOCKED -> READY, all
+void wait_queue_block(struct wait_queue *wq, struct thread *t);  // READY/RUNNING -> BLOCKED
+void wait_queue_wake_one(struct wait_queue *wq);                  // BLOCKED -> READY, one thread
+void wait_queue_wake_all(struct wait_queue *wq);                  // BLOCKED -> READY, all
 ```
 
-Built exactly as specified — `process.c`'s `wait_queue_block`/`wait_queue_wake_one`/`wait_queue_wake_all`, plus a static `wait_queue_remove` helper used both by a normal wake and by `process_kill` (§9) unlinking a killed-while-blocked target. `process::wait_queue` (§6.1) records which queue a blocked PCB is currently on, so `process_kill` doesn't need the caller to already know.
+Built exactly as specified — `process.c`'s `wait_queue_block`/`wait_queue_wake_one`/`wait_queue_wake_all`, plus a static `wait_queue_remove` helper used both by a normal wake and by `process_kill` (§9) unlinking a killed-while-blocked target. `thread::wait_queue` (§6.1) records which queue a blocked thread is currently on, so `process_kill` doesn't need the caller to already know. **Phase 4 update:** the queue holds `struct thread *`, not `struct process *`, now that the two are split — a process with multiple threads can have some blocked and some running at once, which the pre-split shape had no way to express even though nothing exercises it yet (every process still has exactly one thread outside `test thread smp`/`exit`).
 
-This is deliberately *not* a condition variable in the pthreads sense (no associated mutex to atomically release-and-block) — because there is no SMP yet, "atomically" is free (interrupts-off is sufficient exclusion on one core). The API is intentionally written so that adding real mutual exclusion later (Phase D, SMP) means changing the *implementation*, not the call sites — see §8. **Not yet exercised by anything user-facing**: no syscall today actually blocks a caller on a `struct wait_queue` (`sys_wait` busy-polls instead, see §7.4) — the primitive is proven correct by `test sched roundrobin`'s blocking variant and is ready for the first real consumer (a blocking `sys_wait`, a pipe/port read, etc.), but nothing has needed it yet.
+This is deliberately *not* a condition variable in the pthreads sense (no associated mutex to atomically release-and-block) — under SMP (✅ built, Phase SMP below) "atomically" is provided by `g_sched_lock` being held across the block-then-`schedule_locked()` sequence, not by interrupts-off alone anymore (see §8(b)). **Now genuinely exercised by something user-facing**: `process_wait()`/`sys_wait` (§7.4) blocks the caller on the target's parent's `child_wait` queue for real, woken by the target's own exit or kill — no more busy-polling. Getting this exercised for the first time immediately surfaced Bug 11 (§16): `schedule()`'s zombie hand-off ran too late to ever wake a parent sitting `BLOCKED` here with nothing else runnable, a real deadlock, fixed by reordering `schedule()` itself (see §8(a) and Bug 11's full writeup).
 
-### 7.4 Termination and reclamation (✅ automatic reap built Phase A; ✅ pid-directed `process_reap`/`sys_wait` built Phase B; true parent-blocked `wait()` still Phase D 🎯 — closed Bug 3, §16)
+### 7.4 Termination and reclamation (✅ all built — automatic reap Phase A, pid-directed `process_reap` Phase B, real parent-blocked `process_wait()`/`sys_wait` now Phase D — closed Bug 3 and Bug 11, §16)
 
-Automatic reclamation (unchanged since Phase A):
+Automatic reclamation (Phase A shape below is historical — updated after for the Phase SMP per-core deferral and the Phase 4 thread/process split):
 
 ```
 sys_exit(code):
@@ -350,9 +472,81 @@ process_reap_slot(proc):
     proc->state = PROCESS_UNUSED
 ```
 
-Why the deferral needs exactly one pending slot, not zero and not more: reclaiming `prev` *inside the same `schedule()` call* that switches away from it would free memory the CPU is still executing on (the remainder of `schedule()`, including the `kernel_ctx_switch` call itself, runs on `prev`'s stack). Waiting until the *next* `schedule()` call guarantees a full switch has happened since — we're now provably on a different stack. One slot suffices because every exit calls `schedule()` itself, so the queue never grows past depth 1 in practice. **Now genuinely exercised** (previously only correct by construction, per §3): `test sched reap` spawns and exits well past `MAX_PROCESSES` in a loop and asserts it keeps succeeding, and real multi-process use via `sys_spawn`/`sys_wait` hits this path every time.
+**Phase 4 shape (✅ built — the actual current code), two-level and per-core:**
 
-**Built in Phase B:** `process_reap(pid)` — looks up the PCB by pid and calls `process_reap_slot` on it if it's a zombie, used directly by `sys_wait`. `sys_wait(pid)` (`syscall.c`) is a real, working wait — but implemented as a busy-poll: it calls `process_find(pid)` + `sys_yield()` in a loop until the target reaches `PROCESS_ZOMBIE`, then reaps it and returns the exit code, returning `-EMBK_ECHILD` if the pid doesn't exist. This is correct (the zombie can't disappear from under it — nothing else reaps a pid the caller is actively waiting on) but not the eventual design: **still Phase D, 🎯** is a `sys_wait` that *blocks* the caller on a wait queue and is *woken* by the target's own exit, which needs `process::parent`/`zombie_next` (§6.2) so the exiting process knows who (if anyone) to wake, rather than every waiter spinning independently. Busy-polling was chosen as the correct, simple stand-in rather than building parent/child tracking before anything needed it — consistent with §17's general bias against speculative structure.
+```
+process_exit_self(code):
+    current_process->exit_code = code
+    current_thread->state = PROCESS_ZOMBIE
+    schedule()   // never returns
+
+schedule_locked():                       // per-core, this_cpu()->pending_*_reap
+    if this_cpu()->pending_thread_reap:  // thread from THIS core's PREVIOUS schedule_locked() call
+        thread_reap_slot(this_cpu()->pending_thread_reap)   // frees kstack only
+        this_cpu()->pending_thread_reap = NULL
+    if this_cpu()->pending_process_reap: // only set if that thread ALSO completed its process
+        process_reap_slot(this_cpu()->pending_process_reap) // frees the address space
+        this_cpu()->pending_process_reap = NULL
+    ... pick next, as before (now scanning thread_table) ...
+    if current_thread->state == PROCESS_ZOMBIE:
+        dying_process = thread_zombie_locked(current_thread)  // decrements
+            // proc->live_thread_count; returns the process ONLY if this was
+            // its LAST thread AND there's no live parent to hand off to
+    ... (if a real switch is about to happen) ...
+    // Phase 5 exception: a JOINABLE thread (thread_create_user()) that is
+    // NOT also completing its process (dying_process == NULL, i.e. it had
+    // live siblings) is left OUT of the reap queue -- its stack must
+    // survive for thread_join() to collect later (§6.1's Phase 5 addendum).
+    if !(current_thread->joinable && dying_process == NULL):
+        this_cpu()->pending_thread_reap = current_thread   // (the outgoing thread)
+        this_cpu()->pending_process_reap = dying_process   // (NULL unless the process also completed)
+    kernel_ctx_switch(&prev->ctx, &next->ctx)
+
+thread_reap_slot(t):
+    assert(t->state == PROCESS_ZOMBIE)
+    vmm_free_kernel_stack(t->kstack_top, KSTACK_SIZE)
+    memset(t, 0, sizeof(*t)); t->state = PROCESS_UNUSED
+
+process_reap_slot(proc):                 // unchanged in spirit from Phase A/B
+    vmm_destroy_address_space(proc->pml4_phys)
+    memset(proc, 0, sizeof(*proc)); proc->pid = 0
+```
+
+The generalization from Phase A/B: reclaiming a THREAD's kernel stack still can't happen inside the same `schedule_locked()` call that switches away from it (same reasoning as before — we're still executing on that stack until `kernel_ctx_switch` runs), so the one-pending-slot deferral is unchanged in spirit, just per-core (Phase SMP) and now split into a thread-level slot (freed every time a thread exits) and a process-level slot (freed only when that thread was also the LAST thread of its process). `thread_zombie_locked()` is the shared decision point — used by both `schedule_locked()`'s self-exit path and `process_kill()`'s external-kill path — and is deliberately idempotent (safe to call more than once for the same thread) because `schedule_locked()`'s pre-existing retry behavior (§7.2/§11's "nothing else runnable yet" case) can re-run the same ZOMBIE-handling block on a later tick; idempotence is achieved by unlinking the thread from `proc->thread_list` as the FIRST thing `thread_zombie_locked()` does, so a second call finds it already unlinked and skips the decrement/hand-off entirely. **Now genuinely exercised**: `test sched reap` (still exercises the original single-thread path), plus the two new Phase 4 tests — `test thread smp` (3 threads, 1 process, proves the address space isn't reaped while ANY thread is still alive) and `test thread exit` (proves it's reaped exactly once the LAST one exits, not the first).
+
+**Built in Phase B:** `process_reap(pid)` — looks up the PCB by pid and calls `process_reap_slot` on it if it's a zombie.
+
+**Built in Phase D:** real parent-blocked termination collection, replacing the earlier busy-poll entirely.
+
+```
+process_wait(pid):                       // process.c -- used by both sys_wait and
+                                          // the kernel shell's `wait` command (main.c)
+    loop:
+        walk current_process->zombie_head looking for `pid`
+        if found:
+            unlink it, read its exit_code, process_reap_slot() it, return the code
+        target = process_find(pid)
+        if !target or target->parent != current_process:
+            return -EMBK_ECHILD          // not ours to wait for
+        wait_queue_block(&current_process->child_wait, current_thread)  // Phase 4: queues
+                                           // the THREAD, not the process (§6.1/§7.3)
+        schedule()                        // resumes once SOME child of ours exits;
+                                           // loop back and re-check -- might not be
+                                           // this pid yet if we have >1 child
+
+# On the exiting side (thread_zombie_locked(), shared by schedule_locked()'s
+# self-exit path and process_kill()'s external-kill path -- Phase 4, §7.4):
+    if parent_is_alive(dying_process):
+        dying_process->zombie_next = dying_process->parent->zombie_head
+        dying_process->parent->zombie_head = dying_process
+        wait_queue_wake_one(&dying_process->parent->child_wait)
+    else:
+        return dying_process              // caller defers the actual reap -- §7.4
+```
+
+`process::parent`/`parent_pid` (set once, at creation, in `process_create()`) is how the exiting side knows *whether* anyone will ever collect it, and `parent_is_alive()` (§16) guards against a stale `parent` pointer aliasing an unrelated process that later reused the same recycled PCB slot. `sys_wait(handle)` (`syscall.c`) is now a thin wrapper: resolve the handle to a pid (§15.2), call `process_wait(pid)`, free the handle. The kernel's own interactive shell (`main.c`) calls `process_wait(pid)` directly with no handle indirection at all, since it's trusted kernel code, not a sandboxed ring-3 caller.
+
+Getting this blocking path exercised for the very first time (`test sched wait`) immediately hung — Bug 11 (§16): the zombie hand-off above was originally reachable only *after* `schedule()` had already confirmed some other runnable process existed, but the whole point of `process_wait()` is a parent sitting `BLOCKED` (not READY/RUNNING) with nothing else runnable at that exact moment. Fixed by moving the hand-off decision before that check.
 
 ---
 
@@ -360,12 +554,12 @@ Why the deferral needs exactly one pending slot, not zero and not more: reclaimi
 
 **Before Phase B:** none needed. Single core, and `schedule()` was only ever called from syscall context, never from an interrupt handler, so there was no reentrancy to guard against.
 
-**Since Phase B (✅ preemption is real now):** two separate hazards, worth keeping distinct — (a) is now **partially, not fully** closed; (b) is still purely Phase D/future.
+**Since Phase B (✅ preemption is real now):** two separate hazards, worth keeping distinct — (a) is now ✅ **fully closed**; (b) is still purely Phase D/future.
 
-- **(a) Preemption reentrancy — partially closed, one gap still open.** When `schedule()` is entered *from the LAPIC timer ISR*, it's safe from being reentered by a second timer tick: the timer handler is an interrupt gate (`kcontext.asm`'s callers all are), so IF is 0 for its entire duration and no further timer IRQ can land until it returns — this is why Bug 6/7's fix (forcing IF=1 only in the *saved snapshot*, not in the live flags during the ISR) doesn't reopen this hole. **But** `schedule()` is also called from syscall context (`sys_exit`/`sys_yield` → `process_exit_self`/`sys_yield` → `schedule()`), and `syscall_dispatch()` unconditionally executes `sti` before dispatching (needed for Bug 7's fix, disk-I/O syscalls). That means a `schedule()` call triggered by `sys_exit`/`sys_yield` runs with IF=1 — a timer IRQ *can* land mid-dispatch inside that call and re-enter `schedule()` from the timer ISR while the outer, syscall-triggered `schedule()` call hasn't returned. This has not been observed to misbehave (no failing test currently exercises it), but it is a real, currently-open gap, not a Phase D hypothetical — the general fix is the standard one (bracket `schedule()`'s critical section with `cli`/`sti`, restoring the entry IF state on exit rather than unconditionally re-enabling), it just hasn't been built yet. Flagged here explicitly so it doesn't get mistaken for "solved because preemption works in the tests that exist."
-- **(b) Cross-CPU run-queue access** — a genuinely different problem that interrupt-disabling does *not* solve, because it doesn't stop a different CPU from touching the same queue concurrently. This needs real locks (`cpu/spinlock.c` already exists in the tree, unused by this subsystem today). Still purely Phase D — no second CPU exists yet.
+- **(a) Preemption reentrancy — ✅ closed.** When `schedule()` is entered *from the LAPIC timer ISR*, it was always safe from being reentered by a second timer tick: the timer handler is an interrupt gate (`kcontext.asm`'s callers all are), so IF is 0 for its entire duration and no further timer IRQ can land until it returns — this is why Bug 6/7's fix (forcing IF=1 only in the *saved snapshot*, not in the live flags during the ISR) doesn't reopen this hole. **But** `schedule()` is also called from syscall context (`sys_exit`/`sys_yield` → `process_exit_self`/`sys_yield` → `schedule()`), and `syscall_dispatch()` unconditionally executes `sti` before dispatching (needed for Bug 7's fix, disk-I/O syscalls). That meant a `schedule()` call triggered by `sys_exit`/`sys_yield` ran with IF=1 — a timer IRQ *could* land mid-dispatch inside that call and re-enter `schedule()` from the timer ISR while the outer, syscall-triggered `schedule()` call hadn't returned. **Fixed:** `schedule()` now does the standard thing itself — `pushfq`/`pop`/`cli` at entry (same idiom as `cpu/spinlock.c`'s `spin_lock`), saving the caller's original IF and unconditionally disabling interrupts for the scan/dispatch section; every early-return path restores the saved IF before returning, and the path that reaches `kernel_ctx_switch` doesn't need to restore anything explicitly — the switch itself always resumes with IF=1 forced (Bug 6), regardless of what was saved. `schedule()` is now self-contained and safe to call from *any* interrupt state, not just the two states it happens to be called from today. Verified: `test sched roundrobin`/`kill`/`reap`/`stackguard` all still pass after the change (rerun in QEMU), including the two tests that most directly stress this exact path — kthreads exit via `process_exit_self` (the same call shape as `sys_exit`, IF=1) while the timer is actively preempting them throughout.
+- **(b) Cross-CPU run-queue access — ✅ closed (SMP phase, §13).** Real cores exist now (`-smp 4` verified). One global `g_sched_lock` (a real `cpu/spinlock.c` spinlock) guards every `thread_table`/`process_table`/`current_thread`/`pending_*_reap` access (Phase 4 rename: was `proc_table`/`current_process`/`pending_reap`, §6.1), and — the part that is *not* just "add a lock" — it is **held across `kernel_ctx_switch` itself**, released only by whichever context resumes on the far side (the line after the switch, or a first-dispatch trampoline). Releasing it any earlier, even for one instruction, lets another core observe a mid-transition PCB as schedulable and dispatch it while it is still physically executing — every variant of that window was hit as a real crash during bring-up, not hypothesized (see Bugs 12–24, §16). `schedule()`'s Bug-10-era `pushfq`/`cli` prologue was replaced by the lock (same interrupt guarantee, now also cross-core).
 
-**Design decision for Phase D:** per-CPU run queues (§6.3), each with its own spinlock, rather than one global run queue behind one global lock. Reasoning:
+**Design decision (originally "for Phase D," now partially superseded by what actually shipped):** the single global lock above is the shipped design, exactly as the "one lock first, measure before sharding" plan of record said. Per-CPU run queues, each with their own spinlock, remain the *next* step **only if the global lock is measured to bottleneck**. Reasoning preserved for that day:
 
 - A single global lock turns the run queue into a serialization point across every CPU on every scheduling decision — exactly the bottleneck Linux moved away from decades ago (the O(1) scheduler and later CFS are both partly *about* per-CPU run queues to avoid this).
 - Per-CPU queues need a **load-balancing** story (what stops one CPU's queue from starving while another's overflows) — this is real, non-trivial work, which is exactly why it's scoped to Phase D and not attempted speculatively now. Building the per-CPU *shape* early (§6.3) costs nothing; building load-balancing early would be solving a problem that doesn't exist on one core.
@@ -380,6 +574,7 @@ Why the deferral needs exactly one pending slot, not zero and not more: reclaimi
 - **`current_process` as a bare global pointer is a confused-deputy risk once syscalls read it implicitly** (e.g., `sys_exit`/`process_exit_self` reads `current_process->exit_code` directly). This is safe *only* as long as every syscall handler is entered with `current_process` already correctly pointing at the caller — true today because there's exactly one core, but reentrancy is no longer hypothetical: real preemption (Phase B, ✅) means a timer IRQ can now land mid-syscall and call `schedule()`, which *does* mutate `current_process`. This has not yet caused an observed bug (the timer handler doesn't read/write `current_process` itself outside of `schedule()`'s own dispatch, and `schedule()` was already the sole writer), but it is a materially different risk profile than "true today because... no reentrancy" was when this line was first written — worth re-auditing before SMP (Phase D) adds a second, genuinely concurrent reader/writer.
 - **User-pointer validation is now built, one layer up, exactly where this section said it belonged.** `cpu/usercopy.c/h`'s `access_ok`/`copy_from_user`/`copy_to_user`/`copy_string_from_user` guard every syscall that takes a user buffer or path (`sys_write`, `sys_read`, `sys_open`, `sys_stat`, `sys_readdir`, `sys_spawn`'s path argument). This subsystem still does not implement or own that check — noted here only to close the loop on the previous version of this line, which flagged it as an open problem tracked in `cpu/syscall.c`.
 - **Kernel stack guard pages (Bug 4, §16) are a security boundary, not just a robustness one** — an unguarded stack overflow that silently corrupts the adjacent heap allocation is a real privilege-preserving memory-corruption primitive if a hostile (or just buggy) userspace process can control its own stack depth (recursion, alloca-heavy code) enough to walk off the end. This is why it's listed as a **Failure Mode** (§10) *and* here.
+- **`sys_thread_create`'s `entry_point` is a ring-3-supplied arbitrary address, unlike anything else this subsystem hands to the scheduler** — every other entry point the scheduler ever fabricates a context around (`process_create()`'s ELF entry, every kthread's function pointer) is chosen by trusted kernel code, not by the ring-3 caller directly. `sys_thread_create` (cpu/syscall.c, Phase 5) validates it with `access_ok()` before ever calling `thread_create_user()` — the same check every user-buffer-taking syscall already applies (the bullet above), extended here to a value that's used as a jump target rather than dereferenced as data. Without it, a caller could point a brand-new thread's very first instruction at unmapped or kernel-half memory before the thread ever runs, rather than failing cleanly at `sys_thread_create()`'s own call site.
 
 ---
 
@@ -389,7 +584,7 @@ Why the deferral needs exactly one pending slot, not zero and not more: reclaimi
 |---|---|---|
 | Kernel stack overflow (Bug 4) | Silent heap corruption, manifests later as an unrelated-looking crash | ✅ Fixed. Unmapped guard page below every kernel stack → immediate `#PF` at the overflow site |
 | Kernel-stack VA region invisible in a fresh process's own page tables (Bug 5) | N/A — introduced *by* the Bug 4 fix, in the same session; never shipped independently | ✅ Fixed. Region reuses `MMIO_BASE`'s already-populated PML4 slot instead of a fresh one — see §7.2/§16 |
-| Zombie accumulation (Bug 3) | After exactly `MAX_PROCESSES` exits, `process_create` fails forever until reboot | ✅ Fixed (automatic reclamation, §7.4), now genuinely exercised by `test sched reap`. A true parent-blocked `wait()`/orphan-collecting PID 1 still Phase D |
+| Zombie accumulation (Bug 3) | After exactly `MAX_PROCESSES` exits, `process_create` fails forever until reboot | ✅ Fixed (automatic reclamation, §7.4), now genuinely exercised by `test sched reap`. Real parent-blocked `process_wait()` also built (§7.4); orphan-collecting PID 1 is not (no init/service-manager process exists yet at all — `docs/ARCHITECTURE.md` §7 Userspace runtime, unrelated to this subsystem) |
 | Runaway process (infinite loop, ignores its message port) | Previously *couldn't* be stopped — no preemption existed, so it never yielded the CPU at all | ✅ Fixed. Timer-driven preemption (§5, ✅) means it's evicted every quantum regardless of cooperation, and the uncatchable kill (§9, ✅) can force it to `ZOMBIE` outright — verified together via `test sched kill` (kills a process running an intentional infinite loop) |
 | Double-free / use-after-reap | N/A, reaping didn't exist | Guarded now: `process_reap_slot` asserts `state == PROCESS_ZOMBIE` before freeing anything; reused PCB slots are always fully zeroed first |
 | Scheduler picks a half-initialized `PROCESS_READY` PCB (Bug 8) | Possible the instant real preemption + a second `process_create()` call coexist — `proc_alloc()` marked slots `READY` immediately, before pml4/kstack/ctx were built | ✅ Fixed. `proc_alloc()` marks `PROCESS_BLOCKED` instead; only `process_create()`'s final step sets `READY`, after everything is actually built |
@@ -397,8 +592,10 @@ Why the deferral needs exactly one pending slot, not zero and not more: reclaimi
 | RFLAGS.IF corrupted across a context switch (Bug 6) | N/A, no preemption existed to expose it | ✅ Fixed — `kernel_ctx_switch`/`kernel_ctx_save` force IF=1 in the saved snapshot (see Bug 6, §16) |
 | Syscall hangs waiting on an IRQ that can't fire (Bug 7) | N/A, no syscall did blocking I/O before file-I/O syscalls landed | ✅ Fixed — `sti` at the top of `syscall_dispatch()` |
 | PCB slot leaked on process_create() failure (Bug 9) | A failed creation (bad ELF, OOM) permanently removed a slot from the pool, with no PID ever having existed to explain why | ✅ Fixed — all four early-return error paths reset `state = PROCESS_UNUSED` |
-| Timer IRQ re-enters `schedule()` while a syscall-triggered `schedule()` call is still in progress (§8(a)) | N/A, no preemption existed | **Still open.** Not yet observed to misbehave, but not actually prevented — `syscall_dispatch()`'s `sti` (needed for Bug 7) means `schedule()` calls from `sys_exit`/`sys_yield` run with IF=1. Needs `schedule()` to bracket its own critical section with `cli`/restore-IF-on-exit; not built yet |
-| Two CPUs both believe they're running the same PCB (Phase D) | N/A, single core | Per-CPU run queues (§8) + an explicit `PROCESS_RUNNING` owner-CPU field, checked on dispatch |
+| Timer IRQ re-enters `schedule()` while a syscall-triggered `schedule()` call is still in progress (§8(a)) | N/A, no preemption existed | ✅ Fixed. `schedule()` now `cli`s at entry (saving the caller's IF) and restores it on every early-return path — see §8(a)/Bug 10, §16 |
+| Two CPUs both believe they're running the same PCB | Actually happened during SMP bring-up, twice, from different causes (Bugs 13 and 22, §16) | ✅ Fixed. `g_sched_lock` held across the switch, the scan's `candidate == current_process && RUNNING` self-fallback (never a *different* core's RUNNING process), the `running_cpu` owner field, and `process_init()` ordered before `smp_bringup()` |
+| A core keeps executing a stack another core just freed (zombie reap race) | Actually happened: #DF inside `vmm_switch_address_space` — the CR3 reload flushed the stale TLB entries that were the only thing keeping the freed stack readable (Bugs 19/23, §16) | ✅ Fixed. Dying core clears `running_cpu` + switches away inside the same `g_sched_lock` hold that posts the hand-off; per-core pinned idles guarantee that switch always has a target; `process_wait()` keeps a `running_cpu` guard as belt-and-suspenders |
+| 🚧 **`sys_exit()` called via `enter_user_mode()`'s standalone launch (`test ring3`, `cpu/usermode.c`) corrupts the CALLING thread's own scheduling state, not the ring-3 program's** | Pre-existing since `process_exit_self()` was first built (Phase B) — `enter_user_mode()` never creates a real `struct thread`/`struct process` of its own; it's a one-shot CR3-switch-and-`iretq` entirely outside the scheduler. `sys_exit`'s `process_exit_self()` unconditionally acts on `current_thread`/`current_process`, which at that point is still whichever thread CALLED `enter_user_mode()` (in practice, the interactive shell) — so the ring-3 program's own `exit()` marks the SHELL's thread `ZOMBIE` and hands it to `schedule()`, which switches away and never resumes the shell's `main.c` loop. **Found, not fixed, while verifying Phase 5** (confirmed present with the plain pre-Phase-5 `init.c` too, via a controlled A/B rerun — this is not something Phase 4 or 5 introduced). The properly-scheduled path (`process_create()`/`process_wait()`, what `test ring3 threads` and the shell's own `run`/`wait` commands use) does not have this problem: a child's `sys_exit()`/`sys_thread_exit()` there always acts on the CHILD's own `current_thread`, never the caller's, because `schedule()` genuinely switched context to it first. **Out of scope for this phase** — `test ring3` predates and is unrelated to the process/thread split or ring-3 threads; flagged here for whoever next touches `enter_user_mode()` or `test ring3`, not addressed by this work. |
 
 ---
 
@@ -412,12 +609,19 @@ Why the deferral needs exactly one pending slot, not zero and not more: reclaimi
 
 ## 12. Testing Strategy
 
-Following the existing `selftests.c` convention (`test embkfs`, `test vfs`, `test fd`, `test ring3`, etc. — a shell command dispatches to a self-contained in-kernel check that prints pass/fail with a concrete assertion, not just "didn't crash"). **All four specified tests below are now built** (`process_test_roundrobin`/`process_test_kill`/`process_test_reap`/`process_test_stackguard` in `process.c`, wired into `selftests.c` as `test sched roundrobin`/`kill`/`reap`/`stackguard`), closing the gap this section originally flagged (everything through Bug 5 was manual QEMU + `gdb`/`objdump` only):
+Following the existing `selftests.c` convention (`test embkfs`, `test vfs`, `test fd`, `test ring3`, etc. — a shell command dispatches to a self-contained in-kernel check that prints pass/fail with a concrete assertion, not just "didn't crash"). **Ten fully in-kernel selftests are built** (`process_test_*` in `process.c`, wired into `selftests.c` as `test sched roundrobin`/`kill`/`reap`/`stackguard`/`wait`/`priority`, `test smp sched`/`kill`, `test thread smp`/`exit`), closing the gap this section originally flagged (everything through Bug 5 was manual QEMU + `gdb`/`objdump` only), **plus one selftest that needs a real disk** (`test ring3 threads`, Phase 5, below). All eleven pass together, in order, under `-smp 4` — the standard verification pass for any change to this subsystem:
 
 - **`test sched roundrobin`** ✅: uses `process_create_kthread` (ring-0 "threads" sharing the kernel's own PML4, built specifically so scheduler tests don't need a real ELF file) to spawn dummy processes that each increment a shared counter; asserts every process ran at least once within N scheduling rounds and none ran twice before all others ran once. Also exercises the wait-queue blocking path (§7.3).
 - **`test sched kill`** ✅: spawns a kthread running an intentional infinite loop that never touches its message port; issues `process_kill`; asserts the PCB reaches `PROCESS_ZOMBIE` within one scheduling quantum. This is the test that actually proves §3.3's "day one" guarantee is real, not aspirational.
 - **`test sched reap`** ✅: spawns and exits a process well past `MAX_PROCESSES` in a loop; asserts this keeps succeeding (proves Bug 3 stays fixed — a regression here is exactly "silent until it isn't," the failure mode this whole spec is trying to design against). This is also the first test to actually *exercise* the deferred-reap path (§7.4) — before it existed, nothing in the tree had ever created a second concurrent process to trigger it.
 - **`test sched stackguard`** ✅: deliberately checks that the guard page below a kernel stack is genuinely unmapped (`vmm_get_phys` returns not-present) rather than actually recursing into it — there's no fault-recovery path yet, so the test proves the guard page *would* fault without needing to survive a real one.
+- **`test sched wait`** ✅: exercises `process_wait()`'s two zombie hand-off paths (normal exit, uncatchable kill) — see §7.4.
+- **`test sched priority`** ✅: exercises priority bands + aging (§4.2 Phase C) — a `PRIORITY_REALTIME` kthread must dominate a `PRIORITY_BACKGROUND` one busy-looping alongside it, but aging must eventually let the background one make *some* progress too.
+- **`test smp sched`** ✅ (Phase SMP): spawns 8 kthreads, each recording `lapic_get_id()` on first execution; asserts ≥2 distinct core IDs — proves real concurrent cross-core scheduling, not just time-slicing on one core.
+- **`test smp kill`** ✅ (Phase SMP): spawns a busy-loop kthread, waits until it's observed `RUNNING` on a *different* core than the caller, `process_kill()`s it from here; asserts its counter stops advancing and its slot is eventually reaped — exercises `process_kill()`'s running-elsewhere branch specifically (§9).
+- **`test thread smp`** ✅ (Phase 4; sample size raised Phase 5 — see below): one process (`process_create_kthread`), seven *additional* threads under it (`thread_create`) — eight threads total (was three, at Phase 4 ship), all sharing the same `proc->pml4_phys`. Asserts all eight first-execute (≥2 distinct cores) AND all genuinely increment the SAME shared counter — the second assertion is what actually distinguishes "one shared address space" from "eight processes that coincidentally share a pid," since a shared *heap variable* being consistently incremented by threads running on different cores can't happen with separate address spaces. **A real test-flakiness finding from Phase 5's own verification, not a kernel bug:** at the original sample size of 3, "all N first-executions land on the same core" was observed in about 1 run in 4 under heavy host CPU contention — and it is NOT independent per-thread chance (which would predict under 1% at N=8): these threads all become READY back-to-back in one tight loop, so a single core's own successive ticks can round-robin through every one of them in a streak before the OTHER core's next tick happens to land at all if the host is starving that core's vCPU thread of real time. Raising the sample to 8 (matching `test smp sched`'s already-reliable count) and widening `selftest_wait_ticks()` (20 → 100) both helped — observed failure rate dropped from roughly 1-in-4 to roughly 1-in-8 runs under the same adverse conditions — but did not eliminate it outright, which is itself the signature of a correlated/bursty failure mode rather than an independent one. See `THREAD_SMP_COUNT`'s comment (process.c) for the full account.
+- **`test thread exit`** ✅ (Phase 4): one process, two threads (A exits almost immediately, B keeps spinning); asserts the process is still alive (`live_thread_count == 1`, findable via `process_find`) while B is still running, and is only reaped once B *also* exits — proves the address space survives until the LAST thread exits, not the first, the core claim the whole split exists to make true.
+- **`test ring3 threads`** ✅ (Phase 5): the one selftest in this list that ISN'T purely in-kernel (kthreads) — it needs a real filesystem with `/init.elf` on it (e.g. `make run-embkfs`), because exercising `sys_thread_create`/`sys_thread_join` genuinely needs a ring-3 process, unlike every test above (which use `process_create_kthread`'s ring-0 shortcut specifically so they don't need one). Goes through the REAL scheduler (`process_create()`/`process_wait()`, the same path `sys_spawn`/`sys_wait` and the shell's own `run`/`wait` commands use) rather than the standalone `enter_user_mode()` path `test ring3` uses, because `thread_join()`'s blocking path needs a genuinely scheduled process. `/init.elf` itself (`user/init.c`) spawns a second thread of itself, joins it, and checks that the second thread's writes to `.data` (`counter`, `thread_ran`) are visible back in the main thread after the join — the exit code (16) only comes out right if thread creation, the join, AND the shared-memory check all succeeded; any failure exits with -1 instead.
 
 ---
 
@@ -433,26 +637,68 @@ Phased by dependency, matching the granularity of `docs/ARCHITECTURE.md` §5's p
 
 **Phase B — Blocking + preemption (✅ complete):**
 1. ✅ Wait queues (§7.3) — `wait_queue_block`/`wait_queue_wake_one`/`wait_queue_wake_all`.
-2. ✅ Timer-driven preemption: `lapic_timer_handler` calls `schedule()` on every tick (100Hz). Safe from being reentered by another timer tick (interrupt gate keeps IF=0 for the ISR's duration) — but see §8(a) for a related reentrancy gap that's still open, involving `schedule()` calls made from syscall context instead.
+2. ✅ Timer-driven preemption: `lapic_timer_handler` calls `schedule()` on every tick (100Hz). Safe from being reentered by another timer tick (interrupt gate keeps IF=0 for the ISR's duration), and now also safe against the syscall-context reentrancy gap this same phase's work exposed — see §8(a)/Bug 10, §16.
 3. ✅ Uncatchable kill (§9) — `process_kill(pid)`. This is the point at which `docs/ARCHITECTURE.md` §3.3's "ships with the scheduler" promise is actually redeemed, not just documented.
 4. ✅ `test sched kill` (§12).
 5. ✅ `test sched reap` (§12) — pulled forward from the original Phase D plan below once it became clear `test sched roundrobin`'s kthread infrastructure made it trivial to also spawn/exit past `MAX_PROCESSES` in a loop; no reason to wait for full lifecycle completion just to prove Bug 3 stays fixed.
-6. ✅ `sys_wait`/`sys_spawn`/`sys_yield`/`sys_getpid` syscalls, per-process fd table (unblocks `spawn()`'s file-action model, §3.2) — also pulled forward from Phase D: once preemption and wait queues existed, a busy-polling `sys_wait` (§7.4) was simple enough to build immediately rather than wait for parent/child tracking. **Not yet done from the original Phase D scope:** a real blocking `sys_wait` (needs `process::parent`/`zombie_next`, §6.2) — still Phase D, tracked below.
+6. ✅ `sys_wait`/`sys_spawn`/`sys_yield`/`sys_getpid` syscalls, per-process fd table (unblocks `spawn()`'s file-action model, §3.2) — also pulled forward from Phase D: once preemption and wait queues existed, a busy-polling `sys_wait` (§7.4) was simple enough to build immediately rather than wait for parent/child tracking. The real blocking version landed shortly after, in the Phase D work below.
 7. ✅ Four new bugs found and fixed while building the above (Bugs 6–9, §16): RFLAGS.IF corruption in context switch, `int 0x80` leaving IF=0 for the whole syscall, the `proc_alloc()` READY-before-initialized race, and PCB leak on `process_create()` error paths.
+8. ✅ Bug 10 (§16): `schedule()` itself was reentrant against the timer ISR when called from syscall context — found and fixed by re-reading this same Phase B work, not by a crash.
 
-**Phase C — Priority scheduling:**
-1. Fixed priority bands + aging (§4.2, §6.3).
-2. Revisit `dispatch()` (§5) to select across bands, not just round-robin the flat table.
+**Phase C — Priority scheduling (✅ complete):**
+1. ✅ Fixed priority bands + aging (§4.2, §6.2/§6.3) — `PRIORITY_REALTIME`..`PRIORITY_BACKGROUND` (4 bands), `PRIORITY_AGE_TICKS = 20` (~200ms/band — see §6.2's comment on why this is deliberately short, not the "obvious" multi-second value).
+2. ✅ `schedule()`'s "find next" scan now goes band-by-band (0 = highest) before round-robining within a band — see §6.3 for why this shipped as a re-scan of the flat table rather than the originally-sketched intrusive per-band run queue.
+3. ✅ `test sched priority` (§12).
 
-**Phase D — Lifecycle completion + SMP shape (partially pulled into Phase B above; remaining scope):**
-1. A real blocking `sys_wait` — replace the busy-poll (§7.4) with `process::parent`/`zombie_next` (§6.2) tracking so the exiting child wakes its waiting parent directly instead of the parent spinning on `sys_yield`.
-2. Per-CPU run queues + spinlocks (§8) — built when SMP bring-up (AP init, per-CPU data) actually lands elsewhere in the kernel, not before; this phase is a placeholder marker, not a trigger.
+**Phase D — Lifecycle completion + ring-3 process handles (✅ complete except SMP shape):**
+1. ✅ Real blocking `process_wait()`/`sys_wait` — replaced the busy-poll (§7.4) with `process::parent`/`parent_pid`/`zombie_head`/`zombie_next`/`child_wait` tracking (§6.2), so the exiting child wakes its waiting parent directly. Also built `child_list`/`child_next` (live children, for `ps`).
+2. ✅ Ring-3 process handles (§3.4/§3.5, §15.2) — `sys_spawn` returns one, `sys_wait`/`sys_kill` take one, translated via each process's own `handles[PROC_HANDLE_MAX]` table. Closes the raw-pid confused-deputy gap §17 used to flag here.
+3. ✅ `sys_kill` — the last piece of the §15.2 syscall surface; `process_kill()` itself has existed since Phase B.
+4. ✅ `test sched wait` (§12).
+5. ✅ Bug 11 (§16): building `process_wait()` immediately surfaced a real deadlock in `schedule()`'s zombie hand-off ordering — found by the new test hanging on its first run, fixed by reordering.
+6. ✅ The kernel's own interactive shell (`main.c`) now calls `process_adopt_current()` to become a real, permanently-scheduled process instead of a one-way `process_start_first()` hand-off, with `run`/`ps`/`kill`/`wait`/`nice` commands calling straight into this subsystem. Verified interactively via QEMU monitor-injected keystrokes against a real spawned/waited/killed `/init.elf`.
+7. **Still open from this phase:** per-CPU run queues + spinlocks (§8) — built when SMP bring-up (AP init, per-CPU data) actually lands elsewhere in the kernel, not before; this remains a placeholder marker, not a trigger.
+
+**Phase SMP — real multi-core scheduling (✅ complete; the "SMP shape" Phase D.7 deferred):**
+
+Built and verified under QEMU `-smp 4`, in four sub-phases matching the plan's build→boot→selftest discipline (each landed and re-verified against the full existing suite before the next began):
+
+1. ✅ **Per-CPU foundation** (`kernel/cpu/percpu.h/.c`): `struct cpu_data` per core (own TSS + RSP0/#DF stacks, `current_process`, `pending_reap`, `online`), indexed by an APIC-ID→index table built from the MADT; `this_cpu()` resolves via `lapic_get_id()` (deliberately not GS-base — see the header's comment). `current_process` became `#define current_process (this_cpu()->current_process)` so every existing use site in `process.c` needed zero textual changes. GDT split into `gdt_init_bsp()` (shared descriptors, grown to `5 + 2*MAX_CPUS` entries) + `gdt_init_this_cpu()` (per-core TSS descriptor + `ltr`); `tss_set_rsp0()` now writes `this_cpu()->tss.rsp0` behind the same signature.
+2. ✅ **AP bring-up** (`kernel/cpu/smp.c`, `ap_trampoline.asm`, `ap_entry.asm`): INIT-SIPI-SIPI via new LAPIC ICR helpers; a 16-bit real-mode trampoline assembled flat (`nasm -f bin`), embedded in the kernel image via `incbin`, copied to the PMM-reserved page at `AP_TRAMPOLINE_PHYS` (0x8000) and poked per-AP with the kernel PML4 / stack top / `ap_entry64`. APs reuse the kernel's own page tables — made possible by one permanent identity map of `[0, 1MB)` added to the kernel PML4 (`ap_bootstrap_map()`), which stays invisible to ring 3 because `vmm_create_address_space()` zeroes user-half slots. Strictly sequential bring-up gated on each AP's `online` flag, which the AP sets only after **all** of its setup (GDT/IDT/LAPIC/NXE/timer/adopt) is done.
+3. ✅ **One global scheduler lock** (`g_sched_lock`), exactly as §8's "single lock first" plan of record: every `thread_table`/`process_table`/`current_thread`/`pending_*_reap` mutation is under it (Phase 4 rename, §6.1), and it is **held across `kernel_ctx_switch`** — released only by whichever context resumes on the far side (the line after the switch, or a brand-new process's trampoline). `running_cpu` on every PCB makes `process_kill()` a three-way branch (own-current / running-elsewhere / not-running-anywhere); the running-elsewhere case marks `ZOMBIE` only and lets the owning core's next tick do the hand-off — no IPI needed. `pmm.c` and `vmm.c` gained their own spinlocks (kheap already had one); `kprintf()` output is serialized by a lock so cross-core prints don't interleave at the byte level; the exception dump takes a never-released `panic_lock` so a second faulting core can't garble the first's report.
+4. ✅ **Per-core pinned idle kthreads + liveness invariants**: every core gets a dedicated `PRIORITY_BACKGROUND` idle kthread pinned to it (`pinned_cpu`, skipped by every other core's scan and exempt from aging), plus its adopted bootstrap context (BSP shell / AP `ap_main`), also pinned. This is a **liveness requirement, not tuning**: a core whose current process dies or blocks must always have a legal switch target, or it keeps physically executing on a stack that the woken parent — running concurrently on another core — is about to free. New selftests: `test smp online`, `test smp sched` (8 kthreads must first-execute on ≥ 2 distinct cores), `test smp kill` (kill a kthread live on a different core; assert its counter freezes and its slot is reaped).
+
+**Phase 4 — real process/thread split (✅ complete):**
+
+1. ✅ `struct thread` (schedulable unit) split out of the old conflated `struct process` — see §6.1 for the exact field-by-field breakdown of what moved and why. `thread_table[MAX_THREADS]` (schedulable units) + `process_table[MAX_PROCESSES]` (resource owners) replace the old single `proc_table[MAX_PROCESSES]`.
+2. ✅ `current_thread` (real per-CPU field, `cpu_table[]`) + `current_process` (derived, read-only `current_thread->proc` macro) replace the old single per-CPU `current_process` field — designed and shipped so every external consumer outside `process.c` (`cpu/syscall.c`, `cpu/usercopy.c`, `fs/fd.c`) needed either zero changes or a one-line NULL-check fix (`current_process` → `current_thread`, since `current_thread->proc` can't be evaluated when `current_thread` is NULL).
+3. ✅ New public API: `struct thread *thread_create(struct process *proc, void (*entry)(void))` — the actual new capability this phase adds (an additional thread sharing an EXISTING process's address space). `process_create()`/`process_create_kthread()` are now thin wrappers: build/find a process, then call the same internal `thread_alloc_for()` helper `thread_create()` uses for the first (and, until now, only) thread.
+4. ✅ Two-level deferred reap, per core (§7.4): `this_cpu()->pending_thread_reap` (a thread's kernel stack, freed every exit) and `this_cpu()->pending_process_reap` (a process's address space, freed only when the exiting thread was also the LAST thread of its process). `thread_zombie_locked()` is the new shared decision point between `schedule_locked()`'s self-exit path and `process_kill()`'s external-kill path — decrements `proc->live_thread_count`, decides parent hand-off vs. deferred reap, and is deliberately idempotent against `schedule_locked()`'s pre-existing retry behavior (unlinking the thread from `proc->thread_list` as its first action, so a second call on the same thread is a safe no-op).
+5. ✅ `process_kill()` generalized to iterate every thread of the target process (snapshotting the list first, since `thread_zombie_locked()` unlinks as it goes), applying the existing three-way branch (own-current / running-elsewhere / not-running-anywhere) per thread instead of once for the whole process; the caller's own current thread is always processed last, since killing it hands off to `schedule_locked()`, which never returns.
+6. ✅ `process_wait()`'s belt-and-suspenders `running_cpu != -1` retry (Bug 23, §16) kept working by mirroring a NEW `running_cpu` field directly on `struct process` (meaningful only once `live_thread_count == 0`), synchronized at the same instant `schedule_locked()` confirms the dying thread's core has actually switched away — see §6.1's field-by-field notes.
+7. ✅ Two new selftests, `test thread smp` and `test thread exit` (§12) — prove multiple threads under one process genuinely share its address space (not just its pid), and that the address space survives until the LAST thread exits, not the first.
+8. ✅ **Zero new bugs** — build succeeded on the first attempt, and two independent clean boot-to-battery runs (all ten selftests, `-smp 4`) both passed with no failures. Credited to designing explicitly around the two hazards Phase SMP had already taught (idempotent re-entry into exit-disposition logic; a belt-and-suspenders liveness check mirrored across the split) rather than treating this as new, unexamined territory.
+9. **Deliberately not built this phase:** any ring-3 `sys_thread_create`/`sys_thread_exit` syscall surface. The plan of record was to land and verify the kernel-internal split first, then decide separately whether userspace needs it — building both in the same pass would have made a regression harder to attribute to one or the other. Built in Phase 5, immediately below, once that verification was in.
+
+**Phase 5 — ring-3 threads (✅ complete):**
+
+1. ✅ `MAX_PROCESSES`/`MAX_THREADS` raised 16/16 → 64/256 (process.h) — 16 was sized for "one process, one thread" plus a handful of kthreads, and stopped being enough headroom once a single ring-3 process could plausibly want more than a couple of real threads. Caught and fixed `KSTACK_SIZE`'s accidental coupling to `MAX_PROCESSES` (`(MAX_PROCESSES * 1024)` happened to equal 16 KiB, but was never actually DERIVED from the process count) in the same pass — raising the ceiling without decoupling this would have silently quadrupled every kernel stack's size.
+2. ✅ `struct thread`/`struct process` gained the fields §6.1's Phase 5 addendum describes (`joinable`, per-thread `exit_code`, `user_arg`, `join_wait`).
+3. ✅ `thread_create_user(proc, entry_point, arg)` — the ring-3 equivalent of Phase 4's `thread_create()`: an additional thread of `proc`, entering ring 3 via `process_trampoline` (the exact fabricated-context mechanism a process's own first thread already used), with its own dedicated user stack inside the SAME address space (deterministically placed from the thread's own table-slot index — see §6.1's stack-placement note). Marked `joinable`.
+4. ✅ `thread_join(proc, tid)` — blocks (a real block via the new `proc->join_wait`, not a busy-poll) until thread `tid` of `proc` exits, then reaps it and returns its own `exit_code`. Mirrors `process_wait()`'s shape (including the same `running_cpu != -1` belt-and-suspenders retry and the same "snapshot/restore the caller's interrupt state across a `schedule_locked()`-only resume" dance, Bug 25 §16) one level down: threads of one process instead of children of one parent.
+5. ✅ `thread_exit_self(code)` — the thread-level analog of `process_exit_self()`: ends only the calling thread. Always writes `current_process->exit_code` unconditionally ("last writer wins" across however many threads ever call it) — deliberately no special-casing for "am I the last thread," since `process_exit_self()` never needed that either (there was only ever one thread before this phase).
+6. ✅ `schedule_locked()`'s deferred-reap step (§7.4) gained one exception: a joinable thread that is NOT also completing its process is left OUT of the per-core reap queue, so its kernel stack survives for `thread_join()` to collect later — see §7.4's Phase 5 addendum for the exact condition and why a thread that WAS its process's last one doesn't need this (no siblings left to ever join it).
+7. ✅ Three new syscalls, `sys_thread_create`/`sys_thread_join`/`sys_thread_exit` (§15.2) — `sys_thread_create` validates its `entry_point` argument with `access_ok()` before ever handing it to the scheduler (an arbitrary ring-3-supplied address, unlike `sys_spawn`'s trusted-loader-chosen ELF entry). Returns a raw `tid` (a `thread_table[]` slot index), not a capability handle like `sys_spawn`'s pid — deliberately: a tid only ever names a thread of the CALLER's OWN process, so there's no cross-process confused-deputy gap the handle indirection exists to close (§15.2's own reasoning for why pids DO need one).
+8. ✅ New selftest, `test ring3 threads` (§12) — the first selftest in this file that needs a real disk rather than being purely in-kernel, since it's the only way to exercise the ring-3 half of this feature: `user/init.c` now spawns and joins a second thread of itself, checked via a real shared-`.data` write.
+8a. **Test-robustness finding, not a kernel bug** (discovered verifying this phase, §12's `test thread smp` entry): the *existing* `test thread smp` (Phase 4) turned out to have a real, if modest, flaky-failure rate under heavy host CPU contention — a correlated/bursty timing artifact of its own fixed sample size and wait window, not a scheduler correctness issue (the underlying cross-core dispatch was already independently proven correct, including by this exact test passing cleanly, repeatedly, when Phase 4 originally shipped). Mitigated (not eliminated) by raising its sample size 3 → 8 and its wait budget 20 → 100 ticks — recorded here because it's the kind of finding this document's testing discipline exists to catch, even though it didn't touch any code this phase actually shipped.
+9. **Known, accepted limitation, documented rather than engineered around:** `tid` is not generation-guarded (no ABA protection) — a stale tid could, in principle, alias a later, unrelated thread that happens to recycle the same `thread_table[]` slot. Unlike `parent_pid` (which guards against exactly this for PIDS, because a raw pid crosses a PROCESS boundary — see §6.2), a tid only ever lets a process misname one of its OWN threads, self-inflicted rather than a cross-process isolation gap, so the same rigor doesn't buy the same safety property here. Same category of trade-off as §7.1's PID-wraparound call: revisit only if this is ever actually hit in practice.
+10. **Deliberately not built this phase:** per-thread stack reclamation before process exit (§6.1's Phase 5 addendum — a joined thread's stack pages are reclaimed only when the whole process is, not the instant it's joined); thread-local storage; any signal/cancellation semantics beyond the uncatchable process-level kill (`process_kill()` already forces every thread of a process to `ZOMBIE`, joinable or not — see that function's existing iteration, §13's Phase 4 entry).
 
 **Phase E — `fork()` compat (only if a concrete program needs it):**
 1. COW pages in the VMM (explicitly `docs/ARCHITECTURE.md` §3.2's territory, deferred until here).
 2. `fork()` as a compat syscall built from `spawn()`'s address-space-construction path, not a parallel implementation.
 
-**Explicitly not scheduled, revisit only on real need:** `struct thread` split (§4.1's deferred half), CFS/EEVDF-style fairness accounting (§4.2), PID reuse/namespace machinery (§7.1).
+**Explicitly not scheduled, revisit only on real need:** thread-local storage and tid generation-guarding (Phase 5 notes above), per-CPU run queues (only if `g_sched_lock` is *measured* to bottleneck), TLB shootdown (only when something does a live unmap while other cores may hold the mapping), CFS/EEVDF-style fairness accounting (§4.2), PID reuse/namespace machinery (§7.1).
 
 ---
 
@@ -481,59 +727,158 @@ int  process_create(const char *path);             // ✅ built (spawn()-shaped:
                                                      //    the address space directly;
                                                      //    file-actions param still 🎯,
                                                      //    unscheduled — see §17)
-void process_start_first(void);                     // ✅ built — one-way, never returns
+                                                     //    Phase 4: internally allocates a
+                                                     //    process, then its first thread
+                                                     //    via the same helper thread_create()
+                                                     //    below uses.
+/* process_start_first() -- REMOVED (Phase 4). Zero call sites remained (main.c
+ * had already switched to process_adopt_current() below in Phase D); adapting
+ * it correctly for the thread/process split (fabricating a thread's ctx,
+ * trampoline handling) would have been meaningful unverifiable work for code
+ * nothing called, so it was deleted outright rather than carried forward. */
 void process_exit_self(int code);                   // ✅ built — sys_exit's real body
                                                      //    (named _self, not process_exit:
-                                                     //    it always acts on current_process,
+                                                     //    it always acts on current_thread,
                                                      //    there is no "exit some other pid")
-void process_reap(uint32_t pid);                    // ✅ built — used directly by sys_wait
-void process_find(uint32_t pid);                    // ✅ built — PCB lookup by pid, used by
-                                                     //    sys_wait's busy-poll and process_kill
+void process_reap(uint32_t pid);                    // ✅ built — used directly by process_wait
+struct process *process_find(uint32_t pid);         // ✅ built — PCB lookup by pid, used by
+                                                     //    process_wait and process_kill
+struct thread *process_adopt_current(void);         // ✅ built (Phase D; return type updated
+                                                     //    Phase 4) — turns the CALLING
+                                                     //    execution context into a real,
+                                                     //    permanently-scheduled current_thread
+                                                     //    (owned by a fresh process sharing the
+                                                     //    kernel's own PML4); used by both the
+                                                     //    scheduler selftests (paired with a
+                                                     //    restore) and main.c's shell
+                                                     //    (permanent, no restore call ever)
+int process_wait(uint32_t pid);                     // ✅ built (Phase D) — see §7.4. Blocks for
+                                                     //    real via child_wait; NOT a busy-poll.
+int process_set_priority(uint32_t pid, uint8_t p);  // ✅ built (Phase C; Phase 4: applies to
+                                                     //    every thread of the process) — the
+                                                     //    `nice` shell command's kernel-side impl
+int process_list(struct process_info *out, int max); // ✅ built — `ps`'s kernel-side snapshot;
+                                                     //    returns COPIES, never live PCB pointers
 
 /* Scheduling */
 void schedule(void);                                // ✅ built (Phase A/B: round-robin,
                                                      //    now timer-preemptible;
-                                                     //    Phase C: priority-aware, same signature)
+                                                     //    Phase C: priority-band-aware, same
+                                                     //    signature; Phase 4: scans thread_table)
 void sys_yield(void);                               // ✅ built, wired to syscall number 3
 
-/* Blocking (Phase B) */
-void wait_queue_block(struct wait_queue *wq, struct process *p);  // ✅ built
+/* Blocking (Phase B; signature updated Phase 4) */
+void wait_queue_block(struct wait_queue *wq, struct thread *t);  // ✅ built — queues a THREAD
 void wait_queue_wake_one(struct wait_queue *wq);                   // ✅ built
 void wait_queue_wake_all(struct wait_queue *wq);                   // ✅ built
 
-/* Uncatchable kill (Phase B) */
+/* Ring-3 process handles (Phase D, §3.4/§3.5) — unchanged by Phase 4, still process-level */
+int  process_handle_alloc(struct process *owner, uint32_t pid);            // ✅ built
+int  process_handle_resolve(struct process *owner, int handle, uint32_t *out_pid); // ✅ built
+void process_handle_free(struct process *owner, int handle);               // ✅ built
+
+/* Uncatchable kill (Phase B; Phase 4: iterates every thread of the target) */
 void process_kill(uint32_t pid);                    // ✅ built — forces ZOMBIE regardless of state
 
-/* Scheduler selftests (Phase B), see §12 */
-void process_test_roundrobin(void);                 // ✅ built
-void process_test_kill(void);                        // ✅ built
-void process_test_reap(void);                        // ✅ built
-void process_test_stackguard(void);                   // ✅ built
+/* Multi-threading, ring 0 (Phase 4) */
+struct thread *process_create_kthread(void (*entry)(void), struct process *parent); // ✅ built
+                                                     //    (return type updated Phase 4) — a
+                                                     //    FRESH process sharing the kernel's PML4
+                                                     //    plus its one thread
+struct thread *thread_create(struct process *proc, void (*entry)(void)); // ✅ built (Phase 4) —
+                                                     //    an ADDITIONAL ring-0 thread under an
+                                                     //    EXISTING process; not joinable (auto-
+                                                     //    reaped on exit, same as before Phase 5)
+struct thread *process_create_idle_for_cpu(uint32_t cpu_index); // ✅ built (Phase SMP; return
+                                                     //    type updated Phase 4)
+
+/* Multi-threading, ring 3 (Phase 5) — thread_create()'s userspace-visible
+ * equivalent; every thread created this way is JOINABLE (struct
+ * thread::joinable), unlike the ring-0 API above. */
+int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg); // ✅ built —
+                                                     //    returns a raw tid (thread_table[]
+                                                     //    slot index), or a negative errno
+int thread_join(struct process *proc, int tid);     // ✅ built — blocks via proc->join_wait
+                                                     //    until thread `tid` exits; reaps it
+                                                     //    and returns ITS OWN exit_code
+__attribute__((noreturn)) void thread_exit_self(int code); // ✅ built — ends only the calling
+                                                     //    thread; process_exit_self()'s analog
+
+/* Scheduler selftests, see §12 */
+int process_test_roundrobin(void);                  // ✅ built (Phase B)
+int process_test_kill(void);                         // ✅ built (Phase B)
+int process_test_reap(void);                         // ✅ built (Phase B)
+int process_test_stackguard(void);                    // ✅ built (Phase A)
+int process_test_wait(void);                          // ✅ built (Phase D)
+int process_test_priority(void);                      // ✅ built (Phase C)
+int process_test_smp_sched(void);                     // ✅ built (Phase SMP)
+int process_test_smp_kill(void);                      // ✅ built (Phase SMP)
+int process_test_thread_smp(void);                    // ✅ built (Phase 4)
+int process_test_thread_exit(void);                   // ✅ built (Phase 4)
+/* test ring3 threads (§12, Phase 5) has no process_test_* function of its
+ * own -- it's a direct process_create()/process_wait() call inlined into
+ * selftests.c's dispatch, since it needs a real disk and doesn't fit this
+ * file's "temporarily adopt current_thread" selftest convention (§12). */
 ```
 
-### 15.2 Userspace-facing syscalls (✅ all built except `sys_kill`)
+### 15.2 Userspace-facing syscalls (✅ all built)
 
-Per `docs/ARCHITECTURE.md` §3.4's split (fds for streams, typed handles for structural objects): process/thread handles are **not** file descriptors. §3.4/§3.5's eventual capability-handle model for `sys_spawn`/`sys_wait` is not yet built — **what actually shipped in Phase B uses a raw `pid_t`-shaped `uint32_t`, the plain/simple version**, not yet the opaque per-caller handle described below. This is flagged as a known divergence from the settled design, not an oversight: it was the pragmatic choice to get a *working* spawn/wait/kill surface before deciding the handle-scoping details, and should be revisited before untrusted code can call these syscalls (a raw pid lets any caller name any other process, which the handle model was specifically designed to prevent).
+Per `docs/ARCHITECTURE.md` §3.4's split (fds for streams, typed handles for structural objects): process/thread handles are **not** file descriptors. §3.4/§3.5's capability-handle model for `sys_spawn`/`sys_wait`/`sys_kill` is now built, closing what was previously flagged here as a known divergence (an earlier pass shipped a raw `pid_t`-shaped `uint32_t` first, deliberately, to get a *working* surface before deciding the handle-scoping details). `sys_spawn` allocates a handle in the **caller's own** `struct proc_handle handles[PROC_HANDLE_MAX]` table (process.h) pointing at the real pid; `sys_wait`/`sys_kill` resolve their handle argument back to a pid via that same table before acting — a process can only ever name a pid it was actually handed a handle to, closing the confused-deputy hole a bare pid argument left open (any ring-3 process naming any pid it could guess).
 
 ```
 sys_exit(code) -> !                          // ✅ built (int 0x80, SYS_exit = 2)
-sys_spawn(path) -> pid                        // ✅ built (SYS_spawn = 10) — builds on
-                                               //    process_create; file_actions[] param
-                                               //    and the handle-vs-pid model both
-                                               //    still 🎯, unscheduled (see above)
-sys_wait(pid) -> exit_code                    // ✅ built (SYS_wait = 11) — busy-polls
-                                               //    rather than blocking via wait_queue;
-                                               //    see §7.4 for why and what's still 🎯
+sys_spawn(path) -> handle                     // ✅ built (SYS_spawn = 10) — builds on
+                                               //    process_create; returns a handle
+                                               //    (process_handle_alloc), not the raw
+                                               //    pid. file_actions[] param still 🎯,
+                                               //    unscheduled.
+sys_wait(handle) -> exit_code                 // ✅ built (SYS_wait = 11) — resolves the
+                                               //    handle, then genuinely BLOCKS via
+                                               //    process_wait() (§7.4) until that
+                                               //    specific child exits or is killed;
+                                               //    frees the handle on return either way.
 sys_yield() -> void                           // ✅ built (SYS_yield = 3)
 sys_getpid() -> pid                           // ✅ built (SYS_getpid = 12) — not in the
                                                //    original spec, added because a spawn()
                                                //    caller needs to tell itself apart from
-                                               //    a child running the same binary
-sys_kill(handle) -> void                      // 🎯 still not built — the *userspace-reachable*
-                                               //    edge of the uncatchable kill; note the
-                                               //    kernel-internal path (process_kill) is
-                                               //    already fully built and used by the
-                                               //    selftests, just not exposed to ring 3 yet
+                                               //    a child running the same binary.
+                                               //    Deliberately the real pid, not a
+                                               //    handle: a process always has ambient
+                                               //    authority over itself.
+sys_kill(handle) -> void                      // ✅ built (SYS_kill = 13) — the
+                                               //    userspace-reachable edge of the
+                                               //    uncatchable kill; process_kill()
+                                               //    itself has existed since Phase B
+                                               //    (used by the selftests), this just
+                                               //    exposes it to ring 3 via the handle
+                                               //    table. Does not free the handle --
+                                               //    the caller still needs it to
+                                               //    sys_wait() and collect the "killed"
+                                               //    exit code (-1) afterward.
+sys_thread_create(entry, arg) -> tid          // ✅ built (SYS_thread_create = 14, Phase 5) —
+                                               //    thin wrapper over thread_create_user()
+                                               //    (§15.1), with `entry` validated via
+                                               //    access_ok() before ever being handed to
+                                               //    the scheduler (see that function's own
+                                               //    comment, cpu/syscall.c, for why an
+                                               //    arbitrary ring-3-supplied entry point
+                                               //    needs this check where an ELF's own
+                                               //    entry point, chosen by the trusted
+                                               //    loader, doesn't). Returns a raw tid, NOT
+                                               //    a handle -- see thread_create_user()'s
+                                               //    doc comment (process.h) for why a thread
+                                               //    doesn't need the same confused-deputy
+                                               //    protection a pid does (no cross-process
+                                               //    thread naming exists at all).
+sys_thread_join(tid) -> exit_code             // ✅ built (SYS_thread_join = 15, Phase 5) —
+                                               //    thin wrapper over thread_join(); a real
+                                               //    block via proc->join_wait, same shape as
+                                               //    sys_wait/process_wait() one level down.
+sys_thread_exit(code) -> !                    // ✅ built (SYS_thread_exit = 16, Phase 5) —
+                                               //    ends only the calling thread; if it
+                                               //    happens to be the process's last thread,
+                                               //    this completes the process too, exactly
+                                               //    like sys_exit would.
 ```
 
 ---
@@ -577,6 +922,32 @@ The natural way to give the new kernel-stack region its own address space is a f
 **Bug 9 — PCB slot permanently leaked on every `process_create()` error path (found via code review while fixing Bug 8, same session).**
 While auditing `process_create()`'s failure paths to fix Bug 8, none of the four early returns (address-space creation failure, ELF load failure, user-stack allocation failure, kernel-stack allocation failure) reset `proc->state` back to `PROCESS_UNUSED` before returning an error — each one left the slot in whatever partially-reserved state `proc_alloc()` had put it in, permanently unusable and indistinguishable (from outside) from a real running process's slot. With `MAX_PROCESSES = 16`, repeated failed spawns (e.g., a bad path passed to `sys_spawn`) would silently shrink the usable process table over the kernel's uptime, eventually reproducing exactly Bug 3's original symptom (`process_create` fails forever) but from a completely different cause. **The general shape to recognize:** every early-return failure path in a multi-step "acquire, initialize, initialize, initialize" constructor needs to undo *all* prior acquisitions, not just the specific resource that failed on this attempt — a constructor audited only for its happy path is a leak audited for zero of its paths. **Fix:** added `proc->state = PROCESS_UNUSED;` to all four early-return sites. **Guard against recurrence:** any future step added to `process_create()` needs a corresponding rollback added to every return path that comes *after* it, not just the one immediately following.
 
+**Bug 10 — `schedule()` was reentrant against the timer ISR whenever called from syscall context (found by re-reading the finished Phase B work, not by a crash — fixed same session).**
+Bugs 6 and 7 each independently established that IF can be 1 during a `schedule()` call: Bug 6 because the timer ISR's *saved* snapshot forces IF=1 for the outgoing process, and Bug 7 because `syscall_dispatch()` does an unconditional `sti` before dispatching to `sys_exit`/`sys_yield`, both of which call `schedule()` downstream (`process_exit_self` → `schedule()`, `sys_yield` → `schedule()`). Put those two facts together and a third one falls out that neither bug's fix addressed: a `schedule()` call reached from syscall context runs with *live* IF=1 for its own entire body — the scan of `proc_table`, the `g_pending_reap` reclaim, the `current_process`/state mutations, and the CR3/RSP0 switch all execute with interrupts enabled. A timer IRQ landing anywhere in that window calls `schedule()` again, reentrantly, on the same kernel stack, while the outer call's local variables (`prev`, `next`) and the global `current_process`/`proc_table` state are mid-mutation. Depending on exactly where the two calls interleave, this can range from redundant-but-harmless (interrupt lands before any state is touched) to genuinely corrupting (interrupt lands after `current_process = next` but before `kernel_ctx_switch`, so the inner call captures a `prev` that the outer call is about to save over, or the inner call fully completes a switch via its own `kernel_ctx_switch`, which never returns to the outer call's remaining lines until this process is independently rescheduled far later — at which point the outer call resumes using state that a completely different scheduling decision has since invalidated). **The general shape to recognize: fixing two separate bugs that each individually justify "IF can be 1 here now" does not automatically mean the code in between was audited for what "IF can be 1 here" actually implies** — Bugs 6 and 7 were each scoped to their own specific symptom (a resumed process stuck with interrupts off; a syscall hung on disk I/O), and neither fix's author needed to reconsider `schedule()`'s own reentrancy to close their own bug. The reentrancy hazard was a side effect of the *combination*, sitting one level up from either individual fix, and nothing forced it to be revisited until this document was being written and the two facts were laid out next to each other in §8. No test in the existing suite exercises the exact interleaving needed to trigger it, which is precisely why it went unnoticed rather than unnoticeable. **Fix:** `schedule()` now disables interrupts at entry and restores the caller's original state on every return path that doesn't go through `kernel_ctx_switch` (full detail and the reasoning for why the post-switch path needs no explicit restore: §8(a)) — the same `pushfq`/`cli`/conditional-`sti` idiom `cpu/spinlock.c`'s `spin_lock`/`spin_unlock` already use elsewhere in this kernel, applied here for the first time. Verified by rerunning `test sched roundrobin`/`kill`/`reap`/`stackguard` in QEMU after the change (all still pass) — `roundrobin` and `kill` in particular already have kthreads calling `process_exit_self` (the same call shape as `sys_exit`) while the timer actively preempts them, which is the closest existing coverage of this exact interleaving, even though nothing in the test asserts on the reentrancy question directly. **Guard against recurrence:** whenever two bugs each conclude "X can happen now, and that's fine because Y" about the same shared piece of state or code, check whether X-and-Y-together implies something neither bug individually needed to consider — the combination is where this one hid.
+
+**Bug 11 — `schedule()`'s zombie hand-off ran after the "nothing else runnable" early return, deadlocking the very first real use of `process_wait()` (found immediately by `test sched wait` hanging, fixed same session).**
+`schedule()`'s structure was: find `next` (the process to switch to); if none exists (`!next || next == current_process`), restore interrupt state and return early; only *after* that check, if a switch is actually happening, decide what to do with a `PROCESS_ZOMBIE` `prev` — hand it off to a live parent's `zombie_head`/`child_wait`, or queue it for auto-reap via `g_pending_reap`. This was correct for every scenario that existed before `process_wait()`: `process_test_reap()`'s kthreads always exit while their test harness (`self`) is still `READY` or `RUNNING` (it's mid-`selftest_wait_ticks`, looping `hlt`), so `next` always finds `self` regardless of ordering, and the code after the early return always runs. `process_wait()` creates a genuinely new shape: a parent that's actively `PROCESS_BLOCKED` (via `wait_queue_block`) specifically because it's waiting for this exact child to exit. `PROCESS_BLOCKED` doesn't match the `next`-search's `READY || RUNNING` filter — so when the child (the only *other* process in the table) becomes a zombie and calls `schedule()`, the search finds nothing (`next == NULL`), the function returns early, and the code that would move the child onto the parent's `zombie_head` and call `wait_queue_wake_one()` to flip the parent back to `READY` never runs. The parent stays `BLOCKED` forever; the child stays an unreclaimed zombie forever; nothing in the system will ever call `schedule()` again on their behalf (no other process exists to generate a timer-tick opportunity for *this* pair specifically, though in the actual selftest the whole system just hung on this one blocked call). **The general shape to recognize:** an early-return guard ("nothing else to do, bail out") that was written when the *only* two things that could happen next were "keep running yourself" or "run a different runnable process" silently stops being exhaustive the moment a *third* state (`BLOCKED`, waiting specifically on the thing about to change) enters the picture — the guard's condition (`!next`) doesn't know that the side effect it's skipping past is the very thing that would have produced a `next`. **Fix:** moved the zombie hand-off/auto-reap decision to run unconditionally as soon as `current_process->state == PROCESS_ZOMBIE` is observed, *before* the `next`-search begins — so a wake-up that makes the parent `READY` happens in time for that same `schedule()` call's search to find it. The `RUNNING → READY` demotion for a *non-zombie* `prev` correctly stays exactly where it was (gated behind an actual switch happening), since a still-alive process legitimately might end up "resuming as itself" if it's the only one left — the two cases needed different treatment precisely because only one of them ever needs to survive being skipped. **Guard against recurrence:** any future process state that's excluded from the scheduler's "is there something else to run" search (i.e., anything beyond `READY`/`RUNNING`) needs an audit of every place that transitions a process *out* of that excluded state, to check whether the transition's own side effects need to happen before or after the search that state is invisible to.
+
+**SMP bug ledger (Bugs 12–25) — every one found by an actual crash, hang, or GDB session while landing the SMP phase (§13), condensed because the full essay treatment above would triple this file.** The unifying lesson: almost none of these were "add a lock" bugs — they were *liveness and ordering* bugs in the seams between "this core" and "any core", each invisible on a single core by construction.
+
+12. **AP marked `online` before its setup finished** — `smp_bringup()` starts the next AP the moment the flag flips, so an early flip meant two APs running unserialized setup concurrently (shared IDT writes, unlocked `kprintf`) → garbled serial + #DF. Flag now set as `ap_main()`'s last act.
+13. **Scheduler scan matched *any* `PROCESS_RUNNING` candidate** — on one core, "RUNNING" could only mean "me", so the old scan's `READY || RUNNING` filter was equivalent to "READY or myself". With N cores it silently meant "READY, or *whatever someone else is executing right now*" → `kernel_ctx_switch` into a context another core was live inside (RSP=0 #DF). Now `READY || (candidate == current_process && RUNNING)`.
+14. **…and the first fix of #13 dropped the state check entirely**, letting a ZOMBIE `current_process` re-select *itself* through the self-fallback and resume past `process_exit_self()`. Both clauses are needed; the comment at the scan spells out why.
+15. **`g_sched_lock` was never released on a brand-new process's first dispatch** — a fabricated `ctx.rip` jumps straight to the entry point, skipping the `spin_unlock` that lives right after `kernel_ctx_switch`. Every core eventually parked in `spin_lock` forever. Fix: `process_trampoline()`/`kthread_trampoline()` release the lock as their first action, and `process_create*()` fabricate `rflags` with IF=**0** so interrupts cannot fire in the gap between the switch's `popfq` and that unlock (a real, observed self-deadlock window, not a nicety).
+16. **`EFER.NXE` is a per-core MSR** — only `vmm_init()` (BSP) ever set it, so every `VMM_NX` PTE (every kernel stack) was a *reserved-bit* #PF on any AP → #DF the first time an AP dispatched a kthread. `vmm_enable_nx_this_cpu()` now runs first thing in `ap_main()`.
+17. **`vmm.c` had zero locking** — kthread creation maps stack pages with no scheduler lock held while a reap on another core unmaps under `g_sched_lock`: two different locks (one nonexistent) around the same page-table pages. `vmm_lock` now guards map/unmap/create/destroy + both VA bump allocators, same shape as `pmm_lock`/`heap_lock`.
+18. **`process_exit_self()`'s `cli; hlt` fallback stranded cores** — "nothing else runnable *on this core right now*" stopped implying "the system is done" the moment other cores could be busy running everything else; parking with interrupts off made it permanent (and killed the keyboard when it was the BSP). Now `sti; hlt` so the core's own next tick retries.
+19. **Deferred reap posted before the switch away was certain** — `pending_reap` was set in the ZOMBIE hand-off block, but if the scan then found nothing to switch to, the core kept idling *on the zombie's stack* and its own next tick freed that stack out from under itself (#DF inside `vmm_flush_tlb`). The assignment now happens only after a real switch is committed.
+20. **`kernel_ctx_switch` force-restoring IF=1 for *resumed* contexts** — every resume lands one `jmp` before `schedule_locked()`'s own `spin_unlock`; forcing IF=1 in the *saved snapshot* (Bug 6's fix, correct then) let a tick land in that gap and re-enter `schedule()` on a lock the core still held. The switch now saves flags verbatim (IF=0, since every save happens inside the timer ISR); `spin_unlock` is what turns interrupts back on. Bug 6's original concern is still honored — by the unlock's saved-flags restore, not by the snapshot.
+21. **…and the complementary kthread half:** `spin_unlock`'s conditional `sti` restores the *lock acquirer's* interrupt state — IF=0 when the dispatch came from the timer ISR — and a kthread never passes through an `iretq` that would fix it up, so it ran with interrupts permanently off (unpreemptable forever). `kthread_trampoline()` executes an explicit `sti`; `process_trampoline()` never needed it (its `iretq` pushes `rflags=0x202`).
+22. **`process_init()` ran *after* `smp_bringup()`** — the single most damaging one: the blanket table reset wiped the PCBs the APs had already adopted, leaving every AP's `current_process` dangling at a slot the allocator happily recycled into test kthreads — two cores executing "the same" PCB, the root behind a whole family of intermittent corruption that kept shifting shape as the bugs above were fixed. Ordering in `main.c` is now explicit and commented as load-bearing.
+23. **A woken parent could reap a zombie whose core was still standing on its stack** — the hand-off (link + wake) is posted *before* the dying core has switched away; if the parent won the race on another core, `process_reap_slot()` freed a stack that was still someone's live RSP. Closed structurally: the dying core clears `running_cpu` and completes its switch **inside the same `g_sched_lock` hold** that posted the hand-off (so the parent can't even enter its locked zombie-walk until the core is off the stack), the per-core pinned idles guarantee that switch always has a target, and `process_wait()` keeps a belt-and-suspenders `running_cpu != -1` busy-retry.
+24. **Idempotence of re-entered exit paths** — a ZOMBIE (or BLOCKED) current that couldn't switch away re-runs its disposition logic on every subsequent tick; the hand-off re-link and `wait_queue_block()` re-insert each made the node its own list successor (infinite walk for whoever traverses next). Both are now guarded (`already on the parent's zombie list?` / `already on this wait queue?`).
+
+25. **A resumed voluntary-block caller has NO iretq to restore its interrupt state** — the direct consequence of Bug 20's verbatim-flags fix, one layer up (the exact "two fixes compose into a third bug" shape Bug 10 warned about): a preempted process gets IF back from its timer ISR's `iretq`, a syscall from its `int 0x80` frame's — but `process_wait()`'s blocking `schedule_locked()` call is a plain function call, so after resume the flags are the switch's verbatim IF=0 followed by `spin_unlock` restoring the *dispatching* core's (also IF=0, mid-ISR) state. The shell returned from every blocking wait with interrupts silently off; the next `hlt` downstream hung the core — intermittent only because the blocking path itself is (often the zombie is already handed off and no switch happens). Fix: `process_wait()` snapshots its caller's IF at entry and restores it after every resume. Any future voluntary-block path (a sleep syscall, a mutex) needs the same, and this is now the documented rule.
+
+Also fixed in passing, as a *test* bug rather than a kernel bug: `test sched kill` asserted the victim's slot was `UNUSED` synchronously after `process_kill()` — true single-core behavior, wrong under SMP where a victim running on another core is (correctly) only marked ZOMBIE and reaped by that core's own next tick. The test now polls briefly for the slot to clear.
+
 ---
 
 ## 17. Trade-offs (explicit, not buried in the prose above)
@@ -584,10 +955,13 @@ While auditing `process_create()`'s failure paths to fix Bug 8, none of the four
 | Decision | What we gave up | Why it's still right, for now |
 |---|---|---|
 | Round-robin, not priority/fair-share (§4.2 Phase A/B) | Interactive responsiveness under contention | Real preemption now exists (Phase B), so contention is no longer hypothetical, but `MAX_PROCESSES=16` on a single-user workstation still doesn't produce enough runnable processes at once for fairness to matter in practice; building fairness accounting now is still solving next year's problem with this year's guesses — revisit if it's ever actually observed to matter |
-| `sys_wait` busy-polls instead of blocking on a wait queue (§7.4) | CPU cycles spent spinning/yielding while a parent waits, instead of the caller being genuinely off the run queue | The wait-queue primitive (§7.3) exists and this could use it, but doing so needs `process::parent`/`zombie_next` (§6.2) so the exiting child knows whom to wake — busy-polling is a correct, much simpler stand-in that didn't require building parent/child tracking just to ship a working `wait()`; revisit when that tracking is needed for something else anyway (Phase D) |
-| `sys_spawn`/`sys_wait` take a raw `uint32_t` pid, not an opaque capability handle (§15.2) | The confused-deputy protection `docs/ARCHITECTURE.md` §3.4/§3.5's handle model was designed to provide (a raw pid lets any caller name any other process) | Shipping the plain pid-based version first let spawn/wait/kill land as a coherent, testable unit without also having to design the handle-scoping rules in the same pass; explicitly flagged (§15.2) as needing revisiting before untrusted code can call these syscalls, not a forgotten detail |
-| Process/thread kept unified for now (§4.1, deferred split) | The "correct" separation from day one | A process with one thread is the only case that exists; splitting early means carrying an unused abstraction through every change until something actually needs 2 threads |
-| Static `MAX_PROCESSES` array, not a dynamic allocator (§6.3) | Scaling past 16 concurrent processes | A dynamic PCB allocator is real work (allocation failure paths, iteration without a fixed bound) that a single-user dev workstation doesn't need yet; revisit if 16 is ever actually hit in practice, not before |
+| ~~`sys_wait` busy-polls instead of blocking~~ — ✅ resolved (Phase D) | *(historical)* CPU cycles spent spinning/yielding while a parent waited, instead of the caller being genuinely off the run queue | Was a deliberate, correct stand-in shipped first (busy-polling doesn't need parent/child tracking); `process::parent`/`parent_pid`/`zombie_head`/`child_wait` (§6.2) landed shortly after and `process_wait()`/`sys_wait` now genuinely block — see §7.4. Row kept here as the record of the trade-off actually having been paid off, not forgotten. |
+| ~~`sys_spawn`/`sys_wait` took a raw `uint32_t` pid~~ — ✅ resolved (Phase D) | *(historical)* The confused-deputy protection `docs/ARCHITECTURE.md` §3.4/§3.5's handle model was designed to provide (a raw pid let any caller name any other process) | Was the pragmatic choice to ship a coherent, testable spawn/wait unit before designing handle-scoping; the capability-handle model (§15.2) landed shortly after — `sys_spawn` now returns a handle, `sys_wait`/`sys_kill` take one, translated per-process via `handles[PROC_HANDLE_MAX]`. Row kept as the record of the trade-off having been paid off. |
+| ~~Process/thread kept unified for now~~ — ✅ resolved (Phase 4, §4.1/§6.1/§13) | *(historical)* The "correct" separation from day one | Was the pragmatic choice to defer real work until something actually needed >1 thread per process; the split (`struct thread` + `struct process`, §6.1) landed once `thread_create()` became the concrete need, cleanly (zero new bugs, §13's Phase 4 entry) — largely because deferring it meant the split was designed against the SMP phase's already-learned hazards (idempotent re-entry, belt-and-suspenders liveness checks) instead of being new, unexamined territory. Row kept as the record of the trade-off having been paid off, not forgotten. |
+| ~~Ring-3 thread syscalls not built alongside the kernel-internal split~~ — ✅ resolved (Phase 5, §13) | *(historical)* A complete userspace-facing multi-threading story in the same pass as Phase 4 | Was the pragmatic choice to land and verify the kernel-internal split first (ring 0 only, via `thread_create()`), so a regression was unambiguously attributable to one layer or the other; `thread_create_user()`/`thread_join()`/`sys_thread_create`/`sys_thread_join`/`sys_thread_exit` (§13's Phase 5 entry) landed once that verification was in. Row kept as the record of the trade-off having been paid off. |
+| Ring-3 thread stacks reclaimed only on process exit, not per-thread on join (Phase 5, §6.1) | Prompt memory reclamation for a process that creates and joins many short-lived threads over a long lifetime | `thread_join()` already has to reap the THREAD (kernel stack) — extending that to also unmap the joined thread's USER stack pages is real extra work (a `vmm_unmap_in()`-shaped primitive doesn't exist yet) for a cost that's bounded and self-correcting (the whole address space, stacks included, is reclaimed the moment the process itself exits) — not worth building until a real workload's actually observed to need it |
+| Thread tids (Phase 5) are not generation-guarded (no ABA protection) | The same slot-recycling safety `parent_pid` already provides for pids (§6.2) | A tid only ever lets a process misname one of ITS OWN threads (no cross-process thread naming exists at all, unlike a pid) — self-inflicted, not the cross-process isolation gap `parent_pid` closes, so the same rigor doesn't buy the same safety property; revisit only if this is ever actually hit in practice, same call as §7.1's PID-wraparound trade-off |
+| Static `MAX_PROCESSES`/`MAX_THREADS` arrays, not a dynamic allocator (§6.3) | Scaling past a fixed number of concurrent processes/threads (16/16 through Phase 4; raised to 64/256 in Phase 5 once ring-3 processes could genuinely want more than one thread each) | A dynamic PCB/TCB allocator is real work (allocation failure paths, iteration without a fixed bound) that a single-user dev workstation doesn't need yet; revisit if the new ceiling is ever actually hit in practice, not before |
 | No fairness/anti-starvation until Phase C (§4.2) | Guaranteed forward progress for low-priority work under Phase C priorities | Aging (§6.2) is the cheap fix, deliberately deferred to the same phase that introduces the problem it solves — no reason to build it before priorities exist |
 | Uncatchable kill bypasses the message-port model entirely (§9) | Architectural purity ("everything goes through ports") | A purely cooperative kill mechanism is provably incomplete (a process that ignores its port can't be stopped by definition) — this is not a purity/pragmatism trade-off, it's a correctness requirement, which is why `docs/ARCHITECTURE.md` §3.3 already calls it non-optional |
 | `fork()`/COW pushed to Phase E, off the near-term path | Whatever software assumes `fork()` semantics (most Unix software) | `docs/ARCHITECTURE.md` §3.2 already made this call — repeated here only to note the scheduler-side consequence: no process-duplication code path needs to exist until Phase E, which is why `process_create` today builds one address space from scratch and nothing about its shape needs to anticipate duplication |

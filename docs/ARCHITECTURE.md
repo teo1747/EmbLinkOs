@@ -39,11 +39,11 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | Buddy allocator (PMM upgrade) | ⏳ Later |
 | | | Per-process address spaces | ✅ Built *(`mmap`/`brk` still 🎯 Designed)* |
 | | | Copy-on-write pages, NX bit | ⏳ Later *(COW arrives with `fork()`)* |
-| | | Scheduler — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (timer-preemptive round-robin, wait queues; no priority/SMP yet — see spec §17) |
+| | | Scheduler — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (timer-preemptive priority-band round-robin + aging, wait queues, real blocking wait; no SMP yet — see spec §17) |
 | | | Ring 3 entry (`int 0x80`/`iretq`) | ✅ Built *(`SYSCALL`/`SYSRET` fast path still 🎯 Designed)* |
-| 3 | Process & IPC | Process objects, context switch — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (no thread/process split yet — see spec §4.1); per-process fd tables ✅ |
-| | | `spawn()`-shaped process creation (`process_create`, ELF-based) | 🚧 Built (`sys_spawn`/`sys_wait` syscalls ✅; still no file-actions list, still a raw pid not a handle — see spec §15.2/§17) |
-| | | Uncatchable kernel-level kill | ✅ Built (`process_kill`; no `sys_kill` syscall exposing it to ring 3 yet) |
+| 3 | Process & IPC | Process objects, context switch — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (no thread/process split yet — see spec §4.1); per-process fd tables ✅, parent/child tracking ✅ |
+| | | `spawn()`-shaped process creation (`process_create`, ELF-based) | 🚧 Built (`sys_spawn`/`sys_wait`/`sys_kill` ✅, capability handles not raw pids ✅ — see spec §15.2; still no file-actions list) |
+| | | Uncatchable kernel-level kill | ✅ Built (`process_kill`; exposed to ring 3 via `sys_kill`, capability-handle-gated) |
 | | | Message/event ports | 🎯 Designed |
 | | | Pipes | 🎯 Designed |
 | 4 | Driver model | ACPI enumeration | ✅ Built |
@@ -58,7 +58,7 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | FAT32 (write, mkdir, LFN, FSInfo) | ✅ Built |
 | | | fd layer (base 3, create-on-open, `kcontext` unwind) | ✅ Built |
 | | | Page/buffer cache | ⏳ Later |
-| 6 | Syscall ABI + libc | Syscall surface (split: fds / handles) | 🚧 Built (12 calls: write/read/open/close/lseek/stat/readdir/spawn/wait/yield/getpid/exit, user-pointer-validated; still fd-only in practice — process/thread objects use a raw pid, not yet the typed-handle half of the split, see §3.4) |
+| 6 | Syscall ABI + libc | Syscall surface (split: fds / handles) | ✅ Built (13 calls: write/read/open/close/lseek/stat/readdir/spawn/wait/yield/getpid/kill/exit, user-pointer-validated; process/thread objects now go through the typed-handle half of the split too — `sys_spawn`/`sys_wait`/`sys_kill` take/return capability handles, not raw pids, see §3.4) |
 | | | newlib (bring-up libc) → musl (later) | 🔓 / ⏳ |
 | 7 | Userspace runtime | Userspace ELF loader (static-first) | 🎯 Designed *(critical path)* |
 | | | init / service manager (PID 1) | 🔓 Open |
@@ -151,7 +151,7 @@ Ordered by dependency. Fine-grained tasks live in `TODO.md`.
 
 1. **Ring 3 entry** ✅ — via `int 0x80`/`iretq`, privilege separation working. The `SYSCALL`/`SYSRET` fast path (MSR setup, entry stub) is still 🎯, but no longer blocks anything below it.
 2. **Per-process address spaces** ✅ — separate page-table hierarchies; `process_create` builds one from an ELF path per §2's `spawn()`-shaped row.
-3. **Scheduler** *(Phases A and B landed)* — timer-driven preemptive round-robin, wait queues, and the **uncatchable kernel kill** are all built. Priority scheduling and SMP are still open, deferred until something concrete needs them. Full phased spec: [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
+3. **Scheduler** *(Phases A–D landed)* — timer-driven preemptive priority-band round-robin with aging, wait queues, the **uncatchable kernel kill**, real blocking `wait()`, and capability handles for `spawn`/`wait`/`kill` are all built. Only SMP is still open, deferred until something concrete needs it. Full phased spec: [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
 4. **Userspace ELF loading** ✅ — static binaries, loaded from the filesystem (not an embedded blob); relocation/dynamic linking still later.
 5. **Syscall ABI surface for a libc** *(largely built)* — file I/O ✅ (open/read/write/close/lseek/stat/readdir, wired through to VFS/FAT32/EMBKFS), process spawn/wait ✅ (`sys_spawn`/`sys_wait`, still busy-poll-based — see the scheduling spec §7.4/§17), user-pointer validation ✅ (`access_ok`/`copy_from_user`/`copy_to_user`). Still open: memory (`brk`/`mmap`-equiv), basic TTY, and the `SYSCALL`/`SYSRET` fast path.
 6. **newlib** — supply the ~dozen low-level stubs (`_read`, `_write`, `_open`, `_close`, `_lseek`, `_sbrk`, `_fstat`, `_exit`, `_getpid`, …). Familiar from Cortex-M.
@@ -182,7 +182,7 @@ Smaller open items: pipe file-action API shape (at ABI design), init/PID 1 model
 
 ## 7. Deferred / Later (off the near-term critical path)
 
-UEFI bootloader · buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · GUI stack (compositor, toolkit, apps) · SMP · priority scheduling · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib).
+UEFI bootloader · buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · GUI stack (compositor, toolkit, apps) · SMP · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib).
 
 ---
 

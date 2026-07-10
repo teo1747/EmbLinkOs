@@ -7,10 +7,18 @@
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "cpu/rwlock.h"
+#include "drivers/rtc.h"
 #include "cpu/usermode.h"
 #include "process/process.h"
 #include "drivers/usb.h"
 #include "drivers/framebuffer.h"
+#include "cpu/percpu.h"
+#include "crypto/sha256.h"
+#include "crypto/hmac.h"
+#include "crypto/pbkdf2.h"
+#include "crypto/aes.h"
+#include "crypto/xts.h"
+#include "fs/embkfs/embkfs_compress.h"
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -242,6 +250,15 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs alloc\n");
     kprintf("  test embkfs tree\n");
     kprintf("  test embkfs obj\n");
+    kprintf("  test embkfs timestamps\n");
+    kprintf("  test embkfs multivol\n");
+    kprintf("  test embkfs compress\n");
+    kprintf("  test embkfs selfheal\n");
+    kprintf("  test embkfs snapshot\n");
+    kprintf("  test embkfs provenance\n");
+    kprintf("  test embkfs verifyboot\n");
+    kprintf("  stat <path>\n");
+    kprintf("  snap create|list|delete|rollback <name>\n");
     kprintf("  test embkfs ns\n");
     kprintf("  test embkfs all\n");
     kprintf("  test embkfs diag\n");
@@ -250,11 +267,26 @@ static void selftests_print_commands(void)
     kprintf("  test fat32\n");
     kprintf("  test fat32 vfs\n");
     kprintf("  test rwlock\n");
+    kprintf("  test rtc\n");
+    kprintf("  test crypto sha256\n");
+    kprintf("  test crypto hmac\n");
+    kprintf("  test crypto pbkdf2\n");
+    kprintf("  test crypto aes\n");
+    kprintf("  test crypto xts\n");
+    kprintf("  test crypto all\n");
     kprintf("  test ring3\n");
+    kprintf("  test ring3 threads\n");
     kprintf("  test sched roundrobin\n");
     kprintf("  test sched kill\n");
     kprintf("  test sched reap\n");
     kprintf("  test sched stackguard\n");
+    kprintf("  test sched wait\n");
+    kprintf("  test sched priority\n");
+    kprintf("  test smp online\n");
+    kprintf("  test smp sched\n");
+    kprintf("  test smp kill\n");
+    kprintf("  test thread smp\n");
+    kprintf("  test thread exit\n");
     kprintf("  test usb\n");
     kprintf("  test gpu\n");
 }
@@ -265,9 +297,18 @@ static void run_embkfs_all(void)
     int rc_alloc = embkfs_run_allocator_selftests();
     int rc_tree = embkfs_run_tree_selftests();
     int rc_obj = embkfs_run_object_selftests();
+    int rc_ts = embkfs_run_timestamp_selftests();
+    int rc_mv = embkfs_run_multivol_selftests();
+    int rc_cz = embkfs_run_compress_selftests();
+    int rc_sh = embkfs_run_selfheal_selftests();
+    int rc_sn = embkfs_run_snapshot_selftests();
+    int rc_pv = embkfs_run_provenance_selftests();
+    int rc_vb = embkfs_run_verifyboot_selftests();
     int rc_ns = embkfs_run_namespace_selftests();
 
-    if (rc_path == EMBK_OK && rc_alloc == EMBK_OK && rc_tree == EMBK_OK && rc_obj == EMBK_OK && rc_ns == EMBK_OK) {
+    if (rc_path == EMBK_OK && rc_alloc == EMBK_OK && rc_tree == EMBK_OK && rc_obj == EMBK_OK &&
+        rc_ts == EMBK_OK && rc_mv == EMBK_OK && rc_cz == EMBK_OK && rc_sh == EMBK_OK &&
+        rc_sn == EMBK_OK && rc_pv == EMBK_OK && rc_vb == EMBK_OK && rc_ns == EMBK_OK) {
         kprintf("\n[cmd] test embkfs all: OK\n");
         return;
     }
@@ -276,6 +317,13 @@ static void run_embkfs_all(void)
     if (rc_alloc != EMBK_OK) kprintf("\n[cmd] embkfs alloc failed: %s\n", embk_strerror(rc_alloc));
     if (rc_tree != EMBK_OK)  kprintf("\n[cmd] embkfs tree failed: %s\n", embk_strerror(rc_tree));
     if (rc_obj != EMBK_OK)   kprintf("\n[cmd] embkfs obj failed: %s\n", embk_strerror(rc_obj));
+    if (rc_ts != EMBK_OK)    kprintf("\n[cmd] embkfs timestamps failed: %s\n", embk_strerror(rc_ts));
+    if (rc_mv != EMBK_OK)    kprintf("\n[cmd] embkfs multivol failed: %s\n", embk_strerror(rc_mv));
+    if (rc_cz != EMBK_OK)    kprintf("\n[cmd] embkfs compress failed: %s\n", embk_strerror(rc_cz));
+    if (rc_sh != EMBK_OK)    kprintf("\n[cmd] embkfs selfheal failed: %s\n", embk_strerror(rc_sh));
+    if (rc_sn != EMBK_OK)    kprintf("\n[cmd] embkfs snapshot failed: %s\n", embk_strerror(rc_sn));
+    if (rc_pv != EMBK_OK)    kprintf("\n[cmd] embkfs provenance failed: %s\n", embk_strerror(rc_pv));
+    if (rc_vb != EMBK_OK)    kprintf("\n[cmd] embkfs verifyboot failed: %s\n", embk_strerror(rc_vb));
     if (rc_ns != EMBK_OK)    kprintf("\n[cmd] embkfs ns failed: %s\n", embk_strerror(rc_ns));
 }
 
@@ -310,6 +358,50 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embkfs obj") == 0) {
         int rc = embkfs_run_object_selftests();
         kprintf("\n[cmd] test embkfs obj: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs timestamps") == 0) {
+        int rc = embkfs_run_timestamp_selftests();
+        kprintf("\n[cmd] test embkfs timestamps: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs multivol") == 0) {
+        int rc = embkfs_run_multivol_selftests();
+        kprintf("\n[cmd] test embkfs multivol: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs compress") == 0) {
+        int rc_codec = embk_compress_run_selftests();
+        int rc_fs = embkfs_run_compress_selftests();
+        bool ok = (rc_codec == 0 && rc_fs == EMBK_OK);
+        kprintf("\n[cmd] test embkfs compress: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs selfheal") == 0) {
+        int rc = embkfs_run_selfheal_selftests();
+        kprintf("\n[cmd] test embkfs selfheal: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs snapshot") == 0) {
+        int rc = embkfs_run_snapshot_selftests();
+        kprintf("\n[cmd] test embkfs snapshot: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs provenance") == 0) {
+        int rc = embkfs_run_provenance_selftests();
+        kprintf("\n[cmd] test embkfs provenance: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs verifyboot") == 0) {
+        int rc = embkfs_run_verifyboot_selftests();
+        kprintf("\n[cmd] test embkfs verifyboot: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
         return 1;
     }
 
@@ -356,12 +448,90 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test rtc") == 0) {
+        int rc = rtc_run_selftests();
+        kprintf("\n[cmd] test rtc: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto sha256") == 0) {
+        int rc = sha256_run_selftests();
+        kprintf("\n[cmd] test crypto sha256: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto hmac") == 0) {
+        int rc = hmac_sha256_run_selftests();
+        kprintf("\n[cmd] test crypto hmac: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto pbkdf2") == 0) {
+        int rc = pbkdf2_run_selftests();
+        kprintf("\n[cmd] test crypto pbkdf2: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto aes") == 0) {
+        int rc = aes256_run_selftests();
+        kprintf("\n[cmd] test crypto aes: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto xts") == 0) {
+        int rc = aes_xts_run_selftests();
+        kprintf("\n[cmd] test crypto xts: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto all") == 0) {
+        int rc_sha = sha256_run_selftests();
+        int rc_hmac = hmac_sha256_run_selftests();
+        int rc_pbkdf2 = pbkdf2_run_selftests();
+        int rc_aes = aes256_run_selftests();
+        int rc_xts = aes_xts_run_selftests();
+        bool all_ok = (rc_sha == 0 && rc_hmac == 0 && rc_pbkdf2 == 0 && rc_aes == 0 && rc_xts == 0);
+        kprintf("\n[cmd] test crypto all: %s\n", all_ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test ring3") == 0) {
         // Drop to ring 3, run the user stub (write + exit via int 0x80), and
         // return here when it exits. Re-runnable: enter_user_mode now tears
         // down the process address space on both exit and load failure.
         enter_user_mode();
         kprintf("\n[cmd] test ring3: returned to kernel\n");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test ring3 threads") == 0) {
+        // Phase 5 (docs/architecture/process-and-scheduling.md): unlike
+        // "test ring3" above (a one-shot, non-scheduled launch via
+        // enter_user_mode()), this goes through the REAL scheduler --
+        // process_create()/process_wait(), the exact same path sys_spawn/
+        // sys_wait and the shell's own `run`/`wait` commands use -- because
+        // exercising sys_thread_create/sys_thread_join genuinely needs a
+        // scheduled `struct process`/`struct thread` pair (thread_join()
+        // blocks via the scheduler), which enter_user_mode()'s standalone
+        // launch doesn't create at all. /init.elf spawns a second thread of
+        // itself, proves it shares this process's .data/.bss with the main
+        // thread, and exits with a code that only comes out right if every
+        // step (thread_create/thread_join/the shared-memory check) worked
+        // (see user/init.c). Needs a real filesystem with /init.elf on it
+        // (e.g. `make run-embkfs`) -- unlike "test ring3", there's no
+        // embedded fallback blob.
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test ring3 threads: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        int pid = process_create("/init.elf");
+        if (pid < 0) {
+            kprintf("\n[cmd] test ring3 threads: process_create failed: %s\n", embk_strerror(pid));
+            return 1;
+        }
+        int code = process_wait((uint32_t)pid);
+        kprintf("\n[cmd] test ring3 threads: /init.elf exited with code %d (want 16): %s\n",
+                code, code == 16 ? "OK" : "FAIL");
         return 1;
     }
 
@@ -390,6 +560,58 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test sched stackguard") == 0) {
         int rc = process_test_stackguard();
         kprintf("\n[cmd] test sched stackguard: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sched wait") == 0) {
+        int rc = process_test_wait();
+        kprintf("\n[cmd] test sched wait: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sched priority") == 0) {
+        int rc = process_test_priority();
+        kprintf("\n[cmd] test sched priority: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test smp sched") == 0) {
+        int rc = process_test_smp_sched();
+        kprintf("\n[cmd] test smp sched: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test smp kill") == 0) {
+        int rc = process_test_smp_kill();
+        kprintf("\n[cmd] test smp kill: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test thread smp") == 0) {
+        int rc = process_test_thread_smp();
+        kprintf("\n[cmd] test thread smp: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test thread exit") == 0) {
+        int rc = process_test_thread_exit();
+        kprintf("\n[cmd] test thread exit: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test smp online") == 0) {
+        bool ok = true;
+        kprintf("\n");
+        for (uint32_t i = 0; i < cpu_count; i++) {
+            kprintf("  cpu %u (apic_id %u): %s\n", (unsigned int)i,
+                    (unsigned int)cpu_table[i].apic_id,
+                    cpu_table[i].online ? "online" : "OFFLINE");
+            if (!cpu_table[i].online) {
+                ok = false;
+            }
+        }
+        kprintf("[cmd] test smp online: %s (%u core(s))\n", ok ? "OK" : "FAIL",
+                (unsigned int)cpu_count);
         return 1;
     }
 
