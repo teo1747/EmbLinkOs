@@ -25,18 +25,26 @@ kernel_ctx_switch:
 
     pushfq                       ; save RFLAGS to stack
     pop rax                      ; pop RFLAGS into rax
-    ; Force IF=1 in the saved snapshot. kernel_ctx_switch is called from
-    ; inside interrupt-gate handlers (the LAPIC timer ISR, or a syscall via
-    ; int 0x80) which auto-clear IF on entry -- so the LIVE flags at this
-    ; exact instruction read IF=0 regardless of what the outgoing process
-    ; was actually running with. But reaching this point at all (a hardware
-    ; IRQ was serviced, or a software int 0x80 fired) proves the outgoing
-    ; process had IF=1 the moment it was interrupted/trapped: a maskable
-    ; IRQ literally cannot be taken while IF=0, and ring 3 can't execute
-    ; cli/sti at all (privileged, #GP). Storing the raw mid-ISR flags here
-    ; instead would make this process resume with interrupts permanently
-    ; off after its first preemption -- its next hlt would never wake.
-    or rax, 0x200
+    ; Do NOT force IF=1 here (kernel_ctx_save below still does, for a
+    ; different caller -- see its own comment). kernel_ctx_switch has
+    ; exactly ONE call site in the whole kernel: schedule_locked()
+    ; (process.c), immediately followed by spin_unlock(&g_sched_lock).
+    ; That means EVERY future resumption of this saved context -- via
+    ; ANY core, ANY tick -- lands at that exact spin_unlock call, which
+    ; ITSELF decides whether to re-enable interrupts, based on
+    ; g_sched_lock's own saved_flags (captured by whichever core is
+    ; dispatching this resume, reflecting THAT core's real pre-lock
+    ; state). Forcing IF=1 here made interrupts go live via this popfq
+    ; below, one `jmp` instruction before that spin_unlock call actually
+    ; runs -- a real, narrow but genuinely hit window where this core's
+    ; own next timer tick could fire in between, re-enter schedule() and
+    ; spin_lock(&g_sched_lock) while THIS core still holds it (the jmp
+    ; hadn't executed yet, so we're still logically inside the same
+    ; schedule_locked() call), self-deadlocking. Leaving IF as it
+    ; genuinely was (0, since every save happens from inside
+    ; lapic_timer_handler's ISR) closes that window: interrupts only
+    ; go live inside spin_unlock's own cli-protected sequence, never via
+    ; a jmp that could be interrupted first.
     mov [rdi + 64], rax          ; save RFLAGS
 
     ; --- restore incoming context RSI (restore_from) ---

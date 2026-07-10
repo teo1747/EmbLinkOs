@@ -21,6 +21,10 @@
 // Initialize VMM and switch to kernel paage tables
 void vmm_init(void);
 
+// Set EFER.NXE on the CALLING core. Per-core MSR -- every AP must call this
+// before touching any VMM_NX-mapped memory (see vmm.c's comment).
+void vmm_enable_nx_this_cpu(void);
+
 // Map a virtual address to a physical address with the given flags
 // Return 0 on succes, -1 on failure
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);

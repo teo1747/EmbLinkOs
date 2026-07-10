@@ -101,3 +101,13 @@ void idt_init(void) {
     // Load the IDT using lidt instruction
     __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
 }
+
+void idt_load_this_cpu(void) {
+    /* IDTR is per-core CPU state, but the table it points at (idt[]/idt_ptr,
+     * both static above) is one shared, read-only-after-boot region of
+     * memory -- every core just needs its own `lidt` pointed at the SAME
+     * table the BSP already built in idt_init(). Used by APs (kernel/cpu/
+     * smp.c's ap_main()); the BSP itself uses idt_init() above instead,
+     * since it also has to build the table in the first place. */
+    __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
+}
