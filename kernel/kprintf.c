@@ -1,8 +1,22 @@
 #include "include/kprintf.h"
 #include "drivers/serial.h"
 #include "drivers/console.h"
+#include "cpu/spinlock.h"
 #include <stdint.h>
 #include "include/types.h"   // for size_t
+
+/* Guards the serial/console output path. serial_write_char()'s only
+ * "shared state" is the physical UART itself -- concurrent unlocked writes
+ * from different cores don't corrupt kernel memory, but they DO race on
+ * the wire: each character write is its own independent port I/O, so two
+ * cores calling kprintf() at the same time interleave at the BYTE level,
+ * garbling both messages (observed directly: "smp: AP apic_id=3..." and a
+ * kthread's own debug print interleaved mid-word once real cross-core
+ * scheduling made concurrent kprintf() calls a real, not just theoretical,
+ * possibility). One kprintf() call is made atomic end-to-end so output
+ * from different cores never interleaves, even though the underlying
+ * writes were always individually safe. */
+static spinlock_t kprintf_lock = SPINLOCK_INIT;
 
 
 // GCC built-in variadic types
@@ -259,7 +273,9 @@ void kprintf(const char *fmt, ...) {
     struct out_sink s = { .put = sink_serial_put, .written = 0 };
     va_list arg;
     va_start(arg, fmt);
+    spin_lock(&kprintf_lock);
     format_string(&s, fmt, arg);
+    spin_unlock(&kprintf_lock);
     va_end(arg);
 }
 

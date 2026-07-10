@@ -25,14 +25,115 @@ against any single global value.
 
 import sys
 import struct
+import time
 
 from crc32c import crc32c
+
+
+def embk_decompress(comp: bytes, expected_len: int) -> bytes:
+    """Python port of kernel/fs/embkfs/embkfs_compress.c's embk_decompress().
+
+    LZ4-inspired token stream with NO end-of-block marker: the caller
+    already knows the exact decompressed length (the extent's logical_size),
+    so decoding just stops once that many bytes have been produced. Must
+    stay byte-for-byte in sync with the C decoder -- this IS the independent
+    oracle for it (v2.2 Phase 3)."""
+    out = bytearray()
+    sp = 0
+    n = len(comp)
+    while len(out) < expected_len:
+        if sp >= n:
+            raise ValueError("embk_decompress: truncated stream (token)")
+        token = comp[sp]; sp += 1
+        lit_len = token >> 4
+        match_nib = token & 0x0F
+        if lit_len == 15:
+            while True:
+                if sp >= n:
+                    raise ValueError("embk_decompress: truncated stream (literal ext)")
+                b = comp[sp]; sp += 1
+                lit_len += b
+                if b != 255:
+                    break
+        if sp + lit_len > n:
+            raise ValueError("embk_decompress: truncated stream (literals)")
+        out.extend(comp[sp:sp + lit_len])
+        sp += lit_len
+        if len(out) == expected_len:
+            break
+        if sp + 2 > n:
+            raise ValueError("embk_decompress: truncated stream (offset)")
+        offset = comp[sp] | (comp[sp + 1] << 8)
+        sp += 2
+        if offset == 0 or offset > len(out):
+            raise ValueError(f"embk_decompress: bad match offset {offset}")
+        match_len = match_nib
+        if match_nib == 15:
+            while True:
+                if sp >= n:
+                    raise ValueError("embk_decompress: truncated stream (match ext)")
+                b = comp[sp]; sp += 1
+                match_len += b
+                if b != 255:
+                    break
+        match_len += 4  # MINMATCH, must match EMBKZ_MINMATCH in the C encoder
+        msrc = len(out) - offset
+        for i in range(match_len):
+            out.append(out[msrc + i])
+    if len(out) != expected_len:
+        raise ValueError("embk_decompress: decompressed length mismatch")
+    return bytes(out)
 import layout as L
+
+
+def xts_decrypt_blocks(data_key: bytes, tweak_key: bytes, ciphertext: bytes, disk_block_start: int) -> bytes:
+    """Decrypts a run of on-disk filesystem blocks, each its own independent
+    XTS "sector" tweaked by its own disk block number -- must match
+    kernel/crypto/xts.c's block_number_to_tweak_input() + aes_xts_decrypt()
+    exactly. Uses Python's `cryptography` package, NOT a port of the
+    kernel's own AES/XTS code, so a bug shared by both can't hide from this
+    independent oracle (v2.2 Phase 4)."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    assert len(ciphertext) % L.BLOCK_SIZE == 0
+    out = bytearray()
+    n = len(ciphertext) // L.BLOCK_SIZE
+    for i in range(n):
+        block_num = disk_block_start + i
+        tweak = block_num.to_bytes(8, "little") + b"\x00" * 8
+        c = Cipher(algorithms.AES(data_key + tweak_key), modes.XTS(tweak))
+        d = c.decryptor()
+        chunk = ciphertext[i * L.BLOCK_SIZE:(i + 1) * L.BLOCK_SIZE]
+        out.extend(d.update(chunk) + d.finalize())
+    return bytes(out)
 
 
 def die(msg):
     print("FAIL: " + msg)
     sys.exit(1)
+
+
+def check_inode_timestamps(label, inode_data):
+    """v2.2: every object mkfs_embkfs.py writes is stamped with a real
+    wall-clock 'now' at format time (all four fields equal, since nothing
+    has been modified/accessed since). Sanity-checks that: non-zero,
+    atime==btime==mtime==ctime, and not implausibly in the future (a
+    generous 1-day margin above the CURRENT wall clock, not the format
+    time, to tolerate this verifier running some time after the image was
+    formatted)."""
+    (_size, _blocks, _links, _mode, _uid, _gid, _flags,
+     atime, mtime, ctime, btime, _generation, _reserved) = struct.unpack(L.INODE_FMT, inode_data)
+
+    if atime == 0 or mtime == 0 or ctime == 0 or btime == 0:
+        die(f"{label}: zero timestamp (a={atime} m={mtime} c={ctime} b={btime})")
+    if not (atime == mtime == ctime == btime):
+        die(f"{label}: freshly-formatted timestamps not all equal (a={atime} m={mtime} c={ctime} b={btime})")
+
+    now_ns = int(time.time() * 1_000_000_000)
+    one_day_ns = 24 * 60 * 60 * 1_000_000_000
+    if btime > now_ns + one_day_ns:
+        die(f"{label}: btime {btime} is implausibly in the future (now={now_ns})")
+
+    print(f"    -> timestamps OK ({label}: btime=mtime=ctime=atime={btime})")
 
 
 def read_block(img, block_no):
@@ -140,12 +241,14 @@ def parse_superblock_candidate(raw512):
     fields = struct.unpack(L.SB_BODY_FMT, sb[:L.SB_BODY_SIZE])
     return {
         "raw": sb,
+        "raw512": raw512,   # full sector -- the crypto header (v2.2 Phase 4)
+                            # lives past SB_BODY_SIZE, outside `sb`/`raw`
         "checksum": stored_csum,
         "fields": fields,
     }
 
 
-def main(path):
+def main(path, passphrase=None):
     with open(path, "rb") as f:
         img = f.read()
     total_blocks = len(img) // L.BLOCK_SIZE
@@ -198,13 +301,39 @@ def main(path):
     print(f"  version {vmaj}.{vmin}, block_size {block_size}, total_blocks {tot_blocks}, "
           f"free {free_blocks}, gen {generation}")
 
-    KNOWN_INCOMPAT = 0
+    KNOWN_INCOMPAT = L.EMBKFS_INCOMPAT_COMPRESSION | L.EMBKFS_INCOMPAT_ENCRYPTED   # v2.2 Phase 3/4
     KNOWN_RO_COMPAT = 0
     if fincompat & ~KNOWN_INCOMPAT:
         die(f"unknown incompat features 0x{fincompat:016X} — refuse mount")
     read_only = bool(fro & ~KNOWN_RO_COMPAT)
     print(f"  features compat=0x{fcompat:X} ro_compat=0x{fro:X} incompat=0x{fincompat:X}"
           f"  -> {'READ-ONLY' if read_only else 'read-write'}")
+
+    # ---------------------------------------------------------------
+    # 1b. ENCRYPTION (v2.2 Phase 4) -- independent Python-side unlock,
+    # deliberately using the `cryptography` package's AES-XTS rather than
+    # reusing the kernel's own kernel/crypto/xts.c, so a bug shared by both
+    # implementations can't hide from this oracle.
+    # ---------------------------------------------------------------
+    xts_data_key = xts_tweak_key = None
+    if fincompat & L.EMBKFS_INCOMPAT_ENCRYPTED:
+        if not passphrase:
+            die("volume is encrypted -- pass --passphrase to verify it")
+        raw512 = chosen["raw512"]
+        hdr_bytes = raw512[L.CRYPTO_HEADER_OFFSET:L.CRYPTO_HEADER_OFFSET + L.CRYPTO_HEADER_SIZE]
+        magic, salt, iterations, check, _reserved = struct.unpack(L.CRYPTO_HEADER_FMT, hdr_bytes)
+        if magic != L.EMBKFS_CRYPTO_HEADER_MAGIC:
+            die(f"ENCRYPTED feature set but crypto header magic is wrong (0x{magic:016X})")
+        import hashlib
+        keymat = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, iterations, 64)
+        xts_data_key, xts_tweak_key = keymat[:32], keymat[32:]
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        c = Cipher(algorithms.AES(xts_data_key + xts_tweak_key), modes.XTS(b"\x00" * 16))
+        e = c.encryptor()
+        got_check = e.update(L.KEY_CHECK_PLAINTEXT) + e.finalize()
+        if got_check != check:
+            die("wrong passphrase (key-check ciphertext mismatch)")
+        print(f"  encrypted volume unlocked (kdf_iterations={iterations})")
 
     if block_size != L.BLOCK_SIZE:
         die(f"this verifier assumes block_size {L.BLOCK_SIZE}, image has {block_size}")
@@ -250,6 +379,7 @@ def main(path):
     print(f"  root inode: mode 0o{rd_mode:06o} ({'dir' if is_dir else 'not dir'}), links {rd_links}")
     if not is_dir:
         die("root object is not a directory")
+    check_inode_timestamps("root", rd_data)
 
     def lookup(name):
         """Resolve one name in the root dir to its target object id, WALKING the
@@ -297,12 +427,55 @@ def main(path):
              _egen, flags, _r0, _r1) = struct.unpack(L.EXTENT_FMT, ext_data)
 
             is_hole = (flags & L.EXTENT_FLAG_HOLE) != 0
+            is_compressed = (flags & L.EXTENT_FLAG_COMPRESSED) != 0
+            is_encrypted = (flags & L.EXTENT_FLAG_ENCRYPTED) != 0
             if is_hole:
                 if disk_block != 0 or length_blocks != 0 or data_csum != 0:
                     die(f"object {oid}: hole extent has non-zero disk/len/checksum")
                 if logical_size == 0:
                     die(f"object {oid}: hole extent has zero logical_size")
                 data.extend(b"\x00" * logical_size)
+            elif is_encrypted:
+                if length_blocks == 0:
+                    die(f"object {oid}: non-hole extent has zero length")
+                if not xts_data_key:
+                    die(f"object {oid}: extent@{off} is ENCRYPTED but no passphrase was given")
+                cap = length_blocks * L.BLOCK_SIZE
+                # Checksum covers the WHOLE on-disk run (ciphertext, padding
+                # included) -- matches the kernel's write-time order
+                # (encrypt, then checksum) exactly (v2.2 Phase 4).
+                raw = read_blocks(img, disk_block, length_blocks)
+                calc = crc32c(raw)
+                if calc != data_csum:
+                    die(f"object {oid}: extent@{off} checksum 0x{calc:08X} != stored 0x{data_csum:08X} "
+                        f"(ciphertext)")
+                plain = xts_decrypt_blocks(xts_data_key, xts_tweak_key, raw, disk_block)
+                if is_compressed:
+                    comp_size = struct.unpack_from("<Q", _r1, 0)[0]
+                    if comp_size == 0 or comp_size > cap:
+                        die(f"object {oid}: compressed_size {comp_size} invalid for length {length_blocks}")
+                    ext_bytes = embk_decompress(plain[:comp_size], logical_size)
+                else:
+                    if logical_size == 0 or logical_size > cap:
+                        die(f"object {oid}: logical_size {logical_size} invalid for length {length_blocks}")
+                    ext_bytes = plain[:logical_size]
+                data.extend(ext_bytes)
+            elif is_compressed:
+                if length_blocks == 0:
+                    die(f"object {oid}: non-hole extent has zero length")
+                comp_size = struct.unpack_from("<Q", _r1, 0)[0]
+                cap = length_blocks * L.BLOCK_SIZE
+                if comp_size == 0 or comp_size > cap:
+                    die(f"object {oid}: compressed_size {comp_size} invalid for length {length_blocks}")
+                if logical_size == 0:
+                    die(f"object {oid}: compressed extent has zero logical_size")
+                comp_bytes = read_blocks(img, disk_block, length_blocks)[:comp_size]
+                calc = crc32c(comp_bytes)
+                if calc != data_csum:
+                    die(f"object {oid}: extent@{off} checksum 0x{calc:08X} != stored 0x{data_csum:08X} "
+                        f"(compressed bytes)")
+                ext_bytes = embk_decompress(comp_bytes, logical_size)
+                data.extend(ext_bytes)
             else:
                 if length_blocks == 0:
                     die(f"object {oid}: non-hole extent has zero length")
@@ -329,6 +502,7 @@ def main(path):
         mode = f_mode & L.S_IFMT
         if mode not in (L.S_IFREG, L.S_IFLNK):
             die(f"object {oid} is neither regular file nor symlink")
+        check_inode_timestamps(f"object {oid}", fi_data)
 
         obj_bytes = read_object_bytes(oid, mode)
         if len(obj_bytes) != f_size:
@@ -342,16 +516,33 @@ def main(path):
             print(f"    -> file size {f_size}, {len(find_items(oid, L.EMBK_TYPE_EXTENT))} extent(s) OK: {text!r}")
 
     # hello.txt is a single-record entry; wgyehkb.txt and illoeuw.txt share one
-    # dir-entry item (same hash 0xC38842AB) and are told apart by name.
-    for nm in (b"hello.txt", b"wgyehkb.txt", b"illoeuw.txt"):
+    # dir-entry item (same hash 0xC38842AB) and are told apart by name. These
+    # are the default make_image()/make_tree_image() fixture's own filenames
+    # -- other generators (e.g. make_encrypted_image()'s "secret.txt") won't
+    # have them, so only resolve whichever of this fixed set actually exists
+    # rather than assuming any specific image's contents.
+    def name_present(nm):
+        nh = crc32c(nm) & 0xFFFFFFFF
+        return find_item(L.OBJID_ROOT, L.EMBK_TYPE_DIR_ENTRY, nh) is not None
+
+    for nm in (b"hello.txt", b"wgyehkb.txt", b"illoeuw.txt", b"secret.txt"):
+        if not name_present(nm):
+            continue
         tgt_oid, _ttype = lookup(nm)
         read_object(tgt_oid)
 
-    link_oid, _link_type = lookup(b"hello.lnk")
-    read_object(link_oid)
+    if name_present(b"hello.lnk"):
+        link_oid, _link_type = lookup(b"hello.lnk")
+        read_object(link_oid)
 
     print("\nALL CHECKS PASSED — image is a valid EMBKFS volume.")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "embkfs.img")
+    args = sys.argv[1:]
+    passphrase = None
+    if "--passphrase" in args:
+        i = args.index("--passphrase")
+        passphrase = args[i + 1]
+        del args[i:i + 2]
+    main(args[0] if args else "embkfs.img", passphrase=passphrase)

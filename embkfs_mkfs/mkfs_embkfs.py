@@ -37,10 +37,19 @@ Block map (4 KiB blocks):
 
 import sys
 import struct
+import time
 import uuid as uuidlib
 
 from crc32c import crc32c
 import layout as L
+
+# v2.2: real wall-clock timestamps for every object this formatter creates,
+# instead of the placeholder zeros v2.0/v2.1 shipped with (the kernel had no
+# RTC driver until Phase 0 of that work landed). One "now" shared across the
+# whole format pass -- every object created by a single mkfs run is stamped
+# with the exact same instant, matching how a real filesystem's initial
+# population would look (everything created "at format time").
+NOW_NS = int(time.time() * 1_000_000_000)
 
 
 # --- helper: CRC32C-based name hash for directory-entry keys (spec §7.2/§9.2) ---
@@ -219,6 +228,7 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
     items.append((L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
                   L.pack_inode(size=0, blocks=0, links=2,
                                mode=L.S_IFDIR | L.PERM_DIR, uid=0, gid=0,
+                               atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
                                generation=gen)))
 
     # one object id + inode + extent per file; collect the dir
@@ -237,6 +247,7 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
                       L.pack_inode(size=len(data), blocks=nblocks, links=1,
                                    mode=mode, uid=0, gid=0,
+                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
                                    generation=gen)))
 
         # data checksum is CRC32C over the file's actual bytes (logical_size),
@@ -318,6 +329,147 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
         print(f"    {{obj={oid_}, type={tname:<9}, off=0x{off:08X}}}  ({len(data)} bytes data)")
 
 
+def derive_xts_keys(passphrase: bytes, salt: bytes, iterations: int):
+    """PBKDF2-HMAC-SHA256, 64 bytes out: [0:32) data key, [32:64) tweak key.
+    Must match kernel/fs/embkfs/embkfs.c's embkfs_try_unlock() exactly."""
+    import hashlib
+    keymat = hashlib.pbkdf2_hmac("sha256", passphrase, salt, iterations, 64)
+    return keymat[:32], keymat[32:]
+
+
+def xts_encrypt_block(data_key: bytes, tweak_key: bytes, block_number: int, plaintext: bytes) -> bytes:
+    """AES-256-XTS over exactly one on-disk filesystem block, tweak = the
+    block's own disk address as a little-endian uint64 in a 16-byte buffer
+    (high 8 bytes zero). Must match kernel/crypto/xts.c's
+    block_number_to_tweak_input() + aes_xts_encrypt() exactly -- this IS
+    the independent oracle for that code, not a copy of it."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    tweak = block_number.to_bytes(8, "little") + b"\x00" * 8
+    c = Cipher(algorithms.AES(data_key + tweak_key), modes.XTS(tweak))
+    e = c.encryptor()
+    return e.update(plaintext) + e.finalize()
+
+
+def build_crypto_header(passphrase: bytes, iterations: int = 200_000):
+    """Returns (header_bytes, data_key, tweak_key). A fresh random salt
+    every call, like a real mkfs would use."""
+    import os
+    salt = os.urandom(16)
+    data_key, tweak_key = derive_xts_keys(passphrase, salt, iterations)
+    check = xts_encrypt_block(data_key, tweak_key, 0, L.KEY_CHECK_PLAINTEXT)
+    hdr = struct.pack(L.CRYPTO_HEADER_FMT, L.EMBKFS_CRYPTO_HEADER_MAGIC,
+                      salt, iterations, check, b"\x00" * 8)
+    assert len(hdr) == L.CRYPTO_HEADER_SIZE
+    return hdr, data_key, tweak_key
+
+
+def make_encrypted_image(path: str, passphrase: bytes, size_bytes: int = 1024 * 1024,
+                         iterations: int = 10_000):
+    """A minimal ENCRYPTED EMBKFS image: superblock with the ENCRYPTED
+    incompat bit + crypto header, root dir, and one file whose data block
+    is genuinely XTS-encrypted on disk -- exercises the kernel's real
+    mount-time unlock + per-block decrypt path, not just the crypto
+    header's own key-check. `iterations` defaults low (this is a TEST
+    fixture, unlock speed during automated boot tests matters more than realistic
+    KDF cost here; real-world formatting should use build_crypto_header's
+    default of 200_000)."""
+    bs = L.BLOCK_SIZE
+    total_blocks = size_bytes // bs
+    gen = 1
+
+    SB_BLOCK     = L.SUPERBLOCK_OFFSET // bs
+    LEAF_BLOCK   = SB_BLOCK + 1
+    DATA_BLOCK   = SB_BLOCK + 2
+    BACKUP_BLOCK = total_blocks - 1
+
+    crypto_hdr, data_key, tweak_key = build_crypto_header(passphrase, iterations)
+
+    plaintext = b"The vault is open. EMBKFS-v2.2 Phase 4 encryption works.\n"
+
+    items = []
+    items.append((L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
+                  L.pack_inode(size=0, blocks=0, links=2,
+                               mode=L.S_IFDIR | L.PERM_DIR, uid=0, gid=0,
+                               atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                               generation=gen)))
+
+    oid = L.FIRST_USER_OBJID
+    nblocks = (len(plaintext) + bs - 1) // bs
+    items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
+                  L.pack_inode(size=len(plaintext), blocks=nblocks, links=1,
+                               mode=L.S_IFREG | L.PERM_FILE, uid=0, gid=0,
+                               atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                               generation=gen)))
+
+    # Encrypt each on-disk block independently (its own tweak = its own
+    # disk block number), then checksum the CIPHERTEXT -- matching the
+    # kernel's write-time order (encrypt, THEN checksum) and its
+    # encrypted-extent convention of hashing the WHOLE block_size per
+    # block, padding included, not just the logical/real byte count.
+    plain_blocks = build_data_blocks(plaintext)
+    cipher_blocks = []
+    csum = 0
+    for i, pb in enumerate(plain_blocks):
+        cb = xts_encrypt_block(data_key, tweak_key, DATA_BLOCK + i, pb)
+        assert len(cb) == bs
+        cipher_blocks.append(cb)
+        csum = crc32c(cb, csum)
+
+    items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
+                  L.pack_extent(disk_block=DATA_BLOCK, length_blocks=nblocks,
+                                logical_size=len(plaintext),
+                                data_checksum=csum, generation=gen,
+                                flags=L.EXTENT_FLAG_ENCRYPTED)))
+
+    items.extend(build_dir_entry_items(L.OBJID_ROOT, [(b"secret.txt", oid, L.DT_REG)]))
+    items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
+
+    leaf = build_leaf_block(generation=gen, block_no=LEAF_BLOCK, items=items)
+    leaf_csum = crc32c(leaf[8:])
+
+    used = 4 + nblocks
+    free_blocks = total_blocks - used
+
+    root_ptr = L.pack_block_ptr(block=LEAF_BLOCK, checksum=leaf_csum, generation=gen, flags=0)
+    checkpoint_ptr = L.null_block_ptr()
+    body = L.pack_superblock_body(
+        block_size=L.BLOCK_SIZE, total_blocks=total_blocks, free_blocks=free_blocks,
+        uuid16=uuidlib.uuid4().bytes, generation=gen,
+        root_ptr32=root_ptr, checkpoint_ptr32=checkpoint_ptr,
+        feat_incompat=L.EMBKFS_INCOMPAT_ENCRYPTED)
+    sb_csum = crc32c(body)
+    sb_bytes = body + struct.pack("<Q", sb_csum)
+    assert len(sb_bytes) == L.SUPERBLOCK_SIZE
+
+    sb_block = bytearray(L.BLOCK_SIZE)
+    sb_block[0:len(sb_bytes)] = sb_bytes
+    sb_block[L.CRYPTO_HEADER_OFFSET:L.CRYPTO_HEADER_OFFSET + len(crypto_hdr)] = crypto_hdr
+    superblock = bytes(sb_block)
+
+    img = bytearray(size_bytes)
+
+    def put(block_no, block_bytes):
+        off = block_no * bs
+        img[off:off + len(block_bytes)] = block_bytes
+
+    put(SB_BLOCK, superblock)
+    put(LEAF_BLOCK, leaf)
+    for i, cb in enumerate(cipher_blocks):
+        put(DATA_BLOCK + i, cb)
+    put(BACKUP_BLOCK, superblock)
+
+    with open(path, "wb") as f:
+        f.write(img)
+
+    print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs}) -- ENCRYPTED")
+    print(f"  passphrase        : {passphrase.decode()!r}  (TEST FIXTURE ONLY -- never a real credential)")
+    print(f"  kdf_iterations    : {iterations}")
+    print(f"  file data (cipher): blocks {DATA_BLOCK}..{DATA_BLOCK + nblocks - 1}  "
+          f"(\"secret.txt\", {len(plaintext)} logical bytes, {nblocks} block(s), "
+          f"ciphertext csum 0x{csum:08X})")
+    print(f"  free_blocks hint  : {free_blocks}")
+
+
 SLOT = L.KEY_SIZE + L.BLOCK_PTR_SIZE   # 24 + 32 = 56
 
 
@@ -378,7 +530,9 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     items = []
     items.append((L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
                   L.pack_inode(size=0, blocks=0, links=2, mode=L.S_IFDIR | L.PERM_DIR,
-                               uid=0, gid=0, generation=gen)))
+                               uid=0, gid=0,
+                               atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                               generation=gen)))
     dir_entries, data_blocks, file_layouts = [], [], []
     oid, blk = L.FIRST_USER_OBJID, DATA_START
     for name, dtype, mode, data in objects:
@@ -389,7 +543,9 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
 
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
                       L.pack_inode(size=len(data), blocks=nblocks, links=1, mode=mode,
-                                   uid=0, gid=0, generation=gen)))
+                                   uid=0, gid=0,
+                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                                   generation=gen)))
         if nblocks > 0:
             items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
                           L.pack_extent(disk_block=blk, length_blocks=nblocks,
@@ -447,6 +603,21 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
 
 
 if __name__ == "__main__":
-    make_image("embkfs.img")            # flat: single leaf (collision regression)
-    print()
-    make_tree_image("embkfs_tree.img")  # tall: internal root + two leaves
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--encrypted":
+        # Encrypted test fixture: mkfs_embkfs.py --encrypted <path> [passphrase]
+        # (v2.2 Phase 4) -- defaults to a fixed test passphrase so automated
+        # boot tests can type it via QEMU's monitor without a human present.
+        out_path = sys.argv[2] if len(sys.argv) > 2 else "embkfs_encrypted.img"
+        passphrase = (sys.argv[3] if len(sys.argv) > 3 else "correcthorsebattery").encode()
+        make_encrypted_image(out_path, passphrase)
+    elif len(sys.argv) > 1:
+        # Single-image mode: write one flat oracle image at the given path
+        # (used by the Makefile to produce a second, independent EMBKFS
+        # image for multi-volume / USB-mount testing without disturbing the
+        # default embkfs.img/embkfs_tree.img pair below).
+        make_image(sys.argv[1])
+    else:
+        make_image("embkfs.img")            # flat: single leaf (collision regression)
+        print()
+        make_tree_image("embkfs_tree.img")  # tall: internal root + two leaves

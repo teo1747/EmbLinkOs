@@ -26,6 +26,13 @@ struct idt_ptr {
 
 
 void idt_init(void);
+
+// Point THIS core's IDTR at the same, already-built IDT idt_init() set up
+// on the BSP. IDTR is per-core CPU state even though the table in memory
+// is shared read-only, so every AP needs to call this once during its own
+// bring-up (kernel/cpu/smp.c's ap_main()) -- it does not rebuild the table.
+void idt_load_this_cpu(void);
+
 void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr);
 
 // Like idt_set_entry, but selects an Interrupt Stack Table slot (1..7) so the

@@ -1,5 +1,12 @@
 #include "pmm.h"
 #include "../drivers/serial.h"
+#include "../cpu/smp.h"
+#include "../cpu/spinlock.h"
+
+/* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
+ * docs/architecture/process-and-scheduling.md), same "add the lock, don't
+ * build a fancier allocator" call already made for kheap.c's heap_lock. */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 
 static const char *type_names[] = {
@@ -168,9 +175,19 @@ void pmm_init(void) {
     // so it sits below kernel_end and is already covered by the kernel+bitmap
     // reservation above — no separate boot-stack reservation is needed.
 
+    // step 7: explicitly reserve fixed-address pages that something OUTSIDE
+    // this allocator's own bookkeeping needs to own at a known physical
+    // address. Today this is only the AP trampoline (kernel/cpu/smp.h) --
+    // already covered incidentally by step 6's blanket reservation of
+    // everything below kernel_end (which is always > 1MB), but that's an
+    // accident of where step 6's loop happens to start (page 0), not a
+    // deliberate low-memory carve-out. Reserving it explicitly here means
+    // it stays reserved even if step 6 is ever changed to start later.
+    pmm_reserve_page(AP_TRAMPOLINE_PHYS);
+
     pmm_print_stats();
 
-}   
+}
 
 
 // Allocate a single page of physical memory 
@@ -184,28 +201,51 @@ uint64_t pmm_reserved_phys_end(void) {
 }
 
 uint64_t pmm_alloc_page(void) {
+    spin_lock(&pmm_lock);
 
     for (uint64_t page_index = 0; page_index < total_pages; page_index++) {
         if (!bitmap_test(page_index)) { // If the page is free
             bitmap_set(page_index); // Mark it as used
             free_pages--;
             used_pages++;
+            spin_unlock(&pmm_lock);
             return (page_index * PAGE_SIZE); // Return the physical address of the allocated page
         }
     }
+    spin_unlock(&pmm_lock);
     return 0; // No free pages available
 }
 
 
-// Free a single page of physical memory 
+// Free a single page of physical memory
 void pmm_free_page(uint64_t phys_addr) {
+    spin_lock(&pmm_lock);
     uint64_t page_index = (uint64_t)phys_addr / PAGE_SIZE;
-    if(page_index >= total_pages) return; // Invalid page index, ignore
+    if (page_index >= total_pages) {
+        spin_unlock(&pmm_lock);
+        return; // Invalid page index, ignore
+    }
     if (bitmap_test(page_index)) { // If the page is currently allocated
         bitmap_clear(page_index); // Mark it as free
         free_pages++;
         used_pages--;
     }
+    spin_unlock(&pmm_lock);
+}
+
+void pmm_reserve_page(uint64_t phys_addr) {
+    spin_lock(&pmm_lock);
+    uint64_t page_index = phys_addr / PAGE_SIZE;
+    if (page_index >= total_pages) {
+        spin_unlock(&pmm_lock);
+        return; // Out of range, ignore
+    }
+    if (!bitmap_test(page_index)) { // Only if not already reserved/used
+        bitmap_set(page_index);
+        free_pages--;
+        used_pages++;
+    }
+    spin_unlock(&pmm_lock);
 }
 
 

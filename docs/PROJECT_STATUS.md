@@ -1,6 +1,6 @@
 # EmbLinkOS — Project Status & Handoff
 
-*Last updated: 2026-07-05. Living document — reconciled from two previously
+*Last updated: 2026-07-10. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
 first (the intended design and the decisions behind it), then this file
@@ -18,11 +18,12 @@ software, with the OS eventually self-hosting and supporting ARM64 + SMP.
 EmbLinkOS today is a 64-bit x86 kernel with:
 - **Bootloader**: BIOS-based 2-stage loader with hardcoded kernel layout
 - **Memory**: PMM + VMM with dynamic paging (up to 4GB sustained, ~32GB architectural limit)
-- **Filesystems**: EMBKFS (native, transactional CoW, Merkle-checksummed), FAT32 (R/W), VFS multiplexer
-- **Drivers**: Serial console, ATA/DMA, AHCI, keyboard, VBE (EDID + mode enumeration fallback)/Bochs-DISPI/VirtIO-GPU framebuffer, ACPI/APIC, xHCI/EHCI/UHCI/OHCI USB (HID keyboard + mass storage + hub support on the legacy HCs)
-- **Interrupts**: IDT + handler dispatch, exceptions, LAPIC timer (now driving preemption), keyboard IRQ
-- **User Mode**: Ring-3 entry via iretq, ELF64 loader, int 0x80 syscalls (write, exit, yield, open, close, read, lseek, stat, readdir, spawn, wait, getpid), validated user pointers (`access_ok`/`copy_from_user`/`copy_to_user`)
-- **Processes**: per-process address spaces + guarded kernel stacks + fd tables, timer-preemptive round-robin scheduler, wait queues, uncatchable kill, `sys_spawn`/`sys_wait` (see Phase 17/18)
+- **Filesystems**: EMBKFS v2 (native, transactional CoW, Merkle-checksummed, multi-volume, AES-256-XTS encryption, LZ-compression, instant snapshots, self-healing superblock, process-provenance, HMAC verified-root boot check), FAT32 (R/W), VFS multiplexer (real multi-mount, longest-prefix match)
+- **Drivers**: Serial console, ATA/DMA (both IDE channels, IRQ14+IRQ15), AHCI, keyboard, VBE (EDID + mode enumeration fallback)/Bochs-DISPI/VirtIO-GPU framebuffer, ACPI/APIC, xHCI/EHCI/UHCI/OHCI USB (HID keyboard + mass storage + hub support on the legacy HCs), CMOS RTC (real wall-clock timestamps)
+- **Crypto**: from-scratch SHA-256, HMAC-SHA256, PBKDF2, AES-256, AES-256-XTS (`kernel/crypto/`), every primitive checked against externally-computed known-answer vectors
+- **Interrupts**: IDT + handler dispatch, exceptions, LAPIC timer (now driving preemption, per-CPU), keyboard IRQ
+- **User Mode**: Ring-3 entry via iretq, ELF64 loader, 16 int 0x80 syscalls (write, exit, yield, open, close, read, lseek, stat, readdir, spawn, wait, getpid, kill, thread_create, thread_join, thread_exit), validated user pointers (`access_ok`/`copy_from_user`/`copy_to_user`)
+- **Processes & SMP**: real `struct thread`/`struct process` split (schedulable unit vs. resource owner), multi-core bring-up (AP INIT-SIPI-SIPI, per-CPU LAPIC/GDT/TSS), a single global scheduler lock held across context switches, per-process address spaces + guarded kernel stacks + fd tables, timer-preemptive priority-band scheduler with aging, wait queues, uncatchable kill, real blocking `sys_wait`, ring-3 process AND thread handles (kernel kthreads and joinable ring-3 threads sharing one address space), an interactive shell that's itself a real process (see Phase 17–20)
 
 ## Design Philosophy
 
@@ -410,14 +411,171 @@ Closes nearly every gap Phase 17 left open. Full detail and postmortems:
   `process_create()`'s four early-return error paths reset `state` back to
   `PROCESS_UNUSED`, permanently leaking the PCB slot on any failed
   creation; fixed by adding the reset to all four.
-- **Known, deliberate gap left open**: one further scheduler reentrancy
-  hazard was found but *not* fixed this pass — `schedule()` calls made from
-  syscall context (`sys_exit`/`sys_yield`) run with IF=1 (needed for Bug 7's
-  disk-I/O fix), so a timer IRQ can in principle land mid-`schedule()` and
-  re-enter it from the timer ISR. Not observed to misbehave in practice, but
-  not actually prevented either — see `docs/architecture/process-and-scheduling.md`
-  §8(a) for the honest writeup and the standard fix (bracket `schedule()`
-  with `cli`/restore-IF-on-exit), not yet built.
+- **A tenth bug, found by re-reading this same work rather than by a crash,
+  closed immediately after**: `schedule()` calls made from syscall context
+  (`sys_exit`/`sys_yield`) ran with IF=1 (needed for Bug 7's disk-I/O fix),
+  so a timer IRQ could land mid-`schedule()` and re-enter it from the timer
+  ISR while the outer call was still mutating scheduler state — a real
+  reentrancy hazard, not just a Phase D/SMP hypothetical. **Fixed**:
+  `schedule()` now `cli`s at entry (same `pushfq`/`cli`/conditional-`sti`
+  idiom `cpu/spinlock.c` already uses) and restores the caller's original
+  interrupt state on every path that doesn't go through `kernel_ctx_switch`
+  (which always resumes with IF=1 anyway, per Bug 6). Verified by rerunning
+  `test sched roundrobin`/`kill`/`reap`/`stackguard` in QEMU — all still
+  pass, including the two that most directly exercise this exact shape
+  (kthreads calling `process_exit_self`, i.e. IF=1, while being actively
+  preempted). Full writeup: `docs/architecture/process-and-scheduling.md`
+  §8(a)/Bug 10, §16.
+
+### Phase 19 — Priority Scheduling, Real Blocking Wait, Ring-3 Handles, Interactive Shell ✅
+Closes Phases C and D of the scheduler roadmap and turns the kernel's own
+shell into a real process. Full detail and postmortems:
+`docs/architecture/process-and-scheduling.md` (§4.2, §6.2/§6.3, §7.4, §16
+Bugs 11–12) and `TODO.md`.
+- **Priority scheduling**: 4 fixed bands (REALTIME/INTERACTIVE/NORMAL/
+  BACKGROUND), round-robin within a band, aging (200ms/band — deliberately
+  short; a "nicer" multi-second period would let a busy high-priority
+  child visibly freeze even the kernel's own NORMAL-priority shell for
+  several seconds before rescuing it). Verified via `test sched priority`.
+- **Real blocking `process_wait()`/`sys_wait`**: replaces the earlier
+  busy-poll. `struct process` gained `parent`/`parent_pid` (the latter
+  guards against a recycled PCB slot aliasing an unrelated new process),
+  `child_list`/`child_next` (live children, for `ps`), and `zombie_head`/
+  `zombie_next` (a parent's exited-but-unclaimed children — deliberately
+  two separate fields; one double-duty field would corrupt a sibling chain
+  the moment a process tree goes more than one level deep). Verified via
+  `test sched wait`.
+- **Ring-3 process handles** (`docs/ARCHITECTURE.md` §3.4/§3.5): `sys_spawn`
+  now returns a capability handle, not the raw pid; `sys_wait`/`sys_kill`
+  (new) resolve a handle back to a pid via each process's own
+  `handles[PROC_HANDLE_MAX]` table. Closes the confused-deputy gap a raw
+  pid left open. Verified via a temporary `user/init.c` scaffold covering
+  the full handle lifecycle, including invalid- and reused-handle
+  rejection.
+- **Interactive process control**: `main.c`'s old single-hardcoded-process
+  auto-launch (`process_start_first()`, one-way) is gone; the shell now
+  calls `process_adopt_current()` to become a real, permanently-scheduled
+  process itself, with `run`/`ps`/`kill`/`wait`/`nice` commands. Verified
+  interactively in QEMU (monitor-injected keystrokes) against a real
+  `/init.elf`: spawn, list, block-and-collect a real exit code, and
+  no-op-safe kill/wait on already-exited or nonexistent pids.
+- **Two more bugs found and fixed getting here** (full postmortems:
+  architecture doc §16, Bugs 11–12): (11) `schedule()`'s zombie hand-off
+  ran *after* the "nothing else runnable" early return, which deadlocked
+  the very first real use of blocking `process_wait()` (a parent sitting
+  `BLOCKED`, not READY/RUNNING, with nothing else in the table) — fixed by
+  reordering. (12) `struct process::parent` is a raw pointer into a
+  recycled PCB slot; checking only `state != PROCESS_UNUSED` could
+  misidentify an unrelated new process as the still-alive original parent
+  — fixed by also snapshotting and comparing `parent_pid`.
+- **Also fixed along the way**: main.c's process-launch removal (done
+  before this phase) had left a stray unconditional inner `for(;;) hlt`
+  that trapped the shell after at most one keystroke; removed as part of
+  wiring up the real interactive loop.
+
+### Phase 20 — SMP, Thread/Process Split, Ring-3 Threads ✅
+Full spec, comparative analysis, the complete bug ledger, and every design
+decision below: `docs/architecture/process-and-scheduling.md` (its own
+Phase 4/5, §4.1/§6/§13/§16).
+- **Per-CPU foundation** (`kernel/cpu/percpu.h/.c`): `struct cpu_data` per
+  core (own TSS + RSP0/#DF stacks, `current_thread`, `pending_*_reap`,
+  `online`), indexed by an APIC-ID→index table built from the MADT;
+  `this_cpu()` resolves via `lapic_get_id()`. GDT split into
+  `gdt_init_bsp()` (shared descriptors) + `gdt_init_this_cpu()` (per-core
+  TSS descriptor + `ltr`).
+- **AP bring-up** (`kernel/cpu/smp.c`, `ap_trampoline.asm`/`ap_entry.asm`):
+  real-mode AP trampoline relocated below 1MB, INIT-SIPI-SIPI sequencing,
+  each AP lands in `ap_main()` and becomes a real, permanently-scheduled
+  idle thread — not a busy-loop stub.
+- **`struct thread`/`struct process` split** (`process.h`, full rewrite):
+  `thread_table[MAX_THREADS=256]` (the schedulable unit — context, kernel
+  stack, state, priority, running/pinned CPU) separated from
+  `process_table[MAX_PROCESSES=64]` (the resource owner — pid, address
+  space, parent/child/zombie tracking, fd/handle tables).
+  `current_thread` is a real per-CPU field (`cpu_table[]`); `current_process`
+  is a derived, read-only `current_thread->proc` macro — every external
+  consumer outside `process.c` needed either zero changes or a one-line
+  NULL-check fix. `thread_create(proc, entry)` lets one process own more
+  than one kernel thread, sharing its address space.
+- **Single global scheduler lock** (`g_sched_lock`), held **across the
+  context switch itself** — released only by whichever thread resumes on
+  the far side. Per-CPU run queues are explicitly deferred (§8/§17): the
+  shipped design is "one lock first, measure before sharding," not a
+  speculative build. Every SMP-bring-up crash found during this phase was
+  some variant of releasing this lock even one instruction too early.
+- **Ring-3 threads** (Phase 5 of the arch doc): `thread_create_user()`/
+  `thread_join()`/`thread_exit_self()` plus `sys_thread_create`/
+  `sys_thread_join`/`sys_thread_exit` give a ring-3 process real
+  multi-threading — an additional thread sharing the SAME address space,
+  entering ring 3 directly, with its own dedicated (deterministically
+  placed) user stack. Joinable, not auto-reaped like a kthread.
+  `MAX_PROCESSES`/`MAX_THREADS` raised 16/16 → 64/256 for this (catching
+  and fixing `KSTACK_SIZE`'s accidental coupling to `MAX_PROCESSES` in the
+  same pass).
+- **Bugs found and fixed**: 14 during SMP bring-up (two CPUs believing
+  they ran the same PCB, from two different root causes; the scheduler
+  lock's release-point being the load-bearing fix), zero during the
+  thread/process split itself (credited to the split being designed
+  around the two hazards SMP had already taught), zero new kernel bugs
+  during ring-3 threads (one real test-flakiness finding in an existing
+  selftest's sample size, not a kernel bug — see the arch doc §12/§13).
+  Full ledger: arch doc §16.
+- **Ten selftests**: `test sched roundrobin`/`kill`/`reap`/`stackguard`/
+  `wait`/`priority` (pre-existing, still green under `-smp 4`),
+  `test smp sched`/`kill` (cross-core dispatch + kill-while-running-
+  elsewhere), `test thread smp`/`exit` (shared address space across
+  threads, reaped only when the LAST thread exits), `test ring3 threads`
+  (a real ring-3 process spawning/joining a second thread of itself,
+  needs `make run-embkfs` for `/init.elf`).
+
+### Phase 21 — EMBKFS v2: Compression, Encryption, Snapshots, OS-Native Features ✅
+Full spec (byte-exact structs, every design decision, all known
+limitations stated plainly): `docs/EMBKFS_spec_v2.2.md`. Beginner-friendly
+guide also published. Plan executed in one extended pass with standing
+autonomous-execution authorization; every phase has its own permanent
+selftest, all green in `test embkfs all`.
+- **Real timestamps**: CMOS RTC driver (`kernel/drivers/rtc.c`, from
+  scratch, BCD/binary + 12/24h handling, Hinnant's `days_from_civil`);
+  wired through every inode-mutating call site. Found and fixed four
+  pre-existing gaps where a parent directory's own timestamps were never
+  updated on create/rename/unlink/link.
+- **Multi-volume mounting**: `embkfs_init()` mounts every EMBKFS
+  superblock it finds (not just the first), each on its own VFS mount
+  point. **Found and fixed a real, previously-invisible bug getting this
+  verified**: the ATA driver only ever routed the primary IDE channel's
+  interrupt (IRQ14) and always used its Bus-Master DMA registers — any
+  I/O to a 3rd/4th drive (secondary channel) hung for ~2.7 hours before
+  timing out (indistinguishable from a dead hang against any real
+  timeout). Fixed: per-channel IRQ handling (IRQ14 + IRQ15) and per-
+  channel Bus-Master register bases.
+- **Crypto primitives** (`kernel/crypto/`): SHA-256, HMAC-SHA256, PBKDF2,
+  AES-256, AES-256-XTS, all from scratch, all checked against externally-
+  computed known-answer vectors (not just round-trip self-consistency).
+- **Per-extent compression**: an LZ4-inspired (not byte-exact LZ4) codec;
+  only kept when it actually shrinks block usage by at least one block.
+- **AES-256-XTS encryption**: mount-time passphrase prompt (masked echo),
+  PBKDF2 key derivation, LUKS-style key-check, per-block deterministic
+  XTS tweak (the block's own disk address — no stored nonce needed).
+  Cross-verified against an independent Python `cryptography`-based
+  AES-XTS implementation, never reusing the kernel's own crypto code.
+- **OS-native features** (all four, as scoped up front): self-healing
+  dual-superblock repair; instant (O(1)) snapshots with a snapshot-aware
+  allocator (`snap create/list/delete/rollback`) — found and fixed a real
+  ordering bug where a snapshot's own creation commit could free the
+  blocks its frozen root needed; process-provenance (`writer_pid` in
+  every inode, `stat <path>` to view it); an HMAC-SHA256 verified-root
+  boot check (kernel-embedded key — explicitly scoped as authentication,
+  not real asymmetric signing, and documented as such).
+- **Oracle-first discipline held throughout**: `mkfs_embkfs.py`/
+  `verify_embkfs.py` updated alongside every on-disk format change,
+  including independent Python ports of the compression decoder and an
+  XTS decrypt path.
+- **Known, deliberately-scoped limitations** (all documented in the spec,
+  not hidden): snapshot allocator hold-back is conservative, not true
+  per-block refcounting; rolling back to a snapshot reverts the snapshot
+  registry too (newer snapshots become inaccessible); verified-root uses
+  one shared kernel-embedded key; no ciphertext stealing in XTS (never
+  needed, every write is block-rounded).
 
 ---
 
@@ -428,31 +586,47 @@ Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:
 ### High Priority (block real programs)
 1. ~~User-pointer validation~~ — ✅ done, Phase 18.
 2. ~~Process & Scheduling gaps (preemption, blocking, uncatchable kill,
-   per-process fd tables)~~ — ✅ done, Phase 18 (priority scheduling and SMP
-   remain, see Lower Priority below).
+   per-process fd tables)~~ — ✅ done, Phase 18. Priority scheduling and
+   real blocking wait also now done, Phase 19. SMP + the thread/process
+   split + ring-3 threads also now done, Phase 20.
 3. ~~File I/O syscalls~~ — ✅ done, Phase 18.
-4. **A real blocking `sys_wait`**: today's `sys_wait` busy-polls (`process_find`
-   + `sys_yield` in a loop) rather than blocking on a wait queue and being
-   woken by the child's exit — needs `process::parent`/`zombie_next`
-   tracking (`docs/architecture/process-and-scheduling.md` §6.2/§7.4/§17).
-5. **The syscall-context `schedule()` reentrancy gap** (Phase 18's "known,
-   deliberate gap left open" above) — not observed to misbehave, but not
-   actually prevented either; worth closing before it's relied upon.
+4. ~~A real blocking `sys_wait`~~ — ✅ done, Phase 19: `process::parent`/
+   `parent_pid`/`zombie_head`/`zombie_next`/`child_wait` tracking, no more
+   busy-polling. Found and fixed a real deadlock getting this exercised
+   for the first time (Bug 11).
+5. ~~The syscall-context `schedule()` reentrancy gap~~ — ✅ done, Phase 18
+   (Bug 10 above).
+6. ~~Ring-3 process handles for spawn/wait/kill~~ — ✅ done, Phase 19: closes
+   the confused-deputy gap a raw pid argument left open.
+7. ~~SMP~~ — ✅ done, Phase 20: real multi-core bring-up, per-CPU
+   `current_thread`, one global scheduler lock held across context
+   switches. Per-CPU run queues specifically remain deferred (see Lower
+   Priority below) until the global lock is measured to bottleneck.
 
 ### Medium Priority (real-world use)
-1. **Filesystems**: EMBKFS crash-safe orphan reclaim strengthening, VFS
-   multi-mount, `.truncate`/`.readlink` ops; FAT32 IDE secondary channel.
+1. **Filesystems**: ~~EMBKFS crash-safe orphan reclaim~~ (mount-time sweep
+   done; on-disk orphan list for the crash-safety tier still open), ~~VFS
+   multi-mount~~ (done, Phase 21), `.truncate`/`.readlink` ops still open;
+   FAT32 IDE secondary channel note is now moot (both channels work, see
+   Phase 21). EMBKFS v2 (Phase 21) shipped compression/encryption/
+   snapshots/self-heal/provenance/verified-boot — see `TODO.md`'s new
+   EMBKFS v2 subsection for that work's own follow-ups (snapshot
+   refcounting, asymmetric verified-root signing).
 2. **Drivers**: keyboard modifiers/extended scancodes, `vmm_map_mmio_wc`
    (write-combining), USB isochronous transfers, xHCI hub support (legacy
    HCs got hub support in Phase 18; xHCI's is a separate code path, still
    open), USB hot-plug.
 3. **Synchronization**: per-CPU heap caches, locks around currently-unlocked
-   global tables (per-process fd tables, EMBKFS open-ref table, process
-   table) — all deferred until something can actually race (SMP, or the
-   Phase 18 reentrancy gap above becoming load-bearing).
+   global tables (per-process fd tables, EMBKFS open-ref table) — SMP now
+   exists (Phase 20) but nothing currently races these specific tables
+   from more than one core concurrently; revisit before that changes. The
+   process/thread tables themselves are already locked (`g_sched_lock`,
+   Phase 20).
 
 ### Lower Priority (architecture)
-1. **SMP**: AP bring-up (INIT-SIPI-SIPI), per-CPU data, per-CPU LAPIC.
+1. **Per-CPU run queues**: the one piece of the SMP work deliberately left
+   unbuilt — see Phase 20 above and the arch doc §8/§17 for why (measure
+   the global lock first, don't shard speculatively).
 2. **Syscall fast-path**: STAR/LSTAR/SFMASK for `syscall`/`sysret`.
 3. **Bootloader v2**: ELF-aware loading, UEFI support, USB/CD boot.
 4. **Slab allocator**: fixed-size pools on top of the heap (currently
@@ -475,7 +649,16 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 ### Filesystems
 - No crash-safe orphan reclaim beyond the mount-time sweep (EMBKFS); no
   symlink resolution in the VFS yet (EMBKFS itself supports it).
-- Single mount only — no multi-mount / longest-prefix match.
+- VFS now supports real multi-mount (longest-prefix match, `vfs_find_mount`,
+  up to `VFS_MAX_MOUNTS = 8`) — landed alongside EMBKFS v2's multi-volume
+  mounting (Phase 21). No `.readlink`/`.truncate` ops yet (see `TODO.md`).
+- EMBKFS v2 (Phase 21) known, deliberately-scoped limitations — all
+  documented in `docs/EMBKFS_spec_v2.2.md`, not hidden: snapshot allocator
+  hold-back is conservative (not true per-block refcounting); rolling
+  back to a snapshot reverts its own registry entry too (newer snapshots
+  become inaccessible after an older rollback); verified-root boot check
+  uses one kernel-embedded HMAC key, not real asymmetric signing; no XTS
+  ciphertext stealing (never needed — every write is block-rounded).
 
 ### Drivers
 - VBE now does EDID + BIOS mode-list enumeration instead of one hardcoded
@@ -485,17 +668,28 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 - USB: hub support on UHCI/OHCI/EHCI (Phase 18); xHCI hub support and
   isochronous transfers on any controller are still open.
 - Keyboard: ASCII-only, no modifiers/extended scancodes.
+- ATA: both IDE channels now fully interrupt-driven and DMA-capable
+  (Phase 21 fixed the secondary channel — see Phase 21 above); AHCI is
+  still port-0-only.
 
 ### User Mode / Process
 - User pointers are now validated (`access_ok`/`copy_from_user`/
   `copy_to_user`, Phase 18).
-- 12 syscalls exist (write, exit, yield, open, close, read, lseek, stat,
-  readdir, spawn, wait, getpid) — no `sys_kill` yet (the uncatchable
-  `process_kill` is built and used by selftests, just not exposed to ring 3).
-- Preemption, wait queues, and the uncatchable kill are built (Phase 18).
-  Still open: priority scheduling, a real blocking `sys_wait` (today's
-  busy-polls), the syscall-context `schedule()` reentrancy gap noted above,
-  and SMP.
+- 16 syscalls exist (write, exit, yield, open, close, read, lseek, stat,
+  readdir, spawn, wait, getpid, kill, thread_create, thread_join,
+  thread_exit) — `sys_spawn`/`sys_wait`/`sys_kill` take/return capability
+  handles (Phase 19), not raw pids.
+- Preemption, wait queues, the uncatchable kill, priority scheduling
+  (4 bands + aging), real blocking `process_wait()`/`sys_wait`, SMP
+  (multi-core bring-up, a real per-CPU `current_thread`, one global
+  scheduler lock held across context switches), the `struct thread`/
+  `struct process` split, and joinable ring-3 threads are all built
+  (Phases 18–20). `schedule()` is reentrancy-safe against the timer ISR
+  regardless of which context it's called from, and its zombie hand-off
+  no longer deadlocks a blocked waiter. Still open: per-CPU run queues
+  (§6.3/§8 of the arch doc) — deliberately deferred until the single
+  global scheduler lock is *measured* to bottleneck, not built ahead of
+  need.
 
 ---
 
@@ -505,18 +699,19 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 |-----------|--------|-------|
 | PMM | ✅ Passes | Allocates/frees pages consistently |
 | VMM | ✅ Passes | Maps kernel + user, NX works |
-| EMBKFS | ✅ Passes | Create/read/write/unlink/mkdir/rename/link/symlink verified via selftest; collision-chain and B-tree-descent regressions covered |
+| EMBKFS v2 | ✅ Passes | `test embkfs all` — create/read/write/unlink/mkdir/rename/link/symlink, collision-chain and B-tree-descent regressions, RTC timestamps, multi-volume mount, LZ compression, self-heal, snapshots, process-provenance, HMAC verified-root boot check. `test crypto all` — SHA-256/HMAC/PBKDF2/AES-256/XTS against known-answer vectors. Independent oracle: `verify_embkfs.py` (incl. `--passphrase` for encrypted images) |
 | FAT32 | ✅ Passes | Read/write long filenames on MBR partition, oracle-validated against `fsck.vfat`/`mcopy` |
-| VFS | ✅ Passes | Path resolution, multi-FS discovery, `ls`, boot selftest (6 checks) |
+| VFS | ✅ Passes | Path resolution, real multi-mount (longest-prefix), multi-FS discovery, `ls`, boot selftest (6 checks) |
 | File descriptors | ✅ Passes | open/close/read/write/seek/fstat, create-on-open, unlink-while-open, selftest |
-| ATA | ✅ Passes | DMA+IRQ on primary channel, MBR partition discovery |
+| ATA | ✅ Passes | DMA+IRQ on BOTH IDE channels (Phase 21 fixed the secondary channel), MBR partition discovery |
 | AHCI | ✅ Passes | Read/write on port 0 (polling), verified against host ground truth |
 | Ring-3 Entry | ✅ Passes | ELF loads, user code runs, iretq works, syscalls dispatch |
+| SMP / Threads | ✅ Passes | `test smp sched`/`kill`, `test thread smp`/`exit`, `test ring3 threads` (Phase 20) — cross-core dispatch, shared-address-space threading, joinable ring-3 threads, all under `-smp 4` |
 | LAPIC Timer | ✅ Passes | 100 Hz ticks, TSC calibrated |
 | rwlock | ✅ Passes | Reader/writer locking, smoke test passes |
 | GPU / Framebuffer | ✅ Passes | `test gpu` (`fb_run_selftests`): fill_rect/get_pixel/copy_rect round-trip, exact colors, boundary non-bleed. Plus manual: Bochs DISPI + VirtIO-GPU modeset verified via QEMU screendump; VBE EDID/enumeration fallback verified (selects a genuinely different mode than the old hardcoded one under `-vga cirrus`). |
 | USB (UHCI/OHCI/EHCI/xHCI) | ✅ Passes | `test usb` (`usb_run_selftests`): cross-checks discovered controllers against a fresh PCI rescan. Plus manual: HID keyboard input + mass-storage block device verified per-HC in QEMU, an EHCI+UHCI companion handoff, and a keyboard behind a `usb-hub` on UHCI (hub support, Phase 18). |
-| Process lifecycle / scheduler | ✅ Passes | `test sched roundrobin`/`kill`/`reap`/`stackguard` (`process_test_*`, Phase 18) — the four selftests `docs/architecture/process-and-scheduling.md` §12 specifies, all green. Plus manual: `/init.elf` loads, runs in ring 3 on a guarded kernel stack, exits cleanly, zero exceptions; real preemption verified interleaving two kthreads; `sys_spawn`/`sys_wait` verified end to end with real exit codes. |
+| Process lifecycle / scheduler | ✅ Passes | `test sched roundrobin`/`kill`/`reap`/`stackguard`/`wait`/`priority` (`process_test_*`, Phase 18/19) — six selftests, all green. Plus manual: `/init.elf` loads, runs in ring 3 on a guarded kernel stack, exits cleanly, zero exceptions; real preemption verified interleaving two kthreads; the full ring-3 handle lifecycle (`sys_spawn`/`sys_wait`/invalid/reused-handle rejection) verified end to end; the interactive shell's `run`/`ps`/`kill`/`wait`/`nice` commands verified end to end in QEMU via monitor-injected keystrokes against a real spawned/waited process. |
 | Syscalls (file I/O, spawn/wait, user-pointer validation) | ✅ Passes (manual) | Verified via temporary `user/init.c` scaffolds (reverted after each check): file round-trip through `sys_open`/`read`/`write`/`close`; a bad (kernel-address) pointer rejected by `access_ok` instead of dereferenced; spawn/wait observing a real child exit code; per-process fd isolation between two spawned processes. No dedicated automated selftest yet (only the scheduler-side effects are covered by `test sched *` above). |
 
 ---
@@ -584,23 +779,30 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 ## Next Steps
 
 Dependency order — see `TODO.md`'s per-subsystem lists for the full detail
-behind each item. Everything through Phase 18 (user-pointer validation,
-scheduler Phase B, file I/O syscalls, `sys_wait`/`sys_spawn`, per-process fd
-tables) is now done; what's left before self-hosting:
+behind each item. Everything through Phase 21 (user-pointer validation,
+scheduler Phases B/C/D, file I/O syscalls, real blocking `sys_wait`,
+ring-3 process handles, per-process fd tables, the interactive shell, SMP +
+the thread/process split + ring-3 threads, and EMBKFS v2's full feature
+set) is now done; what's left before self-hosting:
 
-1. **A real blocking `sys_wait`** — replace the busy-poll with
-   `process::parent`/`zombie_next` tracking (`docs/architecture/process-and-scheduling.md`
-   §7.4/§17), and close the syscall-context `schedule()` reentrancy gap
-   (§8(a)) while touching this code.
-2. **libc port** (newlib first) — implement syscall backends, don't write
+1. **libc port** (newlib first) — implement syscall backends, don't write
    one from scratch — the hinge to running existing software. The syscall
-   surface (12 calls, file I/O + process management) is now broad enough to
-   make this the natural next step.
-3. **Shell**, then coreutils, then a self-hosting toolchain (tcc first),
-   then mouse + compositor + GUI. See `docs/ARCHITECTURE.md` §5 for the
-   full critical-path roadmap to self-hosting.
-4. **Priority scheduling, SMP** — deferred until something concrete needs
-   them (see `docs/architecture/process-and-scheduling.md` §17 for why).
+   surface (16 calls, file I/O + process/thread management, all handle/
+   capability-safe) is now broad enough to make this the natural next step.
+2. **Native shell/coreutils**, built on top of the kernel's own interactive
+   process-control commands (`run`/`ps`/`kill`/`wait`/`nice`) rather than
+   from scratch, then a self-hosting toolchain (tcc first), then mouse +
+   compositor + GUI. See `docs/ARCHITECTURE.md` §5 for the full
+   critical-path roadmap to self-hosting.
+3. **Per-CPU run queues** — the one piece of the SMP work deliberately left
+   unbuilt: the single global `g_sched_lock` is the shipped design, and
+   per-CPU queues are scoped as the *next* step only once that lock is
+   *measured* to bottleneck (see the arch doc §8/§17), not built ahead of
+   real need.
+4. **True per-block snapshot refcounting / asymmetric verified-root
+   signing** — both EMBKFS v2 known limitations (Phase 21 above), flagged
+   in `docs/EMBKFS_spec_v2.2.md` as natural v2.x follow-ups, not attempted
+   in this pass to keep the crypto/allocator surface reviewable.
 
 ---
 
@@ -613,19 +815,23 @@ tables) is now done; what's left before self-hosting:
 ## Build / Run Commands
 
 ```bash
-make                   # build everything
-make run               # boot in QEMU (serial → stdio)
-make run-ahci          # boot with an extra AHCI SATA disk attached
-make run-embkfs        # boot with a flat EMBKFS image as sdb
-make run-embkfs-tree   # boot with a 2-level EMBKFS tree image as sdb (has /init.elf)
-make run-vga-std       # Bochs DISPI (QEMU -vga std)
-make run-virtio-gpu    # VirtIO-GPU accelerated scan-out (QEMU -vga virtio)
-make run-usb-uhci      # UHCI + usb-kbd + usb-storage
-make run-usb-ohci      # OHCI + usb-kbd + usb-storage
-make run-usb-ehci      # EHCI + usb-storage (high speed)
-make run-usb-xhci      # xHCI + usb-kbd
-make debug             # GDB server on :1234 (paused)
-make clean             # remove binaries (preserves disk.img / ahci.img)
+make                     # build everything
+make run                 # boot in QEMU (serial → stdio)
+make run-smp             # boot with -smp 4 (real multi-core)
+make run-ahci            # boot with an extra AHCI SATA disk attached
+make run-embkfs          # boot with a flat EMBKFS image as sdb
+make run-embkfs-tree     # boot with a 2-level EMBKFS tree image as sdb (has /init.elf)
+make run-embkfs-encrypted # boot with an ENCRYPTED EMBKFS volume (passphrase: correcthorsebattery)
+make run-multivol        # boot with TWO EMBKFS volumes (sdb -> "/", sdc -> "/sdc")
+make run-usb-embkfs      # boot with an EMBKFS volume mounted over xHCI USB mass storage
+make run-vga-std         # Bochs DISPI (QEMU -vga std)
+make run-virtio-gpu      # VirtIO-GPU accelerated scan-out (QEMU -vga virtio)
+make run-usb-uhci        # UHCI + usb-kbd + usb-storage
+make run-usb-ohci        # OHCI + usb-kbd + usb-storage
+make run-usb-ehci        # EHCI + usb-storage (high speed)
+make run-usb-xhci        # xHCI + usb-kbd
+make debug               # GDB server on :1234 (paused)
+make clean               # remove binaries (preserves disk.img / ahci.img)
 ```
 
 ## Memory Layout
