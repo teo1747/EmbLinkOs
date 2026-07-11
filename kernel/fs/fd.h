@@ -1,11 +1,22 @@
 #ifndef __FD_H__
 #define __FD_H__
 
-#include "../include/types.h"  
-#include "vfs.h"
+#include "include/types.h"
+#include "fs/vfs.h"
 #include <stdint.h>
 
-
+/* Opaque forward declaration -- fd.h can't include process.h (process.h
+ * itself includes fd.h, to embed struct fd_entry fds[] in struct process;
+ * including it back here would be circular). Without this, every TU that
+ * uses fd_open_into()'s prototype below invents its OWN anonymous, mutually
+ * incompatible "struct process" (GCC's "declared inside parameter list"
+ * warning) -- harmless for a pointer that's only ever passed through, until
+ * fd.c itself both sees this prototype AND includes the REAL process.h,
+ * at which point the two disagree and fd_open_into()'s definition fails to
+ * compile ("conflicting types"). One forward declaration here makes every
+ * TU's `struct process *` the same (opaque) type, completed later wherever
+ * process.h is actually included. */
+struct process;
 
 /* open() flags. bit values are our own; only O_CREAT/O_EXCL act in v1.
  * O_TRUNC and O_APPEND are reserved - declared so callers can compile against
@@ -45,6 +56,7 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
+int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
 int vfs_fd_run_selftests(void);
 
 

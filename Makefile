@@ -1,82 +1,93 @@
 ASM       = nasm
 ASM_FLAGS = -f bin
 CC = x86_64-elf-gcc
+# -Ikernel makes every kernel translation unit include project headers by
+# their canonical path from the kernel/ root (e.g. #include
+# "drivers/char/serial.h", "arch/x86_64/irq/idt.h"), independent of where the
+# including file itself lives -- the standard approach and what keeps a move
+# like this one from being fragile.
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel \
+         -Ikernel \
          -g -O0
 
 IMG = myos.img
 DISK = disk.img
+# All intermediate build artifacts (assembled .o, the AP trampoline .bin) land
+# here, out of the source tree.
+BUILD = build
 
 # Userland rules appear before `all`, so pin the default goal explicitly.
 .DEFAULT_GOAL := all
 
 STAGE1_SRC  = boot/stage1/boot.asm
 STAGE2_SRC  = boot/stage2/stage2.asm
-ISR_ASM     = kernel/cpu/isr.asm
-KCONTEXT_ASM = kernel/cpu/kcontext.asm
-KENTRY_ASM  = kernel/cpu/kentry.asm
-KENTRY_OBJ  = kernel/cpu/kentry.o
-ISR_OBJ     = kernel/cpu/isr.o
-SYSCALL_ASM = kernel/cpu/syscall_entry.asm
-SYSCALL_OBJ = kernel/cpu/syscall_entry.o
-KCONTEXT_OBJ = kernel/cpu/kcontext.o
+ISR_ASM     = kernel/arch/x86_64/irq/isr.asm
+KCONTEXT_ASM = kernel/arch/x86_64/cpu/kcontext.asm
+KENTRY_ASM  = kernel/arch/x86_64/cpu/kentry.asm
+KENTRY_OBJ  = $(BUILD)/kentry.o
+ISR_OBJ     = $(BUILD)/isr.o
+SYSCALL_ASM = kernel/arch/x86_64/syscall/syscall_entry.asm
+SYSCALL_OBJ = $(BUILD)/syscall_entry.o
+KCONTEXT_OBJ = $(BUILD)/kcontext.o
 
 # --- SMP: AP entry stub (linked into the kernel image) + the real-mode
 # trampoline (a separate flat binary, embedded via incbin -- see
-# kernel/cpu/ap_trampoline_blob.asm's comment for why this mirrors the
-# tree's old init_blob.asm technique).
-AP_ENTRY_ASM         = kernel/cpu/ap_entry.asm
-AP_ENTRY_OBJ         = kernel/cpu/ap_entry.o
-AP_TRAMPOLINE_ASM    = kernel/cpu/ap_trampoline.asm
-AP_TRAMPOLINE_BIN    = kernel/cpu/ap_trampoline.bin
-AP_TRAMPOLINE_BLOB_ASM = kernel/cpu/ap_trampoline_blob.asm
-AP_TRAMPOLINE_BLOB_OBJ = kernel/cpu/ap_trampoline_blob.o
+# kernel/arch/x86_64/smp/ap_trampoline_blob.asm's comment for why this mirrors
+# the tree's old init_blob.asm technique).
+AP_ENTRY_ASM         = kernel/arch/x86_64/smp/ap_entry.asm
+AP_ENTRY_OBJ         = $(BUILD)/ap_entry.o
+AP_TRAMPOLINE_ASM    = kernel/arch/x86_64/smp/ap_trampoline.asm
+AP_TRAMPOLINE_BIN    = $(BUILD)/ap_trampoline.bin
+AP_TRAMPOLINE_BLOB_ASM = kernel/arch/x86_64/smp/ap_trampoline_blob.asm
+AP_TRAMPOLINE_BLOB_OBJ = $(BUILD)/ap_trampoline_blob.o
 
 KERNEL_SRC = kernel/main.c \
-             kernel/cpu/isr.c \
-             kernel/cpu/pic.c \
-             kernel/cpu/irq.c \
-             kernel/cpu/gdt.c \
-             kernel/cpu/percpu.c \
-             kernel/cpu/smp.c \
-             kernel/cpu/spinlock.c \
-             kernel/cpu/rwlock.c \
-             kernel/cpu/syscall.c \
-             kernel/cpu/usercopy.c \
-             kernel/cpu/lapic.c \
-             kernel/cpu/ioapic.c \
-			 kernel/cpu/usermode.c \
-			 kernel/cpu/elf.c \
-			 kernel/process/process.c \
+             kernel/selftests.c \
+             kernel/arch/x86_64/irq/isr.c \
+             kernel/arch/x86_64/irq/pic.c \
+             kernel/arch/x86_64/irq/irq.c \
+             kernel/arch/x86_64/irq/idt.c \
+             kernel/arch/x86_64/irq/ioapic.c \
+             kernel/arch/x86_64/irq/lapic.c \
+             kernel/arch/x86_64/cpu/gdt.c \
+             kernel/arch/x86_64/cpu/percpu.c \
+             kernel/arch/x86_64/cpu/fpu.c \
+             kernel/arch/x86_64/cpu/spinlock.c \
+             kernel/arch/x86_64/cpu/rwlock.c \
+             kernel/arch/x86_64/smp/smp.c \
+             kernel/arch/x86_64/syscall/syscall.c \
+             kernel/arch/x86_64/syscall/usercopy.c \
+             kernel/arch/x86_64/syscall/usermode.c \
+             kernel/arch/x86_64/syscall/elf.c \
+             kernel/process/process.c \
              kernel/acpi/acpi.c \
-             kernel/drivers/serial.c \
-             kernel/drivers/framebuffer.c \
-             kernel/drivers/gpu.c \
-             kernel/drivers/bochs_vbe.c \
-             kernel/drivers/virtio_gpu.c \
-             kernel/drivers/font_8x16.c \
-             kernel/drivers/console.c \
-             kernel/drivers/timer.c \
-             kernel/drivers/hpet.c \
-             kernel/drivers/keyboard.c \
-             kernel/drivers/pit.c \
-             kernel/drivers/rtc.c \
-             kernel/drivers/pci.c \
-             kernel/drivers/usb.c \
-             kernel/drivers/usb_core.c \
-             kernel/drivers/xhci.c \
-             kernel/drivers/ehci.c \
-             kernel/drivers/uhci.c \
-             kernel/drivers/ohci.c \
-             kernel/drivers/ata.c \
-             kernel/drivers/bootanim.c \
-             kernel/drivers/ahci.c \
+             kernel/drivers/char/serial.c \
+             kernel/drivers/video/framebuffer.c \
+             kernel/drivers/video/gpu.c \
+             kernel/drivers/video/bochs_vbe.c \
+             kernel/drivers/video/virtio_gpu.c \
+             kernel/drivers/video/font_8x16.c \
+             kernel/drivers/video/console.c \
+             kernel/drivers/video/bootanim.c \
+             kernel/drivers/timer/timer.c \
+             kernel/drivers/timer/hpet.c \
+             kernel/drivers/timer/pit.c \
+             kernel/drivers/timer/rtc.c \
+             kernel/drivers/input/keyboard.c \
+             kernel/drivers/bus/pci.c \
+             kernel/drivers/usb/usb.c \
+             kernel/drivers/usb/usb_core.c \
+             kernel/drivers/usb/xhci.c \
+             kernel/drivers/usb/ehci.c \
+             kernel/drivers/usb/uhci.c \
+             kernel/drivers/usb/ohci.c \
+             kernel/drivers/storage/ata.c \
+             kernel/drivers/storage/ahci.c \
              kernel/block/block.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
-             kernel/cpu/idt.c \
              kernel/mm/vmm.c \
              kernel/mm/kheap.c \
              kernel/mm/kmalloc.c \
@@ -86,16 +97,15 @@ KERNEL_SRC = kernel/main.c \
              kernel/crypto/aes.c \
              kernel/crypto/xts.c \
              kernel/fs/fat32.c \
-			 kernel/fs/embkfs/embkfs.c \
-			 kernel/fs/embkfs/embkfs_compress.c \
-			 kernel/fs/embkfs/crc32c.c \
-			 kernel/fs/embkfs/embk_vfs.c \
-			 kernel/fs/fd.c \
-			 kernel/fs/vfs.c \
-			 kernel/selftests.c \
-             kernel/kstring.c \
-             kernel/errno.c \
-             kernel/kprintf.c
+             kernel/fs/embkfs/embkfs.c \
+             kernel/fs/embkfs/embkfs_compress.c \
+             kernel/fs/embkfs/crc32c.c \
+             kernel/fs/embkfs/embk_vfs.c \
+             kernel/fs/fd.c \
+             kernel/fs/vfs.c \
+             kernel/lib/kstring.c \
+             kernel/lib/errno.c \
+             kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
 STAGE1_BIN  = boot/stage1/boot.bin
@@ -104,28 +114,57 @@ KERNEL_ELF  = kernel/kernel.elf
 
 
 # ---- Userland ---------------------------------------------------------------
-# The first program that isn't the kernel. Freestanding, linked at 0x400000,
-# flattened to a raw blob, then embedded into the kernel image (see init_blob).
+# Layout: user/lib/ is the shared userland library -- the EmbLink SDK (embk.h,
+# embk_syscall.h), the newlib retargeting layer (crt0.c, syscalls.c), and the
+# linker scripts. user/bin/ holds the actual programs. Built artifacts (.o,
+# .elf) go to $(BUILD), out of the source tree. -Iuser/lib lets a program in
+# user/bin include the SDK as "embk.h". See user/README.md.
 USER_CC      = x86_64-elf-gcc
 USER_LD      = x86_64-elf-ld
-USER_OBJCOPY = x86_64-elf-objcopy
+USER_INC     = -Iuser/lib
+# Freestanding programs (init.elf): own _start, no libc, no SSE.
 USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
-               -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2
+               -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
 
-user/init.o: user/init.c
+build/init.o: user/bin/init.c | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
+build/init.elf: build/init.o user/lib/user.ld
+	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
 
-user/init.elf: user/init.o user/user.ld
-	$(USER_LD) -T user/user.ld user/init.o -o $@
+# --- newlib-linked userland (user/lib/crt0.c + user/lib/syscalls.c + a program) ---
+# Unlike init.elf (freestanding, -mno-sse, own _start), these link against a
+# newlib libc: normal SSE-using code (safe now that the kernel saves/restores
+# FPU/SSE state across context switches), the crt0.c stack-alignment stub, and
+# syscalls.c's POSIX retargeting stubs.
+#
+# NEWLIB_PREFIX: the toolchain's stock newlib (/usr/local/cross) was built
+# WITHOUT C99 formats / long-long in printf (%z, %ll compiled out of libc.a).
+# We rebuilt newlib with --enable-newlib-io-c99-formats + --enable-newlib-io-
+# long-long into this user-owned prefix; pointing -L/-isystem here uses that
+# fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
+# toolchain newlib (and re-lose %z/%ll). See user/README.md.
+NEWLIB_PREFIX ?= /home/motsou/cross/newlib-c99
+NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
+NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
+# gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
+# crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
+# NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
+# rebuilt libc.a wins over the stock one.
+NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
 
-user/init.bin: user/init.elf
-	$(USER_OBJCOPY) -O binary $< $@
+build/crt0.o: user/lib/crt0.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
-# Wrap the raw blob in an object the kernel links against. The .incbin pulls in
-# the bytes; the two labels bracket them so C can compute the length at runtime.
-user/init_blob.o: user/init.elf kernel/cpu/init_blob.asm
-	$(ASM) -f elf64 kernel/cpu/init_blob.asm -o $@
+build/syscalls.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/hello.o: user/bin/hello.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/hello.elf: build/crt0.o build/syscalls.o build/hello.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/hello.o -lc -lgcc -o $@
 
 
 
@@ -145,28 +184,31 @@ $(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_ELF)
 	echo "Building stage2 with KERNEL_LOAD_SECTORS=$$kernel_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D KERNEL_LOAD_SECTORS=$$kernel_sectors $< -o $@
 
-$(ISR_OBJ): $(ISR_ASM)
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(ISR_OBJ): $(ISR_ASM) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
-$(SYSCALL_OBJ): $(SYSCALL_ASM)
+$(SYSCALL_OBJ): $(SYSCALL_ASM) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
-$(KCONTEXT_OBJ): $(KCONTEXT_ASM)
+$(KCONTEXT_OBJ): $(KCONTEXT_ASM) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
-$(KENTRY_OBJ): $(KENTRY_ASM)
+$(KENTRY_OBJ): $(KENTRY_ASM) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
-$(AP_ENTRY_OBJ): $(AP_ENTRY_ASM)
+$(AP_ENTRY_OBJ): $(AP_ENTRY_ASM) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
 # Flat binary, NOT linked into the kernel -- an AP starts in 16-bit real
 # mode and must execute below 1MB, which the kernel's higher-half ELF is
 # not. Embedded as data via the incbin wrapper below instead.
-$(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM)
+$(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM) | $(BUILD)
 	$(ASM) -f bin $< -o $@
 
-$(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN)
+$(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
@@ -184,8 +226,8 @@ $(DISK):
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: embkfs_mkfs/mkfs_embkfs.py user/init.elf
-	python3 embkfs_mkfs/mkfs_embkfs.py
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
 # Create a 64MB AHCI test disk (separate from disk.img)
@@ -205,11 +247,11 @@ fat32.img:
 
 
 embkfs.img:
-	python3 embkfs_mkfs/mkfs_embkfs.py   # adjust path if mkfs writes elsewhere
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py   # adjust path if mkfs writes elsewhere
 
 
 embkfs_tree.img:
-	python3 embkfs_mkfs/mkfs_embkfs.py     # writes embkfs.img AND embkfs_tree.img
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py     # writes embkfs.img AND embkfs_tree.img
 
 
 # COW mutates the disk — boot a PRISTINE copy each run, then grade it.
@@ -243,8 +285,8 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 # string "correcthorsebattery" -- NEVER a real credential, just a KAT-style
 # fixture so this target is scriptable. Boots straight to the kernel's
 # mount-time passphrase prompt; type it at the keyboard (masked echo).
-embkfs_encrypted.img: embkfs_mkfs/mkfs_embkfs.py user/init.elf
-	python3 embkfs_mkfs/mkfs_embkfs.py --encrypted embkfs_encrypted.img correcthorsebattery
+embkfs_encrypted.img: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py --encrypted embkfs_encrypted.img correcthorsebattery
 
 run-embkfs-encrypted: $(IMG) $(DISK) embkfs_encrypted.img
 	qemu-system-x86_64 \
@@ -354,8 +396,8 @@ run-usb-xhci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
 # EMBKFS-formatted USB mass-storage image, exercised specifically over xHCI
 # (its own separate MSC implementation, distinct from usb_core.c's UHCI/
 # OHCI/EHCI path) -- proves EMBKFS mounts over USB, not just ATA/AHCI.
-usbdisk_embkfs.img: embkfs_mkfs/mkfs_embkfs.py user/init.elf
-	python3 embkfs_mkfs/mkfs_embkfs.py usbdisk_embkfs.img
+usbdisk_embkfs.img: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py usbdisk_embkfs.img
 
 run-usb-embkfs: $(IMG) $(DISK) usbdisk_embkfs.img
 	qemu-system-x86_64 $(DRIVES) \
@@ -396,9 +438,7 @@ run-all: $(IMG) ahci.img fat32.img
 	    -serial stdio -no-reboot -no-shutdown
 
 clean:
-	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG) \
-	      $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ)\
-	      $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BIN) $(AP_TRAMPOLINE_BLOB_OBJ) \
-	      user/init.o user/init.elf user/init.bin user/init_blob.o
+	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG)
+	rm -rf $(BUILD)
 
 .PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted

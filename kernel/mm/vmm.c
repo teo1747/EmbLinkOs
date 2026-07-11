@@ -1,7 +1,7 @@
-#include "vmm.h"
-#include "pmm.h"
-#include "../drivers/serial.h"
-#include "../cpu/spinlock.h"
+#include "mm/vmm.h"
+#include "mm/pmm.h"
+#include "drivers/char/serial.h"
+#include "arch/x86_64/cpu/spinlock.h"
 #include <stdint.h>
 
 

@@ -1,7 +1,7 @@
 #ifndef _EMBKFS_H
 #define _EMBKFS_H
 
-#include "../../include/types.h"   /* bool, NULL, size_t */
+#include "include/types.h"   /* bool, NULL, size_t */
 #include <stdint.h>
 
 /* =====================================================================

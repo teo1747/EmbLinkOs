@@ -6,7 +6,7 @@
 
 // Re-export the public allocation API (kmalloc/kcalloc/krealloc/kfree) so
 // existing callers that only include this engine header keep working.
-#include "../include/kmalloc.h"
+#include "include/kmalloc.h"
 
 
 // Heap virtual base

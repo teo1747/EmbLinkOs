@@ -4,9 +4,9 @@
  * into EMBKFS's own (vol, dir_oid, name) API. No filesystem logic lives here;
  * it only unwraps vnodes and rewraps results. */
 
-#include "../vfs.h"
-#include "embkfs.h"
-#include "../../include/errno.h"
+#include "fs/vfs.h"
+#include "fs/embkfs/embkfs.h"
+#include "include/errno.h"
 
 /* The fs_data stashed in a mount for an EMBKFS volume IS the embkfs_volume*
  * the kernel already mounted. This makes the cast explicit and named. */

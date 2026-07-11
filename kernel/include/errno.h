@@ -21,6 +21,7 @@
 #define EMBK_ENOEXEC       8    // exec format error
 #define EMBK_EIO           5    // I/O error (hardware read/write failed)
 #define EMBK_ENXIO         6    // no such device or address
+#define EMBK_E2BIG         7    // argument list too long
 #define EMBK_EBADF         9    // bad file descriptor
 #define EMBK_ECHILD       10    // no child processes
 #define EMBK_EAGAIN       11    // try again / resource temporarily unavailable

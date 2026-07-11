@@ -2,7 +2,7 @@
 #define __KSTRING_H__
 
 #include <stdint.h>
-#include "types.h"
+#include "include/types.h"
 
 // Memory operations
 void *memcpy(void *dest, const void *src, size_t n);

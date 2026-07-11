@@ -1,9 +1,9 @@
-#include "fd.h"
-#include "vfs.h"
-#include "../include/errno.h"
-#include "../include/kprintf.h"
-#include "../include/kstring.h"
-#include "../process/process.h"
+#include "fs/fd.h"
+#include "fs/vfs.h"
+#include "include/errno.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
+#include "process/process.h"
 #include <stdint.h>
 
 
@@ -343,6 +343,74 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
 
     return e->vn.mnt->ops->stat(&e->vn, out);
 }
+
+/* Parallel to vfs_open(), but for an explicit, not-yet-running
+ * target process. placing the result at a SPECIFIC fd rather than the 
+ * lowest free one. Shares vfs_open()'s underlying logic. only the
+ * table and placement logic differ from vfs_open(). 
+ *
+ * No "close what's already there" step: target->fds[] is guaranteed entirely
+ * unused here - process_alloc() never populates it, and spawn() POSIX
+ * addopen running against a fork()'d tables that might already have entries. */
+ int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode){
+
+    if (!target || !path)
+        return -EMBK_EINVAL;
+    if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EINVAL;
+
+    int acc = flags & O_ACCMODE;
+    if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
+        return -EMBK_EINVAL;
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int err = vfs_resolve(path, &vn);
+    if (err == EMBK_OK) {
+        if ((flags & O_EXCL) && (flags & O_CREAT))
+            return -EMBK_EEXIST;
+    } else if (err == -EMBK_ENOENT && (flags & O_CREAT)) {
+        struct vnode parent;
+        const char *leaf;
+        size_t leaf_len;
+        err = fd_split_parent(path, &parent, &leaf, &leaf_len);
+        if (err)
+            return err;
+        if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->create)
+            return -EMBK_ENOSYS;
+
+        err = parent.mnt->ops->create(&parent, leaf, leaf_len, mode, &vn);
+        if (err)
+            return err;
+    } else {
+        return err;
+    }
+
+    struct fd_entry *e = &target->fds[target_fd - FD_BASE];
+    if (e->used)
+        return -EMBK_EBUSY;
+
+    if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
+        err = vn.mnt->ops->obj_get(vn.mnt, vn.ino);
+        if (err)
+            return err;
+    }
+
+    e->used = true;
+    e->vn = vn;
+    e->pos = 0;
+    e->flags = flags;
+
+    if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
+        struct vfs_stat st;
+        err = vn.mnt->ops->stat(&vn, &st);
+        if (err == EMBK_OK)
+            e->pos = st.size;
+    }
+
+    return EMBK_OK;
+ }
 
 int vfs_fd_run_selftests(void)
 {

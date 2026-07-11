@@ -1,8 +1,8 @@
-#include "partition.h"
-#include "block.h"
-#include "../include/kprintf.h"
-#include "../include/errno.h"
-#include "../include/kstring.h"
+#include "block/partition.h"
+#include "block/block.h"
+#include "include/kprintf.h"
+#include "include/errno.h"
+#include "include/kstring.h"
 
 #include <stdint.h>
 

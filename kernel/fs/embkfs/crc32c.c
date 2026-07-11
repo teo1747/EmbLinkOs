@@ -1,4 +1,4 @@
-#include "crc32c.h"
+#include "fs/embkfs/crc32c.h"
 
 /* Castagnoli polynomial in reflected form (low bit = highest-order term).
  * The reflected form is what makes the table loop shift RIGHT and test the

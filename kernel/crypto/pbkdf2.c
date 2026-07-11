@@ -1,8 +1,8 @@
-#include "pbkdf2.h"
-#include "hmac.h"
-#include "../include/types.h"
-#include "../include/kstring.h"
-#include "../include/kprintf.h"
+#include "crypto/pbkdf2.h"
+#include "crypto/hmac.h"
+#include "include/types.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
 
 void pbkdf2_hmac_sha256(const uint8_t *password, size_t password_len,
                          const uint8_t *salt, size_t salt_len,

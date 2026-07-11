@@ -1,14 +1,15 @@
-#include "process.h"
-#include "../mm/pmm.h"
-#include "../mm/vmm.h"
-#include "../include/kprintf.h"
-#include "../include/errno.h"
-#include "../include/kstring.h"
-#include "../cpu/elf.h"
-#include "../cpu/gdt.h"
-#include "../cpu/kcontext.h"
-#include "../cpu/lapic.h"
-#include "../cpu/spinlock.h"
+#include "process/process.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "include/kprintf.h"
+#include "include/errno.h"
+#include "include/kstring.h"
+#include "arch/x86_64/syscall/elf.h"
+#include "arch/x86_64/cpu/gdt.h"
+#include "arch/x86_64/cpu/kcontext.h"
+#include "arch/x86_64/irq/lapic.h"
+#include "arch/x86_64/cpu/spinlock.h"
+
 #include <stdint.h>
 
 #define USER_STACK_TOP 0x0000700000001000ULL  /* TOP of the user stack  page*/
@@ -180,6 +181,23 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->wait_next = NULL;
     t->wait_queue = NULL;
     t->exit_code = 0;
+    t->argc = 0;
+    t->argv_uva = 0;
+    t->has_argv = false; // true only if this thread has a valid argc/argv_uva (user-mode threads only)
+
+    /* Seed a valid default FXSAVE image: zeroed x87/XMM state (all zero is a
+     * legitimate empty state) but MXCSR = 0x1F80 (round-nearest, all
+     * exceptions masked, the hardware reset default) -- not just zeroed,
+     * which would leave every SIMD FP exception UNmasked and likely #XM the
+     * first time this thread does anything float-related. MXCSR sits at a
+     * fixed byte offset (24) in the FXSAVE layout regardless of 32/64-bit
+     * mode (only the FPU instruction/data-pointer fields near the start of
+     * the image vary between those). This thread's own kernel_ctx_switch
+     * FXRSTOR (schedule_locked(), on its first-ever dispatch) is what reads
+     * this buffer -- see struct thread::fpu_state's comment (process.h). */
+    memset(t->fpu_state, 0, sizeof(t->fpu_state));
+    *(uint32_t *)(t->fpu_state + 24) = 0x1F80;
+    *(uint16_t *)(t->fpu_state + 0) = 0x037F;
 
     /* FABRICATE the kernel context so the first schedule()-in lands the
      * thread at the trampoline, on its own kernel stack. This is the
@@ -187,7 +205,27 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->ctx.rbx = t->ctx.rbp = 0;
     t->ctx.r12 = t->ctx.r13 = t->ctx.r14 = t->ctx.r15 = 0;
     t->ctx.rip = ctx_rip;
-    t->ctx.rsp = kstack_top;
+    /* kstack_top - 8, not kstack_top: kernel_ctx_switch (kcontext.asm) enters
+     * a brand-new thread's trampoline (kthread_trampoline/process_trampoline,
+     * ctx_rip above) via a raw `jmp`, not a `call` -- there's no synthetic
+     * return address on the stack. kstack_top is page-aligned (0 mod 16,
+     * vmm_alloc_kernel_stack), but GCC compiles the trampoline as an
+     * ORDINARY C function, which always assumes the standard x86-64 SysV
+     * "entered via call" convention: RSP === 8 mod 16 at the function's own
+     * first instruction (as if a call just pushed an 8-byte return address).
+     * Left as kstack_top verbatim, every aligned-stack local variable
+     * anywhere in that thread's initial call chain -- not just in the
+     * trampoline itself, arbitrarily deep, e.g. a kthread's own locals --
+     * ends up 8 bytes off from where GCC assumed, and any aligned SSE
+     * store/load (movdqa, FXSAVE/FXRSTOR's implicit stack-neutral operands
+     * are fine, but a thread's OWN aligned locals are not) #GP's. Silent
+     * until now because nothing had ever used an aligned SSE instruction
+     * inside a kthread; the FPU/SSE selftest (process_test_fpu) is what
+     * first hit it. Sacrificing 8 bytes off the very top of a stack that
+     * never uses them (the trampoline's `ret` never executes -- both
+     * trampolines end in a noreturn call + __builtin_unreachable()) costs
+     * nothing and makes the real entry RSP match what GCC assumes. */
+    t->ctx.rsp = kstack_top - 8;
     /* IF=0 (0x002), NOT 1 (0x202), on purpose: kernel_ctx_switch's popfq
      * restores THIS rflags value into the LIVE flags register before
      * jumping to ctx.rip -- if IF were already 1 here, interrupts would go
@@ -816,7 +854,8 @@ void process_exit_self(int code) {
 }
 
 /* Create a new process from an ELF executable */
-int process_create(const char *path){
+int process_create(const char *path, char *const argv[], int argc,
+                   const struct spawn_file_action *actions, int n_count) {
     struct process *proc = process_alloc();
     if (!proc) {
         return -EMBK_ENOMEM;  // No free process slots
@@ -833,6 +872,18 @@ int process_create(const char *path){
     proc->child_list = NULL;
     proc->child_next = NULL;
     proc->exit_code = 0;
+    proc->heap_brk = USER_HEAP_VA_BASE;   // sbrk_(0) queries this before any real
+                                           // growth; must start at the heap's base,
+                                           // not 0 (which also fails process_sbrk()'s
+                                           // own USER_HEAP_VA_BASE bound check on the
+                                           // very first growth request)
+    proc->heap_mapped_top = USER_HEAP_VA_BASE;   // nothing mapped yet, but tracked
+                                                  // from the same base heap_brk starts
+                                                  // at (process_sbrk() only maps pages
+                                                  // between heap_mapped_top and the new
+                                                  // break, starting from 0 would try to
+                                                  // map/track the entire unused range
+                                                  // below the real heap)
     memset(proc->handles, 0, sizeof(proc->handles));
 
     /* Register ourselves on our parent's live-children list (ps tree view
@@ -861,6 +912,24 @@ int process_create(const char *path){
         return rc;  // ELF load failed
     }
 
+    /* 2.5. Apply file_actions -- give the child its fds before it ever runs.
+     * proc->fds[] is guaranteed empty here (see fd_open_into()'s comment),
+     * so there's nothing to close/overwrite first. */
+    for (int i = 0; i < n_count; i++) {
+        const struct spawn_file_action *act = &actions[i];
+        if(act->kind != SPAWN_ACTION_OPEN) {
+            vmm_destroy_address_space(pml4);
+            proc->pid = 0;
+            return -EMBK_EINVAL;  // Only SPAWN_ACTION_OPEN is supported
+        }
+        int fd = fd_open_into(proc, act->target_fd, act->path, act->flags, act->mode);
+        if (fd < 0) {
+            vmm_destroy_address_space(pml4);
+            proc->pid = 0;
+            return fd;  // fd_open_into failed
+        }
+    }
+
     // 3. Allocate a user stack page and map it into the process's address space
     uint64_t stack_phys = pmm_alloc_page();
     if (!stack_phys) {
@@ -871,16 +940,59 @@ int process_create(const char *path){
 
     vmm_map_in(pml4, USER_STACK_VA, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
 
+    // 3.5 Lay out argv on the child's stack, via the SAME direct-map trick
+    // elf_load already uses for PT_LOAD Segments: stack_phys is a raw physical
+    // page, writable through its P2V KELNEL alias regardless of whose cr3 is live
+    uint64_t child_kva = P2V(stack_phys);
+    uint64_t off = PAGE_SIZE;
+
+    uint64_t argv_child_uva[SPAWN_ARGV_MAX];
+    for (int i = 0; i < argc; i++) {
+        size_t slen = strlen(argv[i]) + 1;  // include null terminator
+        off -= slen;
+        memcpy((void *)(child_kva + off), argv[i], slen);
+        argv_child_uva[i] = USER_STACK_VA + off;                 // the child's stack VA
+                                                                 // not the kernel alias,
+                                                                 // we just wrote through
+    }
+
+    off &= ~0x7ULL;           // 8-align before the pointer array
+    off -= (argc + 1) * sizeof(uint64_t);  // space for the argv array + null terminator
+    uint64_t argv_array_child_uva = USER_STACK_VA + off;
+    uint64_t *argv_array_child_kva = (uint64_t *)(child_kva + off);
+    for (int i = 0; i < argc; i++) {
+        argv_array_child_kva[i] = argv_child_uva[i];
+    }
+    argv_array_child_kva[argc] = 0;  // null terminator
+
+    off &= ~0xFULL;            // 16-align before the initial RSP push
+
+    uint64_t child_user_rsp = USER_STACK_VA + off;
+
+
     // 4. Allocate the first (and, for this phase, only) thread: kernel
     // stack + fabricated ctx pointing at process_trampoline.
     struct thread *t = thread_alloc_for(proc, (uint64_t)(uintptr_t)process_trampoline,
-                                         entry_point, USER_STACK_TOP);
+                                         entry_point, child_user_rsp);
     if (!t) {
         pmm_free_page(stack_phys);
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_EIO;  // Failed to allocate kernel stack
     }
+
+    /* Wire the argv layout built above (steps 3.5) into the thread that
+     * process_trampoline() actually reads at entry -- thread_alloc_for()/
+     * thread_init_for() only ever zero-initialize has_argv/argc/argv_uva
+     * (see struct thread's declaration, process.h), so without this the
+     * argv data above is written to the child's stack and then silently
+     * never used: process_trampoline() takes its has_argv==false branch,
+     * loads rdi=0/leaves rsi untouched, and _start(argc, argv) receives
+     * argc=0 and a garbage argv regardless of what was actually passed to
+     * process_create(). */
+    t->has_argv = true;
+    t->argc = (uint64_t)argc;
+    t->argv_uva = argv_array_child_uva;
 
     t->state = PROCESS_READY;
     return (int)proc->pid;
@@ -918,10 +1030,32 @@ static void process_trampoline(void) {
      * process's own main thread (process_create() never sets user_arg), so
      * loading it unconditionally here is harmless for the common case --
      * see struct thread::user_arg's comment (process.h). */
-    uint64_t arg = current_thread->user_arg;
+    if (current_thread->has_argv) {
+       uint64_t argc = current_thread->argc;
+       uint64_t argv = current_thread->argv_uva;
 
-    /* Set up the user stack and jump to the entry point */
-    __asm__ volatile(
+       /* Set up the user stack and jump to the entry point */
+        __asm__ volatile(
+        "movq %4, %%rdi\n"      // arg -> rdi, BEFORE the pushes below (which
+                                 // must not themselves land in rdi -- see the
+                                 // "rdi" clobber forcing the compiler to pick
+                                 // other registers for the other operands)
+        "movq %5, %%rsi\n"       // argc -> rsi
+        "pushq %0\n"            // ss = user data | 3
+        "pushq %1\n"            // rsp = user stack top
+        "pushq $0x202\n"        // rflags = IF=1
+        "pushq %2\n"            // cs = user code | 3
+        "pushq %3\n"            // rip = entry point
+        "iretq\n"               // return to user mode
+        :
+        : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
+          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(argc), "r"(argv)
+        : "rdi", "memory"
+    );
+    } else {
+        uint64_t arg = current_thread->user_arg;
+        /* Set up the user stack and jump to the entry point */
+        __asm__ volatile(
         "movq %4, %%rdi\n"      // arg -> rdi, BEFORE the pushes below (which
                                  // must not themselves land in rdi -- see the
                                  // "rdi" clobber forcing the compiler to pick
@@ -934,10 +1068,60 @@ static void process_trampoline(void) {
         "iretq\n"               // return to user mode
         :
         : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry), "r"(arg)
+          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(arg)
         : "rdi", "memory"
-    );
+        );
+
+    }
+
+    
     __builtin_unreachable();  // Should never return
+}
+
+/* sys_sbrk's kernel side. Cortex-M-style, Matching newlib's _sbrk(ptrdiff_t
+ * increment) directly: ONE call, a relative increment, returns the OLD break (the
+ * newly available region starts there) or -1 -- not Linux's two-call brk(addr)
+ * No shrink-side unmappaing: heap_mapped_top only ever grows, same reasoning
+ * USER_THREAD_STACK_BASE already uses for its own never-unmapped
+ * per-thread stacks. */
+int64_t process_sbrk(struct process *proc, int64_t increment){
+    uint64_t old_brk = proc->heap_brk;
+    uint64_t new_brk = old_brk + (uint64_t)increment;
+
+    if (increment == 0) {
+        return (int64_t)old_brk;  // pure query -- malloc() does this first
+    
+    }
+
+    if (increment > 0 && new_brk < old_brk) {
+        return -EMBK_EOVERFLOW;  // increment overflowed new_brk
+    }
+
+    if (new_brk < USER_HEAP_VA_BASE || new_brk > USER_HEAP_VA_MAX) {
+        return -EMBK_ENOMEM;  // out of bounds -- no more heap to give (matches
+                               // newlib's own _sbrk()/POSIX brk() convention:
+                               // failure means ENOMEM, not EINVAL)
+    }
+
+    if (new_brk > proc->heap_mapped_top) {
+        uint64_t map_to = (new_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);  // round up to page boundary
+        // Map new pages from heap_mapped_top to map_to
+        for (uint64_t addr = proc->heap_mapped_top; addr < map_to; addr += PAGE_SIZE) {
+            uint64_t phys_page = pmm_alloc_page();
+            if (!phys_page) {
+                proc->heap_mapped_top = addr;  // update to the last successfully mapped page
+                return -EMBK_ENOMEM;  // physical memory exhausted
+            }
+            vmm_map_in(proc->pml4_phys, addr, phys_page, VMM_WRITABLE | VMM_USER);
+
+        }
+        proc->heap_mapped_top = map_to;
+    }
+    
+    // Shrinking: just move heap_brk down; heap_mapped_top remains as is (pages are not unmapped)
+    proc->heap_brk = new_brk;
+    return (int64_t)old_brk;
+
 }
 
 /* The kthread equivalent of process_trampoline() above -- same reason it
@@ -1278,7 +1462,8 @@ static void schedule_locked(void) {
     vmm_switch_address_space(next->proc->pml4_phys);
     tss_set_rsp0(next->kstack_top);
 
-    kernel_ctx_switch(&prev->ctx, &current_thread->ctx);
+    kernel_ctx_switch(&prev->ctx, &current_thread->ctx,
+                       prev->fpu_state, current_thread->fpu_state);
     /* Resumed here (possibly much later, on a completely different
      * occasion, possibly a different core) with IF restored by whichever
      * mechanism actually applies to this resumption (kernel_ctx_switch
@@ -1728,6 +1913,90 @@ int process_test_roundrobin(void) {
 
     g_rr_stop = true;
     selftest_wait_ticks(8);   // let all three notice the flag, exit, and get reaped
+
+    selftest_release_self(self, did_adopt);
+    return ok ? 0 : -1;
+}
+
+/* --------------------------------------------------------------------
+ * FPU/SSE context-switch selftest: proves kernel_ctx_switch's FXSAVE/
+ * FXRSTOR (kcontext.asm) genuinely isolates one thread's XMM register
+ * state from every other thread's, not just its GP registers -- the same
+ * "no explicit yield, pure preemptive interleaving via the timer" shape
+ * process_test_roundrobin() above uses, since a bug here would only ever
+ * show up across a REAL preemption landing between one thread's xmm0
+ * write and its own later read-back.
+ * -------------------------------------------------------------------- */
+
+#define FPU_TEST_TICKS 40   // long enough to guarantee several preemptions
+                            // land between the two kthreads' load/check pairs
+
+static volatile uint64_t g_fpu_a_iters, g_fpu_b_iters;
+static volatile bool     g_fpu_a_corrupt, g_fpu_b_corrupt;
+static volatile bool     g_fpu_stop;
+
+/* Distinct 16-byte patterns each kthread loads into xmm0 and expects to read
+ * back byte-for-byte, however many context switches happen to land while
+ * it's sitting there. aligned(16): movdqa #GP's on an unaligned operand. */
+static const uint8_t g_fpu_pattern_a[16] __attribute__((aligned(16))) = {
+    0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA
+};
+static const uint8_t g_fpu_pattern_b[16] __attribute__((aligned(16))) = {
+    0xBB,0xBB,0xBB,0xBB, 0xBB,0xBB,0xBB,0xBB, 0xBB,0xBB,0xBB,0xBB, 0xBB,0xBB,0xBB,0xBB
+};
+
+static void fpu_kthread_body(const uint8_t *pattern, volatile uint64_t *iters,
+                              volatile bool *corrupt) {
+    uint8_t observed[16] __attribute__((aligned(16)));
+    while (!g_fpu_stop) {
+        __asm__ volatile ("movdqa (%0), %%xmm0" :: "r"(pattern) : "memory");
+
+        /* Deliberately plain C work here, no asm -- gives the timer plenty
+         * of chances to preempt with xmm0 "in flight", which is exactly the
+         * window kernel_ctx_switch has to get right. */
+        (*iters)++;
+
+        __asm__ volatile ("movdqa %%xmm0, (%0)" :: "r"(observed) : "memory");
+
+        for (int i = 0; i < 16; i++) {
+            if (observed[i] != pattern[i]) {
+                *corrupt = true;
+                break;
+            }
+        }
+    }
+    process_exit_self(0);
+}
+
+static void fpu_kthread_a(void) { fpu_kthread_body(g_fpu_pattern_a, &g_fpu_a_iters, &g_fpu_a_corrupt); }
+static void fpu_kthread_b(void) { fpu_kthread_body(g_fpu_pattern_b, &g_fpu_b_iters, &g_fpu_b_corrupt); }
+
+int process_test_fpu(void) {
+    bool did_adopt;
+    struct thread *self = selftest_acquire_self(&did_adopt);
+    if (!self) {
+        return -1;
+    }
+
+    g_fpu_a_iters = g_fpu_b_iters = 0;
+    g_fpu_a_corrupt = g_fpu_b_corrupt = false;
+    g_fpu_stop = false;
+
+    struct thread *ta = process_create_kthread(fpu_kthread_a, NULL);
+    struct thread *tb = process_create_kthread(fpu_kthread_b, NULL);
+    bool ok = (ta != NULL && tb != NULL);
+
+    if (ok) {
+        selftest_wait_ticks(FPU_TEST_TICKS);
+        kprintf("process_test_fpu: iters a=%llu b=%llu corrupt_a=%d corrupt_b=%d\n",
+                (unsigned long long)g_fpu_a_iters, (unsigned long long)g_fpu_b_iters,
+                (int)g_fpu_a_corrupt, (int)g_fpu_b_corrupt);
+        ok = (g_fpu_a_iters > 0) && (g_fpu_b_iters > 0)
+             && !g_fpu_a_corrupt && !g_fpu_b_corrupt;
+    }
+
+    g_fpu_stop = true;
+    selftest_wait_ticks(8);   // let both notice the flag, exit, and get reaped
 
     selftest_release_self(self, did_adopt);
     return ok ? 0 : -1;
@@ -2294,7 +2563,24 @@ int process_test_thread_smp(void) {
     return ok ? 0 : -1;
 }
 
-static void thread_exit_entry_a(void) { process_exit_self(0); }   // exits almost immediately
+/* A is gated on g_thread_exit_a_go, NOT free-running, to close a real SMP
+ * use-after-free in the SETUP window below: process_create_kthread() marks A
+ * READY before it returns, so on a multi-core machine another core's timer
+ * can dispatch A and run it to completion BEFORE this test's own next line
+ * (thread_create(ta->proc, ...)) executes. A is parentless and, at that
+ * instant, its process's only thread -- so A exiting drops live_thread_count
+ * 1->0 and AUTO-REAPS the whole process (process_exit_self -> ... ->
+ * process_reap_slot memsets the PCB, frees the slot). thread_create() would
+ * then be adding B to a freed/recycled `ta->proc`. Gating A so it can't exit
+ * until AFTER B is created makes A's exit a guaranteed 2->1 transition, never
+ * 1->0, which is the exact scenario this test means to exercise. (Latent
+ * since this test was written; the FXSAVE/FXRSTOR added to every context
+ * switch just widened the window enough to hit it regularly.) */
+static volatile bool g_thread_exit_a_go;
+static void thread_exit_entry_a(void) {
+    while (!g_thread_exit_a_go) { __asm__ volatile ("pause"); }
+    process_exit_self(0);
+}
 static volatile bool g_thread_exit_b_stop;
 static void thread_exit_entry_b(void) {
     while (!g_thread_exit_b_stop) { __asm__ volatile ("pause"); }
@@ -2314,6 +2600,8 @@ int process_test_thread_exit(void) {
         return -1;
     }
 
+    g_thread_exit_a_go = false;    // A stays parked until B exists (see the
+                                    // entry functions' comment above)
     g_thread_exit_b_stop = false;
 
     struct thread *ta = process_create_kthread(thread_exit_entry_a, NULL);
@@ -2329,6 +2617,11 @@ int process_test_thread_exit(void) {
     if (ok) {
         pid = ta->proc->pid;
         pml4 = ta->proc->pml4_phys;
+
+        /* B now exists, so it's finally safe to let A exit: its exit is a
+         * 2->1 live_thread_count transition, leaving the process (and B)
+         * alive -- exactly what the still_alive check below asserts. */
+        g_thread_exit_a_go = true;
 
         selftest_wait_ticks(10);   // let A exit and get reaped; B keeps spinning
 
@@ -2355,7 +2648,12 @@ int process_test_thread_exit(void) {
         kprintf("process_test_thread_exit: after B's exit, process reaped=%d\n", (int)reaped);
         ok = reaped;
     } else {
-        g_thread_exit_b_stop = true;   // safety net
+        /* Safety net for every early-failure path: release BOTH gated
+         * threads so neither spins forever. a_go especially matters when B's
+         * creation failed but A exists (ta != NULL, tb == NULL) -- A would
+         * otherwise park on g_thread_exit_a_go for the life of the kernel. */
+        g_thread_exit_a_go = true;
+        g_thread_exit_b_stop = true;
     }
     (void)pml4;
 
