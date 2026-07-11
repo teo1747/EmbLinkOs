@@ -112,7 +112,11 @@
       "Bash(timeout 90 python3 /tmp/claude-1000/-home-motsou-myos/4b746f41-6725-4167-a536-c66079e2827c/scratchpad/run_tests.py \"test smp sched\" \"test thread smp\" \"test sched wait\")",
       "Bash(git add *)",
       "Bash(awk '{print $1}')",
-      "Bash(git status *)"
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(xargs -I{} echo \"commits after it on HEAD path: {}\")",
+      "Bash(git stash *)",
+      "Bash(git ls-tree *)"
     ],
     "additionalDirectories": [
       "/usr/local/cross/x86_64-elf/include/sys"
