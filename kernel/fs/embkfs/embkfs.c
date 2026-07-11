@@ -1,18 +1,18 @@
-#include "embkfs.h"
-#include "crc32c.h"
-#include "../../block/block.h"
-#include "../../include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
-#include "../../include/kprintf.h"
-#include "../../include/errno.h"
-#include "../../include/kstring.h"   /* memcmp, strlen */
-#include "../../drivers/rtc.h"       /* rtc_now_ns — real inode timestamps (v2.2) */
-#include "../../drivers/pit.h"       /* pit_delay_ms — selftest RTC-resolution wait */
-#include "embkfs_compress.h"         /* per-extent compression (v2.2 Phase 3) */
-#include "../../crypto/xts.h"        /* AES-256-XTS (v2.2 Phase 4) */
-#include "../../crypto/pbkdf2.h"     /* passphrase KDF (v2.2 Phase 4) */
-#include "../../crypto/hmac.h"       /* HMAC-SHA256 (v2.2 Phase 5d verified-root) */
-#include "../../drivers/keyboard.h"  /* keyboard_getchar — mount-time passphrase prompt */
-#include "../../process/process.h"   /* current_process->pid — writer provenance (v2.2 Phase 5c) */
+#include "fs/embkfs/embkfs.h"
+#include "fs/embkfs/crc32c.h"
+#include "block/block.h"
+#include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
+#include "include/kprintf.h"
+#include "include/errno.h"
+#include "include/kstring.h"   /* memcmp, strlen */
+#include "drivers/timer/rtc.h"       /* rtc_now_ns — real inode timestamps (v2.2) */
+#include "drivers/timer/pit.h"       /* pit_delay_ms — selftest RTC-resolution wait */
+#include "fs/embkfs/embkfs_compress.h"         /* per-extent compression (v2.2 Phase 3) */
+#include "crypto/xts.h"        /* AES-256-XTS (v2.2 Phase 4) */
+#include "crypto/pbkdf2.h"     /* passphrase KDF (v2.2 Phase 4) */
+#include "crypto/hmac.h"       /* HMAC-SHA256 (v2.2 Phase 5d verified-root) */
+#include "drivers/input/keyboard.h"  /* keyboard_getchar — mount-time passphrase prompt */
+#include "process/process.h"   /* current_process->pid — writer provenance (v2.2 Phase 5c) */
 
 _Static_assert(sizeof(struct aes_xts_ctx) <= sizeof(((struct embkfs_volume *)0)->xts_opaque),
                "embkfs_volume.xts_opaque too small for struct aes_xts_ctx");

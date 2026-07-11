@@ -1,7 +1,7 @@
-#include "acpi.h"
-#include "../drivers/serial.h"
-#include "../mm/pmm.h"
-#include "../include/kprintf.h"
+#include "acpi/acpi.h"
+#include "drivers/char/serial.h"
+#include "mm/pmm.h"
+#include "include/kprintf.h"
 #include <stdint.h>
 
 

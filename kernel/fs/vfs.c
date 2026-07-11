@@ -10,10 +10,10 @@
  * way the block layer records a driver as sda/sdb. The VFS borrows fs_data;
  * it never owns or frees it. */
 
-#include "vfs.h"
-#include "../include/errno.h"
-#include "../include/kstring.h"   /* strlen, strcmp, memcpy */
-#include "../include/kprintf.h"
+#include "fs/vfs.h"
+#include "include/errno.h"
+#include "include/kstring.h"   /* strlen, strcmp, memcpy */
+#include "include/kprintf.h"
 
 /* v1 keeps a tiny, fixed table. It MUST be static storage: vfs_mount wires
  * each mount's root vnode to point back at its own slot (root.mnt = &slot),

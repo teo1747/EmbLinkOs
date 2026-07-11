@@ -1,7 +1,7 @@
-#include "pmm.h"
-#include "../drivers/serial.h"
-#include "../cpu/smp.h"
-#include "../cpu/spinlock.h"
+#include "mm/pmm.h"
+#include "drivers/char/serial.h"
+#include "arch/x86_64/smp/smp.h"
+#include "arch/x86_64/cpu/spinlock.h"
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't

@@ -1,7 +1,7 @@
-#include "embkfs_compress.h"
-#include "../../include/kstring.h"
-#include "../../include/kprintf.h"
-#include "../../include/kmalloc.h"
+#include "fs/embkfs/embkfs_compress.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
+#include "include/kmalloc.h"
 
 #define EMBKZ_MINMATCH    4u
 #define EMBKZ_HASH_BITS   14

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "aes.h"
+#include "crypto/aes.h"
 
 /*
  * AES-256-XTS (IEEE P1619 / NIST SP 800-38E), built on aes.h.

@@ -1,7 +1,7 @@
-#include "xts.h"
-#include "../include/types.h"
-#include "../include/kstring.h"
-#include "../include/kprintf.h"
+#include "crypto/xts.h"
+#include "include/types.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
 
 void aes_xts_init(struct aes_xts_ctx *ctx,
                    const uint8_t data_key[AES256_KEY_SIZE],

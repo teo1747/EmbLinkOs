@@ -1,10 +1,10 @@
-#include "fat32.h"
-#include "vfs.h"
-#include "../include/ctype.h"
-#include "../include/errno.h"
-#include "../include/kprintf.h"
-#include "../include/kstring.h"
-#include "../mm/kheap.h"
+#include "fs/fat32.h"
+#include "fs/vfs.h"
+#include "include/ctype.h"
+#include "include/errno.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
+#include "mm/kheap.h"
 
 #include <stdint.h>
 
