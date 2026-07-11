@@ -475,7 +475,7 @@ def make_encrypted_image(path: str, passphrase: bytes, size_bytes: int = 1024 * 
         f.write(img)
 
     print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs}) -- ENCRYPTED")
-    print(f"  passphrase        : {passphrase.decode()!r}  (TEST FIXTURE ONLY -- never a real credential)")
+    print(f"  passphrase        : <redacted> ({len(passphrase)} bytes)")
     print(f"  kdf_iterations    : {iterations}")
     print(f"  file data (cipher): blocks {DATA_BLOCK}..{DATA_BLOCK + nblocks - 1}  "
           f"(\"secret.txt\", {len(plaintext)} logical bytes, {nblocks} block(s), "
