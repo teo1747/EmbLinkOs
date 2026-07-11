@@ -1,10 +1,10 @@
-#include "block.h"
-#include "../include/kprintf.h"
-#include "../include/errno.h"
-#include "../include/kstring.h"
-#include "../drivers/serial.h"
-#include "../include/kstring.h"   // for memcpy
-#include "../mm/pmm.h"            // for KV2P, KERNEL_VIRTUAL_BASE
+#include "block/block.h"
+#include "include/kprintf.h"
+#include "include/errno.h"
+#include "include/kstring.h"
+#include "drivers/char/serial.h"
+#include "include/kstring.h"   // for memcpy
+#include "mm/pmm.h"            // for KV2P, KERNEL_VIRTUAL_BASE
 
 #include <stdint.h>
 

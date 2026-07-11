@@ -8,8 +8,8 @@
  * standard libc-style contracts (NULL handling, overflow checks).
  */
 
-#include "../include/kmalloc.h"
-#include "kheap.h"
+#include "include/kmalloc.h"
+#include "mm/kheap.h"
 
 void *kmalloc(uint64_t size) {
     // A zero-byte request returns NULL; the engine treats 0 as "no alloc".

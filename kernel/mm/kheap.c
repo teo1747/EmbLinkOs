@@ -1,9 +1,9 @@
-#include "kheap.h"
-#include "../cpu/spinlock.h"
-#include "pmm.h"
-#include "vmm.h"
-#include "../include/kprintf.h"
-#include "../drivers/serial.h"
+#include "mm/kheap.h"
+#include "arch/x86_64/cpu/spinlock.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "include/kprintf.h"
+#include "drivers/char/serial.h"
 #include <stdint.h>
 
 

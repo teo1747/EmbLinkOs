@@ -1,7 +1,7 @@
 #ifndef _PARTITION_H_
 #define _PARTITION_H_
 
-#include "block.h"
+#include "block/block.h"
 
 // Partition support: an MBR (DOS) partition table parser that exposes each
 // primary partition as its own block device. A partition device delegates

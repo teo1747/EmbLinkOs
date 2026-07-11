@@ -1,7 +1,7 @@
 #ifndef _VFS_H
 #define _VFS_H
 
-#include "../include/types.h"     /* bool, size_t, NULL */
+#include "include/types.h"     /* bool, size_t, NULL */
 #include <stdint.h>
 
 /* =====================================================================

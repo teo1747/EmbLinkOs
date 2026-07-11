@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "sha256.h"
+#include "crypto/sha256.h"
 
 /* HMAC-SHA256 (RFC 2104 construction over SHA-256). Used directly by the
  * verified-root boot check (Phase 5d) and as the PRF underneath

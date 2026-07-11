@@ -5,29 +5,30 @@
 #include "include/errno.h"
 #include "include/kstring.h"
 
-#include "drivers/serial.h"
-#include "drivers/framebuffer.h"
-#include "drivers/gpu.h"
-#include "drivers/console.h"
-#include "drivers/keyboard.h"
-#include "drivers/timer.h"
-#include "drivers/hpet.h"
-#include "drivers/rtc.h"
-#include "drivers/pci.h"
-#include "drivers/usb.h"
-#include "drivers/ata.h"
-#include "drivers/ahci.h"
-#include "drivers/bootanim.h"
+#include "drivers/char/serial.h"
+#include "drivers/video/framebuffer.h"
+#include "drivers/video/gpu.h"
+#include "drivers/video/console.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/timer/timer.h"
+#include "drivers/timer/hpet.h"
+#include "drivers/timer/rtc.h"
+#include "drivers/bus/pci.h"
+#include "drivers/usb/usb.h"
+#include "drivers/storage/ata.h"
+#include "drivers/storage/ahci.h"
+#include "drivers/video/bootanim.h"
 
-#include "cpu/gdt.h"
-#include "cpu/percpu.h"
-#include "cpu/smp.h"
-#include "cpu/idt.h"
-#include "cpu/syscall.h"
-#include "cpu/pic.h"
-#include "cpu/irq.h"
-#include "cpu/lapic.h"
-#include "cpu/ioapic.h"
+#include "arch/x86_64/cpu/gdt.h"
+#include "arch/x86_64/cpu/percpu.h"
+#include "arch/x86_64/smp/smp.h"
+#include "arch/x86_64/irq/idt.h"
+#include "arch/x86_64/syscall/syscall.h"
+#include "arch/x86_64/irq/pic.h"
+#include "arch/x86_64/irq/irq.h"
+#include "arch/x86_64/irq/lapic.h"
+#include "arch/x86_64/irq/ioapic.h"
+#include "arch/x86_64/cpu/fpu.h"
 
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -116,7 +117,8 @@ static bool shell_handle_process_command(const char *cmd)
             kprintf("\n[run] usage: run <path>\n");
             return true;
         }
-        int pid = process_create(arg);
+        char *argv[] = { (char *)arg, NULL };
+        int pid = process_create(arg, argv, 1, NULL, 0);
         if (pid < 0) {
             kprintf("\n[run] failed to start %s: %s\n", arg, embk_strerror(pid));
         } else {
@@ -311,6 +313,10 @@ void kernel_main(void) {
     syscall_init();   // install int 0x80 (DPL3) + #DF on IST1; needs idt_init first
     pic_init();
     irq_install();
+    fpu_init_this_cpu();   // CR0/CR4 are per-core -- every AP repeats this in
+                            // ap_main() (smp.c). Must land before this core's
+                            // first kernel_ctx_switch() ever runs an FXSAVE/
+                            // FXRSTOR (process.c's schedule_locked()).
 
     // --- Memory ---
     pmm_init();

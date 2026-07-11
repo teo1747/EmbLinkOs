@@ -6,13 +6,13 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
-#include "cpu/rwlock.h"
-#include "drivers/rtc.h"
-#include "cpu/usermode.h"
+#include "arch/x86_64/cpu/rwlock.h"
+#include "drivers/timer/rtc.h"
+#include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
-#include "drivers/usb.h"
-#include "drivers/framebuffer.h"
-#include "cpu/percpu.h"
+#include "drivers/usb/usb.h"
+#include "drivers/video/framebuffer.h"
+#include "arch/x86_64/cpu/percpu.h"
 #include "crypto/sha256.h"
 #include "crypto/hmac.h"
 #include "crypto/pbkdf2.h"
@@ -277,6 +277,7 @@ static void selftests_print_commands(void)
     kprintf("  test ring3\n");
     kprintf("  test ring3 threads\n");
     kprintf("  test sched roundrobin\n");
+    kprintf("  test fpu\n");
     kprintf("  test sched kill\n");
     kprintf("  test sched reap\n");
     kprintf("  test sched stackguard\n");
@@ -513,22 +514,26 @@ int selftests_handle_command(const char *cmd)
         // exercising sys_thread_create/sys_thread_join genuinely needs a
         // scheduled `struct process`/`struct thread` pair (thread_join()
         // blocks via the scheduler), which enter_user_mode()'s standalone
-        // launch doesn't create at all. /init.elf spawns a second thread of
-        // itself, proves it shares this process's .data/.bss with the main
-        // thread, and exits with a code that only comes out right if every
-        // step (thread_create/thread_join/the shared-memory check) worked
-        // (see user/init.c). Needs a real filesystem with /init.elf on it
-        // (e.g. `make run-embkfs`) -- unlike "test ring3", there's no
-        // embedded fallback blob.
+        // launch doesn't create at all. Run at the top level (argc==1),
+        // /init.elf runs the full EmbLink native-primitive suite -- a second
+        // thread (create/join + shared-memory proof), a spawn() with argv +
+        // file-actions, and an sbrk() heap exercise -- and exits 16 iff ALL
+        // of them passed (see user/init.c, built on the EmbLink SDK
+        // user/embk.h). 16 is a fixed success sentinel, not a computed value.
+        // Needs a real filesystem with /init.elf on it (e.g. `make
+        // run-embkfs`) -- unlike "test ring3", there's no embedded fallback
+        // blob.
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test ring3 threads: VFS not registered (need /init.elf on disk)\n");
             return 1;
         }
-        int pid = process_create("/init.elf");
+        char *argv[] = { "/init.elf", NULL };
+        int pid = process_create("/init.elf", argv, 1, NULL, 0);
         if (pid < 0) {
             kprintf("\n[cmd] test ring3 threads: process_create failed: %s\n", embk_strerror(pid));
             return 1;
         }
+
         int code = process_wait((uint32_t)pid);
         kprintf("\n[cmd] test ring3 threads: /init.elf exited with code %d (want 16): %s\n",
                 code, code == 16 ? "OK" : "FAIL");
@@ -542,6 +547,12 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test sched roundrobin") == 0) {
         int rc = process_test_roundrobin();
         kprintf("\n[cmd] test sched roundrobin: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test fpu") == 0) {
+        int rc = process_test_fpu();
+        kprintf("\n[cmd] test fpu: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 

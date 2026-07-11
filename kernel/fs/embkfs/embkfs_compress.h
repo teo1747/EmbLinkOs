@@ -2,7 +2,7 @@
 #define _EMBKFS_COMPRESS_H
 
 #include <stdint.h>
-#include "../../include/types.h"
+#include "include/types.h"
 
 /*
  * A small, self-contained LZ77-family compressor for EMBKFS v2's per-extent

@@ -1,7 +1,7 @@
-#include "hmac.h"
-#include "../include/types.h"
-#include "../include/kstring.h"
-#include "../include/kprintf.h"
+#include "crypto/hmac.h"
+#include "include/types.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
 
 void hmac_sha256(const uint8_t *key, size_t key_len,
                   const uint8_t *msg, size_t msg_len,

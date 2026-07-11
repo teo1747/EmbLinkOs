@@ -1,7 +1,7 @@
-#include "aes.h"
-#include "../include/types.h"
-#include "../include/kstring.h"
-#include "../include/kprintf.h"
+#include "crypto/aes.h"
+#include "include/types.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
 
 /* S-box and its inverse, generated from first principles (GF(2^8)
  * multiplicative inverse + the standard affine transform, modulus

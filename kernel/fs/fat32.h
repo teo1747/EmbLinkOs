@@ -2,8 +2,8 @@
 #define __FAST32_H__
 
 
-#include "../include/types.h"
-#include "../block/block.h"
+#include "include/types.h"
+#include "block/block.h"
 
 #include <stdint.h>
 

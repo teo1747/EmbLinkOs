@@ -3,7 +3,7 @@
 
 
 #include <stdint.h>
-#include "../include/types.h"
+#include "include/types.h"
 
 
 #define BLOCK_NAME_LEN    16 // Max length of a block device name (including null terminator)

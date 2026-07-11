@@ -2,10 +2,11 @@
 #define __PROCESS_H__
 
 #include <stdint.h>
-#include "../include/types.h"
-#include "../cpu/kcontext.h"
-#include "../cpu/percpu.h"
-#include "../fs/fd.h"
+#include "include/types.h"
+#include "arch/x86_64/cpu/kcontext.h"
+#include "arch/x86_64/cpu/percpu.h"
+#include "fs/fd.h"
+#include "process/spawn.h"
 
 /* Raised from 16/16 once ring-3 processes could genuinely have more than one
  * thread each (Phase 5, below) — 16 was sized for "one process, one thread"
@@ -28,6 +29,13 @@
  * explicitly now so the two constants can never drift against each other
  * again. */
 #define KSTACK_SIZE (16 * 1024)             // 16 KiB per thread's kernel stack
+
+/* Same "big slot" VA scheme as USER_CODE_VA (0x400000000000)/USER_STACK_VA
+ * (0x700000000000) in process.c -- slot 6, between code and stack. Was
+ * missing four hex digits (0x60000000, a tiny low address) before, which
+ * also broke USER_HEAP_VA_MAX's bound check for every real sbrk() call. */
+#define USER_HEAP_VA_BASE 0x0000600000000000ULL
+#define USER_HEAP_VA_MAX  (USER_HEAP_VA_BASE + 0x40000000ULL)   // 1 GiB of user heap space
 
 enum process_state {
     PROCESS_UNUSED = 0,      /**< Process slot is unused */
@@ -99,6 +107,19 @@ struct wait_queue {
  * process's pid reads it via `proc->pid`. */
 struct thread {
     struct kcontext ctx;       /**< Saved kernel context for this thread */
+
+    /* x87 FPU + MXCSR + XMM0-15 state (the FXSAVE/FXRSTOR image, kernel/cpu/
+     * kcontext.asm's kernel_ctx_switch), saved/restored around every context
+     * switch alongside `ctx` above -- eager, unconditional, every thread
+     * (kthread or ring-3), same simplicity tradeoff the GP-register save
+     * already makes. The `aligned(16)` is load-bearing, not decorative:
+     * FXSAVE/FXRSTOR #GP fault on an unaligned operand. thread_init_for()
+     * (process.c) seeds this with a valid default state (zeroed + MXCSR =
+     * 0x1F80, all exceptions masked) for every freshly created thread --
+     * without that, a brand-new thread's first-ever FXRSTOR would load an
+     * all-zero MXCSR (every exception UNmasked) and likely #XM on its very
+     * first floating-point op. */
+    unsigned char fpu_state[512] __attribute__((aligned(16)));
     uint64_t kstack_top;       /**< Virtual address of the top of this thread's kernel stack */
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */
@@ -194,6 +215,10 @@ struct thread {
      * (neither passes one), so loading it unconditionally in the
      * trampoline is harmless for them. */
     uint64_t user_arg;
+
+    uint64_t argc;          /* number of argv[] entries (user-mode threads only) */
+    uint64_t argv_uva;          /* pointer to argv[] array (user-mode threads only) */
+    bool has_argv;          /* true if this thread has a valid argc/argv_uva (user-mode threads only) */
 };
 
 /* The resource owner: address space, pid, parent/child tracking, fd/handle
@@ -303,6 +328,15 @@ struct process {
      * sys_spawn returns, what sys_wait/sys_kill take) to the real pid --
      * see PROC_HANDLE_MAX's comment above. */
     struct proc_handle handles[PROC_HANDLE_MAX];
+
+    /* current break pointer for this process's heap (user-mode threads only) 
+     * grows/shrinks as the process allocates/frees heap memory. via sys_brk(). */
+    uint64_t heap_brk;  
+
+    /* The highest virtual address mapped in the process's heap region (user-mode threads only) 
+     * used to track the top of the heap and ensure that the process does not exceed its allocated heap space. */
+    uint64_t heap_mapped_top;
+
 };
 
 
@@ -315,12 +349,28 @@ struct process {
 void process_init(void);
 
 /**
+ * @brief Change the end of the data segment (heap) for a process.
+ *
+ * @param proc The process whose heap is to be adjusted.
+ * @param increment The amount by which to change the heap size.
+ * @return int64_t The previous end of the heap on success, or a negative -EMBK_* code on failure.
+ */
+int64_t process_sbrk(struct process *proc, int64_t increment);
+
+/**
  * @brief Create a new process.
  *
  * @param path The path to the executable for the new process.
- * @return int The PID of the newly created process, or -1 on failure.
+ * @param argv argv[0..argc). Copied into the child's own stack before this
+ *             returns, so the caller's storage need not outlive the call.
+ * @param argc Number of entries in argv (NOT counting a NULL terminator --
+ *             process_create() appends that itself; see SPAWN_ARGV_MAX's
+ *             comment in spawn.h for the "+1 for the terminator" budget).
+ * @return int The PID of the newly created process, or a negative -EMBK_*
+ *             code on failure.
  */
-int process_create(const char *path);
+int process_create(const char *path, char *const argv[], int argc,
+                                 const struct spawn_file_action *actions, int n_count);
 
 /**
  * @brief Switch to the next ready thread in the scheduler.
@@ -503,6 +553,7 @@ struct thread *process_create_idle_for_cpu(uint32_t cpu_index);
  * @{
  */
 int process_test_roundrobin(void);
+int process_test_fpu(void);
 int process_test_kill(void);
 int process_test_reap(void);
 int process_test_stackguard(void);

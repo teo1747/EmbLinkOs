@@ -1,7 +1,7 @@
-#include "sha256.h"
-#include "../include/types.h"
-#include "../include/kstring.h"
-#include "../include/kprintf.h"
+#include "crypto/sha256.h"
+#include "include/types.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
 
 /* FIPS 180-4 round constants: the fractional parts of the cube roots of the
  * first 64 primes. Extremely standard, but errors here are invisible until
