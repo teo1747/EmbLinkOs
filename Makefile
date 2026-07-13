@@ -76,6 +76,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/pit.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
+             kernel/drivers/input/mouse.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
@@ -103,6 +104,12 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
+             kernel/fs/epfs.c \
+             kernel/ipc/handle.c \
+             kernel/ipc/channel.c \
+             kernel/ipc/endpoint.c \
+             kernel/gfx/surface.c \
+             kernel/gfx/compositor.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
              kernel/lib/kprintf.c
@@ -111,6 +118,16 @@ LINKER      = kernel/linker.ld
 STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
+# Stripped copy that actually goes into the boot image. The full kernel.elf
+# carries ~490 KB of .debug_*/.symtab that stage2's real-mode loader would
+# otherwise stream into 0x10000.. -- past 0xA0000 (video RAM) at sector 1152
+# and into the VGA option-ROM window at sector 1408, where int 0x13 writes
+# fail (-> disk_error hang) or scribble the VESA framebuffer vbe_init just set.
+# strip removes the non-allocated sections; PT_LOAD offsets and e_entry are
+# untouched, so load_elf still parses it identically. Keep kernel.elf (with
+# symbols) for gdb. See boot ceiling note in memory.
+STRIP       = x86_64-elf-strip
+KERNEL_BIN  = kernel/kernel.strip.elf
 
 
 # ---- Userland ---------------------------------------------------------------
@@ -154,6 +171,14 @@ NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLI
 # rebuilt libc.a wins over the stock one.
 NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
 
+# Dynamic-link flags (Phase 2): an ET_EXEC app that imports the toolkit from
+# libembk.so. No -static / no -T (default script emits the dynamic sections).
+# libembk.so must appear on the link line BEFORE -lc -lm (so ld pulls the libc
+# fns the .so needs INTO the app; --export-dynamic re-exports them to the .so);
+# --no-dynamic-linker: the kernel is the loader; --hash-style=sysv: DT_HASH.
+NEWLIB_DYN_LDFLAGS = -nostartfiles -no-pie $(NEWLIB_LIB)
+NEWLIB_DYN_WL      = -Wl,--export-dynamic -Wl,--no-dynamic-linker -Wl,--hash-style=sysv
+
 build/crt0.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
@@ -165,6 +190,148 @@ build/hello.o: user/bin/hello.c user/lib/embk.h | $(BUILD)
 
 build/hello.elf: build/crt0.o build/syscalls.o build/hello.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/hello.o -lc -lgcc -o $@
+
+# --- uidemo.elf: the EmbLink UI toolkit running live in ring-3 -----------------
+# The ui/ toolkit (host-tested pure userland C) built for the OS: newlib libc +
+# libm + malloc, SSE on. It creates a surface, renders the settings card with
+# the CPU backend + TrueType rasteriser, and presents it (sys_ui_present).
+UIDEMO_UISRC = ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
+               ui/backend/scene_render.c ui/layout/layout.c ui/reactive/reactive.c \
+               ui/declare/declare.c ui/theme/theme.c ui/kit/kit.c
+UIDEMO_UIOBJ = $(patsubst ui/%.c,$(BUILD)/uiobj_%.o,$(subst /,_,$(UIDEMO_UISRC)))
+UIDEMO_INC   = -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit -Iui/dsl
+
+# compile each toolkit source once for the newlib target
+$(BUILD)/uiobj_scene_scene.o: ui/scene/scene.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_backend_cpu_backend.o: ui/backend/cpu_backend.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_backend_font.o: ui/backend/font.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_backend_scene_render.o: ui/backend/scene_render.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_layout_layout.o: ui/layout/layout.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_reactive_reactive.o: ui/reactive/reactive.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_declare_declare.o: ui/declare/declare.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_theme_theme.o: ui/theme/theme.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_kit_kit.o: ui/kit/kit.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/uiobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+UIDEMO_OBJS = $(BUILD)/uiobj_scene_scene.o $(BUILD)/uiobj_backend_cpu_backend.o \
+              $(BUILD)/uiobj_backend_font.o $(BUILD)/uiobj_backend_scene_render.o \
+              $(BUILD)/uiobj_layout_layout.o $(BUILD)/uiobj_reactive_reactive.o \
+              $(BUILD)/uiobj_declare_declare.o $(BUILD)/uiobj_theme_theme.o $(BUILD)/uiobj_kit_kit.o \
+              $(BUILD)/uiobj_dsl_em.o
+
+# --- libembk.so: the shared UI toolkit + DSL (Phase 2 dynamic linking) ---------
+# The SAME toolkit sources, compiled -fPIC and linked into ONE ET_DYN shared
+# object. Apps stay ET_EXEC with static libc but import the toolkit from here;
+# the kernel's in-kernel dynamic loader (elf.c) resolves the app's toolkit
+# imports to libembk.so's exports AND libembk.so's libc imports back to the app's
+# --export-dynamic'd static libc. newlib is non-PIC so libc CANNOT live in the
+# .so -- it stays in each app; only our own toolkit code is shared. ld -shared
+# (not the gcc driver, whose -shared spec is wrong for this bare x86_64-elf
+# target) leaves libc symbols UND for load-time binding.
+$(BUILD)/picobj_scene_scene.o: ui/scene/scene.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_backend_cpu_backend.o: ui/backend/cpu_backend.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_backend_font.o: ui/backend/font.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_backend_scene_render.o: ui/backend/scene_render.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_layout_layout.o: ui/layout/layout.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_reactive_reactive.o: ui/reactive/reactive.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_declare_declare.o: ui/declare/declare.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_theme_theme.o: ui/theme/theme.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_kit_kit.o: ui/kit/kit.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+               $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
+               $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
+               $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
+               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o
+
+build/libembk.so: $(LIBEMBK_OBJS)
+	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(LIBEMBK_OBJS) -o $@
+
+libembk: build/libembk.so
+	@echo "libembk.so OK"
+
+build/uidemo.o: user/bin/uidemo.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+build/uidemo.elf: build/crt0.o build/syscalls.o build/uidemo.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/uidemo.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# --- wmdemo.elf: the window-compositor demo (two composited windows) -----------
+# Reuses the exact same toolkit object set + include paths as uidemo; one window
+# hosts the real EmUI toolkit, a second is drawn directly, and the kernel
+# compositor draws both over a desktop with chrome + z-order.
+build/wmdemo.o: user/bin/wmdemo.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+build/wmdemo.elf: build/crt0.o build/syscalls.o build/wmdemo.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/wmdemo.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# --- home.elf: the HOME launcher (the OS's user-space landing screen) ----------
+# Full-screen chromeless desktop window (embk_win_create_desktop) hosting a
+# toolkit launcher; clicking a tile embk_spawn()s that app as a floating window.
+# Reuses the same toolkit object set + include paths as uidemo/wmdemo.
+build/home.o: user/bin/home.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+# home.elf is DYNAMICALLY LINKED (Phase 2): it imports the toolkit from
+# libembk.so instead of statically bundling it. Note: NO -static (that would
+# forbid the .so), NO -T newlib.ld (the default script emits the dynamic
+# sections .dynamic/.dynsym/.rela.plt/.got the loader needs), and libembk.so
+# comes BEFORE -lc -lm so ld pulls the libc functions the .so needs INTO the app
+# and --export-dynamic exports them back to the .so. --no-dynamic-linker: the
+# kernel is the loader (no PT_INTERP); --hash-style=sysv: DT_HASH for symcount.
+build/home.elf: build/crt0.o build/syscalls.o build/home.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/home.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# --- v4demo.elf: the EmUI V4 reference app (CHROMELESS window, app-owned
+# chrome: WindowBar drag + its own CloseButton; TabView/Split/V4 components).
+build/v4demo.o: user/bin/v4demo.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+build/v4demo.elf: build/crt0.o build/syscalls.o build/v4demo.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/v4demo.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# --- clockw.elf: the CLOCK desktop widget (EmUI V5, EM_WIDGET runtime) ---------
+build/clockw.o: user/bin/clockw.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+build/clockw.elf: build/crt0.o build/syscalls.o build/clockw.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/clockw.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+uidemo: build/uidemo.elf
+	@echo "uidemo OK"
+
+wmdemo: build/wmdemo.elf
+	@echo "wmdemo OK"
+
+home: build/home.elf
+	@echo "home OK"
 
 
 
@@ -179,8 +346,8 @@ $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
 	echo "Building stage1 with STAGE2_LOAD_SECTORS=$$stage2_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D STAGE2_LOAD_SECTORS=$$stage2_sectors $< -o $@
 
-$(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_ELF)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_ELF)) + 511) / 512 )); \
+$(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_BIN)
+	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
 	echo "Building stage2 with KERNEL_LOAD_SECTORS=$$kernel_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D KERNEL_LOAD_SECTORS=$$kernel_sectors $< -o $@
 
@@ -214,11 +381,21 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 $(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
-$(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF)
-	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) > $(IMG)
+# Boot image carries the stripped kernel (see KERNEL_BIN note above).
+$(KERNEL_BIN): $(KERNEL_ELF)
+	$(STRIP) --strip-all -o $@ $<
+
+$(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
+	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) > $(IMG)
 	truncate -s 1M $(IMG)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_ELF)) + 511) / 512 )); \
-	echo "Kernel is $$kernel_sectors sectors; stage2 loads exact size"
+	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
+	video_ceiling=$$(( (0xA0000 - 0x10000) / 512 )); \
+	echo "Kernel is $$kernel_sectors sectors (video-RAM ceiling $$video_ceiling); stage2 loads exact size"; \
+	if [ $$kernel_sectors -ge $$video_ceiling ]; then \
+	  echo "*** WARNING: stripped kernel exceeds the 0xA0000 real-mode load ceiling;"; \
+	  echo "*** stage2 will overflow into video RAM/option-ROM. Move to an unreal-mode"; \
+	  echo "*** high load (>1 MB) before the kernel grows further."; \
+	fi
 # Create the 64 MB data disk only if it doesn't already exist
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=64
@@ -226,7 +403,7 @@ $(DISK):
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf build/uidemo.elf build/wmdemo.elf build/v4demo.elf build/clockw.elf build/home.elf build/libembk.so
 	python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
@@ -255,15 +432,28 @@ embkfs_tree.img:
 
 
 # COW mutates the disk — boot a PRISTINE copy each run, then grade it.
-EMBKFS_MASTER  := embkfs_tree.img       # pristine, never written by QEMU
+EMBKFS_MASTER  := embkfs.img       # pristine, never written by QEMU
 EMBKFS_SCRATCH := embkfs_scratch.img
+
+# Display settings shared by the interactive targets:
+#  - XRES/YRES: the virtio-gpu scanout size (the whole stack -- fb, compositor,
+#    mouse clamp, home launcher -- adapts to whatever the device reports).
+#    Override per run: `make run-embkfs-cow XRES=1920 YRES=1080`.
+#  - zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
+#    window (stretching is what made the display look blurry/badly scaled).
+XRES ?= 1280
+YRES ?= 800
+VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
+DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
-		-vga virtio -serial stdio -no-reboot -no-shutdown -m 4G -smp 4
+	    -usb -device usb-tablet \
+	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
@@ -280,6 +470,36 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown
+
+# --- run-ui: boot to a window, then the live EmbLink UI app ------------------
+# Boots EmbLinkOS with a real display; uidemo.elf (the ring-3 UI toolkit, font
+# embedded) is on the EMBKFS root. At the shell prompt, type:  run /uidemo.elf
+# and the settings card renders into a Piece-1 surface and presents to screen.
+#
+# Uses virtio-gpu (-vga virtio): its damage-rect scan-out flush presents from a
+# cached-RAM backbuffer, avoiding the per-present memcpy into UNCACHED VRAM that
+# -vga std incurs (fb_front is vmm_map_mmio'd VMM_NOCACHE) -- ~2x FPS on the
+# toolkit demos. Use `make run-vga-std` for the plain uncached-LFB path.
+run-ui: $(IMG) embkfs.img
+	@echo "At the shell prompt, type:  run /uidemo.elf"
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -usb -device usb-tablet \
+	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
+
+# Boots to the window-compositor demo: two kernel-composited windows (one
+# hosting the EmUI toolkit, one drawn directly) over a desktop with title-bar
+# chrome + z-order. At the shell prompt, type:  run /wmdemo.elf   (ESC quits).
+run-wm: $(IMG) embkfs.img
+	@echo "At the shell prompt, type:  run /wmdemo.elf   (ESC quits)"
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -usb -device usb-tablet \
+	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
 
 # Encrypted EMBKFS test volume (v2.2 Phase 4). Passphrase is the fixed test
 # string "correcthorsebattery" -- NEVER a real credential, just a KAT-style
@@ -345,7 +565,7 @@ run-part-embkfs: $(IMG) $(DISK) part_embkfs.img
 	    -serial stdio -no-reboot -no-shutdown
 
 run: $(IMG) $(DISK)
-	qemu-system-x86_64 $(DRIVES) -serial stdio -no-reboot -no-shutdown
+	qemu-system-x86_64 $(DRIVES) -usb -device usb-tablet -serial stdio -no-reboot -no-shutdown
 
 # ---- Display / GPU test targets ---------------------------------------------
 # stdvga exposes the Bochs DISPI interface -> bochs_vbe.c does a runtime
@@ -437,8 +657,85 @@ run-all: $(IMG) ahci.img fat32.img
 	    -device ide-hd,drive=satadisk,bus=ahci0.0 \
 	    -serial stdio -no-reboot -no-shutdown
 
+# EmbLink UI Piece 3: the scene tree is pure userland C with no syscalls, so
+# its selftests are host-compiled and run natively (no QEMU / no ring-3) --
+# fast, and appropriate for a pure data-structure + traversal piece.
+HOSTCC ?= cc
+scene-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene \
+	    ui/scene/scene.c ui/scene/scene_test.c -o $(BUILD)/scene_test
+	$(BUILD)/scene_test
+
+# Piece 4a: the CPU render backend + dirty-rect driver. Same host-test posture
+# as Piece 3 -- operates on in-memory render_target buffers, no QEMU/ring-3.
+backend-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
+	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/scene_render.c \
+	    ui/backend/backend_test.c -lm -o $(BUILD)/backend_test
+	$(BUILD)/backend_test
+
+# Piece 4b: the TrueType font rasterizer. Synthetic-font unit tests, host-run.
+font-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
+	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
+	    ui/backend/font_test.c -lm -o $(BUILD)/font_test
+	$(BUILD)/font_test
+
+# Piece 5: the flexbox-style layout engine. Host-run unit tests.
+layout-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend -Iui/layout \
+	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
+	    ui/layout/layout.c ui/layout/layout_test.c -lm -o $(BUILD)/layout_test
+	$(BUILD)/layout_test
+
+# Piece 6: the reactivity system (signals/scopes/edges). UI-agnostic, host-run.
+reactive-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/reactive \
+	    ui/reactive/reactive.c ui/reactive/reactive_test.c -o $(BUILD)/reactive_test
+	$(BUILD)/reactive_test
+
+# Piece 7: the declarative API (capstone). Ties scene/layout/reactive together.
+declare-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare \
+	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/layout/layout.c \
+	    ui/reactive/reactive.c ui/declare/declare.c ui/declare/declare_test.c \
+	    -lm -o $(BUILD)/declare_test
+	$(BUILD)/declare_test
+
+# Themed showcase: renders a real UI with the widget kit to a PNG, so the
+# toolkit's actual look can be seen (not just unit-tested).
+UI_SRC = ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/backend/scene_render.c \
+         ui/layout/layout.c ui/reactive/reactive.c ui/declare/declare.c ui/theme/theme.c ui/kit/kit.c
+UI_INC = -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit
+showcase:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) \
+	    $(UI_SRC) ui/showcase/showcase.c -lm -o $(BUILD)/showcase
+	$(BUILD)/showcase $(BUILD)/showcase_light.ppm light
+	$(BUILD)/showcase $(BUILD)/showcase_dark.ppm  dark
+	python3 -c "from PIL import Image; \
+	  Image.open('$(BUILD)/showcase_light.ppm').save('$(BUILD)/showcase_light.png'); \
+	  Image.open('$(BUILD)/showcase_dark.ppm').save('$(BUILD)/showcase_dark.png'); \
+	  print('wrote $(BUILD)/showcase_light.png + showcase_dark.png')"
+
+# EmUI V2 showcase: renders an app screen written in the SwiftUI-flavored DSL.
+V2_SRC = $(UI_SRC) ui/dsl/em.c
+V2_INC = $(UI_INC) -Iui/dsl
+showcase-v2:
+	$(HOSTCC) -std=gnu11 -Wall -Wextra -O2 $(V2_INC) \
+	    $(V2_SRC) ui/dsl/showcase_v2.c -lm -o $(BUILD)/showcase_v2
+	$(BUILD)/showcase_v2 $(BUILD)/v2_light.ppm light
+	$(BUILD)/showcase_v2 $(BUILD)/v2_dark.ppm  dark
+	$(BUILD)/showcase_v2 $(BUILD)/v4_light.ppm light v4
+	$(BUILD)/showcase_v2 $(BUILD)/v4_dark.ppm  dark  v4
+	python3 -c "from PIL import Image; \
+	  Image.open('$(BUILD)/v2_light.ppm').save('$(BUILD)/v2_light.png'); \
+	  Image.open('$(BUILD)/v2_dark.ppm').save('$(BUILD)/v2_dark.png'); \
+	  Image.open('$(BUILD)/v4_light.ppm').save('$(BUILD)/v4_light.png'); \
+	  Image.open('$(BUILD)/v4_dark.ppm').save('$(BUILD)/v4_dark.png'); \
+	  print('wrote v2_{light,dark}.png + v4_{light,dark}.png')"
+
 clean:
-	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(IMG)
+	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
 	rm -rf $(BUILD)
 
-.PHONY: all run debug clean run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
+.PHONY: all run debug clean scene-test backend-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted

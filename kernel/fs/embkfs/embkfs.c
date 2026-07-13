@@ -1458,6 +1458,8 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->total_blocks = sb->total_blocks;
     vol->free_blocks  = sb->free_blocks;
     vol->generation   = sb->generation;
+    /* read cache starts empty (rcache_gen=0 never matches a real generation) */
+    vol->rcache_buf = NULL; vol->rcache_oid = 0; vol->rcache_gen = 0; vol->rcache_len = 0;
     vol->root         = sb->root;
     vol->read_only    = read_only;
     vol->feature_incompat = sb->feature_incompat;
@@ -4192,6 +4194,10 @@ int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
     return EMBK_OK;
 }
 
+/* Cap on the whole-object read cache (embkfs_read_object_at): files up to this
+ * size are cached for fast sequential reads; larger ones use the direct path. */
+#define EMBKFS_RCACHE_MAX (8u * 1024u * 1024u)
+
 int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
                           uint64_t offset, uint8_t *buf, uint64_t len,
                           uint64_t *out_read)
@@ -4200,6 +4206,19 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
     *out_read = 0;
     if (len == 0) return EMBK_OK;
 
+    /* Fast path: whole-object read cache. This is the O(n^2) fix -- previously
+     * EVERY call re-decoded the entire [0, offset+want) prefix, so a file read
+     * sequentially in K chunks re-read growing prefixes (K*(K+1)/2 blocks). */
+    if (vol->rcache_buf && vol->rcache_oid == oid && vol->rcache_gen == vol->generation) {
+        uint64_t total = vol->rcache_len;
+        if (offset >= total) return EMBK_OK;
+        uint64_t want = total - offset;
+        if (want > len) want = len;
+        memcpy(buf, vol->rcache_buf + offset, want);
+        *out_read = want;
+        return EMBK_OK;
+    }
+
     uint64_t total = 0;
     int rc = embkfs_read_object_prefix(vol, oid, NULL, 0, &total, NULL);
     if (rc != EMBK_OK) return rc;
@@ -4207,6 +4226,25 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
 
     uint64_t want = total - offset;
     if (want > len) want = len;
+
+    /* Decode the whole object ONCE into the cache (capped so a huge file can't
+     * pin unbounded RAM), then serve. On a miss for a >cap file, or on OOM,
+     * fall back to the original direct prefix read below. */
+    if (total <= EMBKFS_RCACHE_MAX) {
+        uint8_t *nb = kmalloc(total ? total : 1);
+        if (nb) {
+            rc = embkfs_read_object_prefix(vol, oid, nb, total, NULL, NULL);
+            if (rc != EMBK_OK) { kfree(nb); return rc; }
+            if (vol->rcache_buf) kfree(vol->rcache_buf);
+            vol->rcache_buf = nb;
+            vol->rcache_oid = oid;
+            vol->rcache_gen = vol->generation;
+            vol->rcache_len = total;
+            memcpy(buf, nb + offset, want);
+            *out_read = want;
+            return EMBK_OK;
+        }
+    }
 
     uint64_t need_prefix = offset + want;
     uint8_t *tmp = kmalloc(need_prefix ? need_prefix : 1);

@@ -16,4 +16,10 @@ int keyboard_has_char(void);
 // Inject a character into the keyboard buffer (used by USB HID driver).
 void keyboard_inject_char(char c);
 
+// Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
+// ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.
+void keyboard_set_grab(int grab, uint32_t pid);
+int  keyboard_is_grabbed(void);
+void keyboard_release_grab_pid(uint32_t pid);
+
 #endif /* __KEYBOARD__H__ */

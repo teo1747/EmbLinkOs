@@ -1,6 +1,6 @@
 # EmbLinkOS — Project Status & Handoff
 
-*Last updated: 2026-07-10. Living document — reconciled from two previously
+*Last updated: 2026-07-13. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
 first (the intended design and the decisions behind it), then this file
@@ -22,8 +22,9 @@ EmbLinkOS today is a 64-bit x86 kernel with:
 - **Drivers**: Serial console, ATA/DMA (both IDE channels, IRQ14+IRQ15), AHCI, keyboard, VBE (EDID + mode enumeration fallback)/Bochs-DISPI/VirtIO-GPU framebuffer, ACPI/APIC, xHCI/EHCI/UHCI/OHCI USB (HID keyboard + mass storage + hub support on the legacy HCs), CMOS RTC (real wall-clock timestamps)
 - **Crypto**: from-scratch SHA-256, HMAC-SHA256, PBKDF2, AES-256, AES-256-XTS (`kernel/crypto/`), every primitive checked against externally-computed known-answer vectors
 - **Interrupts**: IDT + handler dispatch, exceptions, LAPIC timer (now driving preemption, per-CPU), keyboard IRQ
-- **User Mode**: Ring-3 entry via iretq, ELF64 loader, 16 int 0x80 syscalls (write, exit, yield, open, close, read, lseek, stat, readdir, spawn, wait, getpid, kill, thread_create, thread_join, thread_exit), validated user pointers (`access_ok`/`copy_from_user`/`copy_to_user`)
-- **Processes & SMP**: real `struct thread`/`struct process` split (schedulable unit vs. resource owner), multi-core bring-up (AP INIT-SIPI-SIPI, per-CPU LAPIC/GDT/TSS), a single global scheduler lock held across context switches, per-process address spaces + guarded kernel stacks + fd tables, timer-preemptive priority-band scheduler with aging, wait queues, uncatchable kill, real blocking `sys_wait`, ring-3 process AND thread handles (kernel kthreads and joinable ring-3 threads sharing one address space), an interactive shell that's itself a real process (see Phase 17–20)
+- **User Mode**: Ring-3 entry via iretq, ELF64 loader (static **and dynamic linking**, in-kernel — no userspace `ld.so`), ~48 int 0x80 syscalls (file I/O, process/thread management, window/compositor, IPC, memory, `sleep_ms`/`proc_alive`/`win_resize` among the newest), validated user pointers (`access_ok`/`copy_from_user`/`copy_to_user`)
+- **Processes & SMP**: real `struct thread`/`struct process` split (schedulable unit vs. resource owner), multi-core bring-up (AP INIT-SIPI-SIPI, per-CPU LAPIC/GDT/TSS), a single global scheduler lock held across context switches, per-process address spaces + guarded kernel stacks + fd tables, timer-preemptive priority-band scheduler with aging, wait queues, uncatchable kill, real blocking `sys_wait`, ring-3 process AND thread handles (kernel kthreads and joinable ring-3 threads sharing one address space)
+- **Userland & UI**: a newlib libc port (freestanding / static / dynamically-linked build modes), a window compositor (z-order, app-owned chrome, zero-copy windows, resizable windows, desktop widgets), and **EmUI** — a from-scratch, SwiftUI-flavored UI toolkit apps are built against, with an app-runtime layer (`EM_APPLICATION`/`EM_WIDGET`) that removes almost all boilerplate. The OS boots by default into a graphical home launcher (app grid + a live desktop clock widget), not the interactive kernel shell (see Phase 22).
 
 ## Design Philosophy
 
@@ -577,6 +578,93 @@ selftest, all green in `test embkfs all`.
   one shared kernel-embedded key; no ciphertext stealing in XTS (never
   needed, every write is block-rounded).
 
+### Phase 22 — newlib userland, GUI stack (compositor + EmUI), dynamic linking, mouse, IPC
+
+*Landed ahead of the "self-hosting first" ordering ARCHITECTURE.md originally
+sketched — see that doc's §5/§10 for the reasoning. This phase covers
+several previously-untracked pieces of work in one entry since they shipped
+together and depend on each other; individually they span a mouse driver,
+an in-kernel window compositor, a from-scratch UI toolkit built in five
+successive versions (V1 → V5), an in-kernel dynamic linker, and a
+newlib-based libc port.*
+
+- **newlib port**: freestanding, static-newlib, and dynamically-linked build
+  modes (`user/lib/crt0.c`, `syscalls.c` — the POSIX retargeting layer over
+  the raw `embk_syscallN` ABI). The stock cross-toolchain's newlib lacked
+  C99 printf formats (`%z`/`%ll` compiled out); fixed with a from-source
+  newlib rebuild into a separate prefix (`NEWLIB_PREFIX`) rather than
+  patching the toolchain in place. See `user/README.md` and
+  `docs/BUILD_SETUP.md`.
+- **In-kernel dynamic linker** (`kernel/arch/x86_64/syscall/elf.c`): no
+  userspace `ld.so`, no `PT_INTERP` — the kernel loads an `ET_EXEC` app plus
+  its one `DT_NEEDED` shared object (`libembk.so`, the UI toolkit compiled
+  `-fPIC`) into the same address space at `exec`/`spawn` time, applying
+  `RELATIVE`/`64`/`GLOB_DAT`/`JUMP_SLOT` relocations eagerly (no lazy PLT)
+  plus `R_X86_64_COPY` for the first-ever cross-object data (not function)
+  reference, which needed dedicated handling to bind back to the app's own
+  copy of the symbol rather than one living in the `.so`. Two-way symbol
+  resolution: the app's toolkit calls resolve into `libembk.so`; the `.so`'s
+  libc calls resolve back into the app's own `--export-dynamic`'d static
+  newlib (newlib itself is not PIC, so it can't live in the `.so`).
+- **Mouse driver** (`kernel/drivers/input/mouse.c`) + IntelliMouse wheel
+  support, feeding the compositor's pointer routing.
+- **Window compositor** (`kernel/gfx/compositor.c`): z-ordered windows,
+  kernel-drawn chrome (title bar + close button) or fully app-owned
+  ("chromeless") chrome, zero-copy shared-memory windows (the client renders
+  directly into pages mapped both into its own address space and the
+  compositor's), window move/resize, click-to-focus, title-bar drag, a
+  click-latch so a press landing while an app is mid-render isn't silently
+  dropped (`sys_win_input` is a state poll, not an event queue), desktop
+  widgets in their own z-band (always above the wallpaper, always below app
+  windows), and pointer capture (drag routing sticks to the press-owner
+  window even once the cursor leaves its bounds, needed for fast/steep
+  drags to survive the poll rate).
+- **EmUI** (`ui/`): a from-scratch, SwiftUI-flavored declarative UI toolkit,
+  built in layers — a scene-graph render IR (`ui/scene`), a flexbox layout
+  engine (`ui/layout`), a general reactive core (`ui/reactive`), an
+  immediate-mode API over a retained instance tree with automatic
+  reconciliation (`ui/declare`), a design-token theme system (`ui/theme`),
+  a themed widget kit (`ui/kit`), a CPU render backend with a from-scratch
+  TrueType rasterizer (`ui/backend`), and a DSL (`ui/dsl/em.{h,c}`) that
+  progressed through five iterations: V1/V2 (brace-scoped containers,
+  chainable modifiers), V3 (components, navigation, charts/lists), V4
+  (app-owned "chromeless" window chrome, a larger modern component set —
+  Dropdown/Toast/Spinner/Gauge/SearchField/Disclosure/StatCard/EmptyState,
+  tab and split-view navigation), and V5 (resizable windows via a corner
+  grip, always-on-desktop widgets via `EM_WIDGET`). A V4.1 app-runtime
+  layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
+  used to be ~150 lines of per-app boilerplate (font loading, arena setup,
+  window creation, the event loop, dirty-rect presenting, teardown) into
+  one declarative struct literal, and gates the whole event loop on
+  **retained updates** — a frame is only built when there's an input edge,
+  a structural change, a timer tick, or a component explicitly requests one
+  (an idle app does zero UI work per poll). Every layer below the DSL has a
+  host-compiled, host-run unit test (`make scene-test`/`backend-test`/
+  `font-test`/`layout-test`/`reactive-test`/`declare-test`, no QEMU); whole
+  screens render to PNG via `make showcase`/`showcase-v2` for a fast visual
+  check before booting a VM. See `docs/EMUI_GUIDE.md` (how to build an app)
+  and `docs/EMUI_INTERNALS.md` (how the toolkit itself works).
+- **IPC** (`kernel/ipc/`): capability handles, channels, and endpoints for
+  cross-process communication, underlying window/resource handles more
+  broadly, not just a message-passing feature on its own.
+- **`epfs`** (`kernel/fs/epfs.c`): an additional lightweight filesystem
+  backend alongside EMBKFS/FAT32 in the VFS mount registry.
+- **The home launcher** (`user/bin/home.c`) replaces the interactive kernel
+  shell as the default boot target: a full-screen chromeless desktop window
+  hosting an app-tile grid (click to `spawn()`), spawning the clock desktop
+  widget (`clockw.elf`) automatically. It hand-rolls its own event loop
+  (predates/bypasses the `EM_APPLICATION` runtime, since it owns the
+  desktop layer rather than an app window) and tracks each spawned child by
+  its **spawn handle** (opaque, capability-scoped — not a raw pid), which
+  surfaced a real bug worth flagging for anyone spawning children from an
+  EmUI app: failing to `wait()` a dead child leaks its handle out of the
+  16-per-process handle table, and once that table fills, the *next* spawn
+  call fails and kills the child it just created.
+- **Reference apps**: `uidemo.elf`/`wmdemo.elf` (V1–V3 toolkit + compositor
+  demos), `v4demo.elf` (the fullest reference — chromeless chrome, tabs,
+  split view, every V4/V5 component), `clockw.elf` (the minimal `EM_WIDGET`
+  reference, an uptime clock ticking on the desktop).
+
 ---
 
 ## Major To-Do Buckets (Rough Priority)
@@ -779,28 +867,31 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 ## Next Steps
 
 Dependency order — see `TODO.md`'s per-subsystem lists for the full detail
-behind each item. Everything through Phase 21 (user-pointer validation,
-scheduler Phases B/C/D, file I/O syscalls, real blocking `sys_wait`,
-ring-3 process handles, per-process fd tables, the interactive shell, SMP +
-the thread/process split + ring-3 threads, and EMBKFS v2's full feature
-set) is now done; what's left before self-hosting:
+behind each item. Everything through Phase 22 (user-pointer validation,
+the full scheduler + SMP + thread/process split + ring-3 threads, EMBKFS
+v2's full feature set, **and** the newlib port, dynamic linking, the window
+compositor, and the EmUI GUI stack — all of which landed *ahead of* the
+self-hosting-first ordering originally sketched in `docs/ARCHITECTURE.md`)
+is now done. What's left before self-hosting:
 
-1. **libc port** (newlib first) — implement syscall backends, don't write
-   one from scratch — the hinge to running existing software. The syscall
-   surface (16 calls, file I/O + process/thread management, all handle/
-   capability-safe) is now broad enough to make this the natural next step.
-2. **Native shell/coreutils**, built on top of the kernel's own interactive
+1. **Native shell/coreutils**, built on top of the kernel's own interactive
    process-control commands (`run`/`ps`/`kill`/`wait`/`nice`) rather than
-   from scratch, then a self-hosting toolchain (tcc first), then mouse +
-   compositor + GUI. See `docs/ARCHITECTURE.md` §5 for the full
-   critical-path roadmap to self-hosting.
+   from scratch, then a self-hosting toolchain (tcc first). The GUI stack
+   landing first means a native *editor* is now also plausible as an EmUI
+   app before a text shell exists — worth reconsidering that ordering. See
+   `docs/ARCHITECTURE.md` §5 for the current critical-path roadmap.
+2. **A real TTY** — scrollback, line editing — for whichever of the above
+   needs a text console; the framebuffer console today is output-only.
 3. **Per-CPU run queues** — the one piece of the SMP work deliberately left
    unbuilt: the single global `g_sched_lock` is the shipped design, and
    per-CPU queues are scoped as the *next* step only once that lock is
    *measured* to bottleneck (see the arch doc §8/§17), not built ahead of
    real need.
-4. **True per-block snapshot refcounting / asymmetric verified-root
-   signing** — both EMBKFS v2 known limitations (Phase 21 above), flagged
+4. **Lazy PLT binding** for the dynamic linker — relocations are currently
+   applied eagerly at load time (see Phase 22); fine at today's app count
+   and sizes, worth revisiting if process start latency becomes a problem.
+5. **True per-block snapshot refcounting / asymmetric verified-root
+   signing** — both EMBKFS v2 known limitations (Phase 21), flagged
    in `docs/EMBKFS_spec_v2.2.md` as natural v2.x follow-ups, not attempted
    in this pass to keep the crypto/allocator surface reviewable.
 
@@ -830,9 +921,17 @@ make run-usb-uhci        # UHCI + usb-kbd + usb-storage
 make run-usb-ohci        # OHCI + usb-kbd + usb-storage
 make run-usb-ehci        # EHCI + usb-storage (high speed)
 make run-usb-xhci        # xHCI + usb-kbd
+make embkfs.img          # build every userland app + libembk.so, pack an EMBKFS image
+make run-embkfs-cow      # boot a pristine EMBKFS image, then grade the post-boot copy
+make run-ui              # boot to a shell; `run /uidemo.elf` launches the EmUI toolkit live
+make run-wm              # boot to the window-compositor demo (two composited windows)
+make scene-test backend-test font-test layout-test reactive-test declare-test  # host-run UI unit tests, no QEMU
+make showcase-v2         # render EmUI DSL/V4/V5 screens to PNG (needs Pillow) -- see docs/EMUI_GUIDE.md
 make debug               # GDB server on :1234 (paused)
 make clean               # remove binaries (preserves disk.img / ahci.img)
 ```
+See `docs/BUILD_SETUP.md` for first-time toolchain/newlib setup and
+`CONTRIBUTING.md` for the complete, currently-maintained target list.
 
 ## Memory Layout
 

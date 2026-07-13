@@ -1,4 +1,8 @@
 #include "process/process.h"
+#include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
+#include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
+#include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
+#include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
@@ -13,7 +17,12 @@
 #include <stdint.h>
 
 #define USER_STACK_TOP 0x0000700000001000ULL  /* TOP of the user stack  page*/
-#define USER_STACK_VA  0x0000700000000000ULL  /* base of the user stack page */
+#define USER_STACK_VA  0x0000700000000000ULL  /* base of the TOP stack page */
+/* The main thread's stack grows DOWN from USER_STACK_TOP. One page is far too
+ * little for real userland (the EmbLink UI toolkit recurses through layout /
+ * scene traversal / glyph rasterisation with multi-KB frames). Map this many
+ * pages ending at USER_STACK_TOP so the stack has room to grow. */
+#define USER_STACK_PAGES 128                   /* 512 KiB main stack */
 
 /* Phase 5 (ring-3 threads): per-thread user stacks for every thread BEYOND
  * a process's own main one (which keeps using USER_STACK_VA/TOP above,
@@ -303,9 +312,23 @@ static void thread_reap_slot(struct thread *t) {
  * i.e. every thread this process ever had has already been (or is, in the
  * SAME deferred step, about to be) reaped via thread_reap_slot(). */
 static void process_reap_slot(struct process *proc) {
+    /* R2 (crash-safety): unmap every surface this process mapped and drop its
+     * refs BEFORE the address space is torn down. surface pages are owned by
+     * the surface refcount, not the process -- unmapping them here (PTE clear,
+     * no frame free) keeps vmm_destroy_address_space's "free every user-half
+     * frame" walk from freeing shared memory another process still maps. */
+    obj_handles_release_all(proc);
+
+    /* Reclaim compositor windows BEFORE the address space is destroyed: a shared
+     * (zero-copy) window's pixel pages are mapped in this process's user half but
+     * OWNED by the compositor -- they must be unmapped here so the address-space
+     * teardown below doesn't free them out from under the compositor. */
+    compositor_reap_pid((int)proc->pid);
+
     vmm_destroy_address_space(proc->pml4_phys);
 
     uint32_t reaped_pid = proc->pid;
+    keyboard_release_grab_pid(reaped_pid);   /* free the kbd grab if this proc held it */
     memset(proc, 0, sizeof(*proc));
     proc->pid = 0;
 
@@ -350,6 +373,20 @@ struct process *process_find(uint32_t pid) {
         }
     }
     return NULL;
+}
+
+/* Self-locking liveness probe for the syscall layer (sys_proc_alive): does a
+ * process with this pid currently exist with at least one live thread? Unlike
+ * process_find() this takes g_sched_lock itself -- callers hold no locks and
+ * only need a boolean snapshot (racy by nature: the answer can change the
+ * instant we return; that's inherent to any liveness query). */
+int process_alive(uint32_t pid) {
+    if (pid == 0) return 0;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    int alive = (p != NULL && p->live_thread_count > 0);
+    spin_unlock(&g_sched_lock);
+    return alive;
 }
 
 /* Is `p->parent` still genuinely alive, i.e. still the SAME process that
@@ -885,6 +922,8 @@ int process_create(const char *path, char *const argv[], int argc,
                                                   // map/track the entire unused range
                                                   // below the real heap)
     memset(proc->handles, 0, sizeof(proc->handles));
+    memset(proc->obj_handles, 0, sizeof(proc->obj_handles));
+    proc->shared_next_va = USER_SHARED_VA_BASE;   /* surface-mapping VA window */
 
     /* Register ourselves on our parent's live-children list (ps tree view
      * only -- see child_list's comment in process.h). */
@@ -917,16 +956,48 @@ int process_create(const char *path, char *const argv[], int argc,
      * so there's nothing to close/overwrite first. */
     for (int i = 0; i < n_count; i++) {
         const struct spawn_file_action *act = &actions[i];
-        if(act->kind != SPAWN_ACTION_OPEN) {
+        if (act->kind == SPAWN_ACTION_OPEN) {
+            int fd = fd_open_into(proc, act->target_fd, act->path, act->flags, act->mode);
+            if (fd < 0) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return fd;  // fd_open_into failed
+            }
+        } else if (act->kind == SPAWN_ACTION_INHERIT_SURFACE) {
+            /* Minimal handle_transfer (EmbLink UI Piece 1): dup+map the
+             * PARENT's surface (act->target_fd reused as the parent's surface
+             * handle) into the child, so the child is born already sharing
+             * it. current_process is the spawning parent here; proc is the
+             * child. Needs a real spawning process holding the surface. */
+            if (!current_thread) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            int dh = surface_transfer_to(current_process, act->target_fd, proc);
+            if (dh < 0) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return dh;  // transfer failed (bad handle / OOM)
+            }
+        } else if (act->kind == SPAWN_ACTION_INHERIT_CHANNEL) {
+            /* MOVE the parent's channel end (act->target_fd) into the child;
+             * the channel stays open, only the holder changes (Layer A). */
+            if (!current_thread) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            int dh = channel_transfer_end_to(current_process, act->target_fd, proc);
+            if (dh < 0) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return dh;
+            }
+        } else {
             vmm_destroy_address_space(pml4);
             proc->pid = 0;
-            return -EMBK_EINVAL;  // Only SPAWN_ACTION_OPEN is supported
-        }
-        int fd = fd_open_into(proc, act->target_fd, act->path, act->flags, act->mode);
-        if (fd < 0) {
-            vmm_destroy_address_space(pml4);
-            proc->pid = 0;
-            return fd;  // fd_open_into failed
+            return -EMBK_EINVAL;  // unknown spawn action kind
         }
     }
 
@@ -939,6 +1010,15 @@ int process_create(const char *path, char *const argv[], int argc,
     }
 
     vmm_map_in(pml4, USER_STACK_VA, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
+
+    // 3.1 Give the main stack room to grow down: map (USER_STACK_PAGES-1) more
+    // pages BELOW the top page. argv still lives in the top page (below).
+    for (int i = 1; i < USER_STACK_PAGES; i++) {
+        uint64_t ph = pmm_alloc_page();
+        if (!ph) { vmm_destroy_address_space(pml4); proc->pid = 0; return -EMBK_ENOMEM; }
+        vmm_map_in(pml4, USER_STACK_VA - (uint64_t)i * 0x1000, ph,
+                   VMM_NX | VMM_WRITABLE | VMM_USER);
+    }
 
     // 3.5 Lay out argv on the child's stack, via the SAME direct-map trick
     // elf_load already uses for PT_LOAD Segments: stack_phys is a raw physical
@@ -1112,8 +1192,11 @@ int64_t process_sbrk(struct process *proc, int64_t increment){
                 proc->heap_mapped_top = addr;  // update to the last successfully mapped page
                 return -EMBK_ENOMEM;  // physical memory exhausted
             }
-            vmm_map_in(proc->pml4_phys, addr, phys_page, VMM_WRITABLE | VMM_USER);
-
+            if (vmm_map_in(proc->pml4_phys, addr, phys_page, VMM_WRITABLE | VMM_USER) < 0) {
+                pmm_free_page(phys_page);
+                proc->heap_mapped_top = addr;   // don't claim a page we failed to map
+                return -EMBK_ENOMEM;
+            }
         }
         proc->heap_mapped_top = map_to;
     }
@@ -1479,6 +1562,29 @@ static void schedule_locked(void) {
 
 void sys_yield(void) {
     schedule();
+}
+
+/* --------------------------------------------------------------------
+ * Blocking primitives for kernel subsystems OUTSIDE process.c (IPC channels,
+ * kernel/ipc/channel.c). g_sched_lock and schedule_locked() are file-static
+ * here, so expose the exact "block until woken" dance process_wait()/
+ * thread_join() implement, without leaking scheduler internals.
+ *
+ * Usage (mirrors thread_join): the caller snapshots its own interrupt state,
+ * then loops -- sched_lock(); check its condition under the lock; if not met,
+ * sched_block_current_locked(&wq) (which switches away and returns with the
+ * lock RELEASED once woken); restore IF; loop. Waking is via the existing
+ * wait_queue_wake_one/all (process.h), which must be called under sched_lock.
+ * -------------------------------------------------------------------- */
+void sched_lock(void)   { spin_lock(&g_sched_lock); }
+void sched_unlock(void) { spin_unlock(&g_sched_lock); }
+
+void sched_block_current_locked(struct wait_queue *wq) {
+    /* MUST hold g_sched_lock (via sched_lock()). Blocks current_thread on wq
+     * and switches away; schedule_locked() releases g_sched_lock at its tail,
+     * so this returns with the lock NOT held once the thread is resumed. */
+    wait_queue_block(wq, current_thread);
+    schedule_locked();
 }
 
 void process_init(void) {

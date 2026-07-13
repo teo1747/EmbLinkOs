@@ -1,5 +1,6 @@
 #include "drivers/usb/usb_core.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -110,8 +111,22 @@ static const char g_usb_hid_ascii_shift[128] = {
     '?',  0,    0,    0,    0,    0,    0,    0,
 };
 
+/* QEMU usb-tablet report (report protocol, 6 bytes): [buttons][X lo/hi][Y lo/hi]
+ * [wheel]. X/Y are absolute in [0, 0x7FFF]; buttons bit0/1/2 = left/right/middle
+ * (same layout as MOUSE_BTN_*). Fed straight into the absolute cursor, so it
+ * maps 1:1 and never "escapes" the window like the relative PS/2 mouse. */
+static void usb_tablet_process_report(const uint8_t *report, int len) {
+    if (len < 5) return;
+    uint32_t buttons = report[0] & 0x07;
+    int32_t x = (int32_t)(report[1] | ((uint32_t)report[2] << 8));
+    int32_t y = (int32_t)(report[3] | ((uint32_t)report[4] << 8));
+    int32_t wheel = (len >= 6) ? (int32_t)(int8_t)report[5] : 0;
+    mouse_set_absolute(x, y, 0x7FFF, buttons, wheel);
+}
+
 static void usb_hid_process_report(struct usb_device *dev,
                                    const uint8_t *report, int len) {
+    if (dev->hid_kind == USB_HID_TABLET) { usb_tablet_process_report(report, len); return; }
     if (len < 3) return;
     uint8_t modifiers = report[0];
     bool shift = (modifiers & 0x22) != 0;   // L/R shift
@@ -135,19 +150,24 @@ static void usb_hid_process_report(struct usb_device *dev,
     }
 }
 
-static bool usb_hid_attach(struct usb_device *dev) {
+static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
     const struct usb_ep_info *ep = usb_find_ep(dev, 3, true);
     if (!ep) {
         kprintf("USB HID: no interrupt-IN endpoint\n");
         return false;
     }
 
-    // Boot protocol + infinite idle so the device only reports changes.
-    usb_control(dev, 0x21, 0x0B /* SET_PROTOCOL */, 0 /* boot */, 0, NULL, 0);
+    if (kind == USB_HID_KEYBOARD) {
+        // Boot protocol so the keyboard sends the fixed 8-byte boot report.
+        usb_control(dev, 0x21, 0x0B /* SET_PROTOCOL */, 0 /* boot */, 0, NULL, 0);
+    }
+    // A tablet has no boot mode -- leave it in REPORT protocol (its absolute
+    // 6-byte report). SET_IDLE(0) = only report on change, for both kinds.
     usb_control(dev, 0x21, 0x0A /* SET_IDLE */, 0, 0, NULL, 0);
 
+    dev->hid_kind = kind;
     dev->hid_ep = ep->addr;
-    dev->hid_mps = ep->mps > 8 ? 8 : ep->mps;   // boot report is 8 bytes
+    dev->hid_mps = ep->mps > 8 ? 8 : ep->mps;   // reports are <= 8 bytes
     if (dev->hid_mps == 0) dev->hid_mps = 8;
 
     if (dev->ops->int_submit(dev, dev->hid_ep, dev->hid_mps) < 0) {
@@ -155,7 +175,8 @@ static bool usb_hid_attach(struct usb_device *dev) {
         return false;
     }
     dev->hid_active = true;
-    kprintf("USB HID: boot keyboard ready (addr %u, ep 0x%x)\n",
+    kprintf("USB HID: %s ready (addr %u, ep 0x%x)\n",
+            kind == USB_HID_TABLET ? "absolute tablet" : "boot keyboard",
             (unsigned int)dev->addr, (unsigned int)dev->hid_ep);
     return true;
 }
@@ -608,10 +629,13 @@ int usb_enumerate(struct usb_device *dev) {
     // 6) Class dispatch.
     if (dev->if_class == 0x03 && dev->if_subclass == 0x01 &&
         dev->if_protocol == 0x01) {
-        usb_hid_attach(dev);
+        usb_hid_attach(dev, USB_HID_KEYBOARD);
+    } else if (dev->if_class == 0x03 && dev->if_subclass == 0x00) {
+        // Non-boot HID pointer (QEMU usb-tablet): absolute X/Y -> 1:1 cursor.
+        usb_hid_attach(dev, USB_HID_TABLET);
     } else if (dev->if_class == 0x03 && dev->if_subclass == 0x01 &&
                dev->if_protocol == 0x02) {
-        kprintf("USB: HID boot mouse detected (no driver yet)\n");
+        kprintf("USB: HID boot mouse detected (relative; no driver)\n");
     } else if (dev->if_class == 0x08) {
         usb_msc_attach(dev);
     } else if (dev->if_class == 0x09) {

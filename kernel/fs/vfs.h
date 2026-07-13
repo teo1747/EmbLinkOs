@@ -20,10 +20,14 @@
  * ===================================================================== */
 
 /* ---- Object kinds (vnode->type, vfs_stat.type, readdir type) -------- */
-#define VFS_DT_UNKNOWN 0
-#define VFS_DT_REG     1   /* regular file */
-#define VFS_DT_DIR     2   /* directory    */
-#define VFS_DT_LNK     3   /* symlink      */
+#define VFS_DT_UNKNOWN  0
+#define VFS_DT_REG      1   /* regular file */
+#define VFS_DT_DIR      2   /* directory    */
+#define VFS_DT_LNK      3   /* symlink      */
+#define VFS_DT_ENDPOINT 4   /* a listening IPC endpoint (kernel/ipc/endpoint.h,
+                            * EmbLink UI Piece 1 Layer B) -- not a byte stream,
+                            * never opened via the fd layer. Only epfs (mounted
+                            * at /run) ever produces one of these. */
 
 struct vfs_mount;   /* forward: one mounted filesystem instance      */
 struct vfs_ops;     /* forward: the per-filesystem operation table    */
@@ -85,6 +89,24 @@ struct vfs_ops {
 
     /* remove the name `name` from directory `dir` */
     int (*unlink)(struct vnode *dir, const char *name, size_t name_len);
+
+    /* Create a VFS_DT_ENDPOINT node named `name` in `dir`, bound to
+     * `endpoint_obj` (an opaque struct listen_endpoint*, kernel/ipc/
+     * endpoint.h -- the VFS layer never looks inside it). Only epfs
+     * implements this; every other filesystem leaves it NULL (-EMBK_ENOSYS).
+     * Kept as its own op rather than overloading ->create (which is
+     * mode/permission-shaped for regular files) so an endpoint's identity
+     * -- a live kernel object pointer, not a byte stream -- is explicit at
+     * the VFS boundary. */
+    int (*create_endpoint)(struct vnode *dir, const char *name, size_t name_len,
+                           void *endpoint_obj, struct vnode *out);
+
+    /* Fetch the opaque struct listen_endpoint* a VFS_DT_ENDPOINT vnode names.
+     * Only epfs implements it; NULL elsewhere. Used by chan_connect (kernel/
+     * ipc/endpoint.c) to get from "a resolved path" to "the object to mint a
+     * channel against" without the VFS layer needing to know what an
+     * endpoint IS. */
+    void *(*get_endpoint)(struct vnode *vn);
 
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);

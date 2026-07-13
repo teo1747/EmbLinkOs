@@ -6,6 +6,7 @@
 
 #include "fs/vfs.h"
 #include "fs/embkfs/embkfs.h"
+#include "include/kprintf.h"
 #include "include/errno.h"
 
 /* The fs_data stashed in a mount for an EMBKFS volume IS the embkfs_volume*
@@ -95,8 +96,11 @@ static int embkfs_vfs_read(struct vnode *vn, uint64_t off, void *buf, size_t len
 
     uint64_t got = 0;
     int rc = embkfs_read_object_at(vol_of(vn), vn->ino, off, (uint8_t *)buf, len, &got);
-    if (rc != EMBK_OK)
+    if (rc != EMBK_OK) {
+        kprintf("embkfs: READ FAIL oid=%u off=%u len=%u rc=%d\n",
+                (unsigned)vn->ino, (unsigned)off, (unsigned)len, (int)rc);
         return rc;
+    }
 
     if (got > (uint64_t)(~(size_t)0))
         return -EMBK_ERANGE;

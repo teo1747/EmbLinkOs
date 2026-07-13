@@ -78,12 +78,16 @@ struct usb_device {
     uint16_t toggle_in;
     uint16_t toggle_out;
 
-    // HID keyboard state
+    // HID state
     bool    hid_active;
+    uint8_t hid_kind;      // 0 = boot keyboard, 1 = absolute pointer (tablet)
     uint8_t hid_ep;
     uint16_t hid_mps;
     uint8_t prev_keys[6];
 };
+
+#define USB_HID_KEYBOARD 0
+#define USB_HID_TABLET   1
 
 static inline uint8_t usb_toggle_get(struct usb_device *dev, uint8_t ep_addr) {
     uint16_t map = (ep_addr & 0x80) ? dev->toggle_in : dev->toggle_out;

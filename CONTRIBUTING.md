@@ -13,6 +13,13 @@ and the decisions behind it — plus per-subsystem deep dives under
 and **[`docs/TODO.md`](docs/TODO.md)** (what's actually built vs. what's left).
 The repo is ground truth; the docs describe intent.
 
+If this is a fresh clone/fork and you haven't built the toolchain yet, do
+that first: **[`docs/BUILD_SETUP.md`](docs/BUILD_SETUP.md)** (cross compiler,
+the newlib rebuild, dynamic linking). If you're here to build a graphical
+app rather than hack on the kernel, **[`docs/EMUI_GUIDE.md`](docs/EMUI_GUIDE.md)**
+is the faster on-ramp; **[`docs/EMUI_INTERNALS.md`](docs/EMUI_INTERNALS.md)**
+covers extending the UI toolkit itself.
+
 ## The core principle
 
 **The working OS is not the deliverable — understanding is.** If the goal were a
@@ -72,6 +79,11 @@ Documentation drift is the default failure mode. Update, in the same change:
   if one exists for that subsystem) — when a design decision lands, or a
   planned item (🎯) becomes built (✅).
 - **`docs/TODO.md`** — add gaps the change leaves behind; remove items it closes.
+- **`docs/EMUI_GUIDE.md`** / **`docs/EMUI_INTERNALS.md`** — when the UI
+  toolkit itself changes: a new component or macro goes in the guide's
+  reference table; a new layer, mechanism, or internal invariant goes in
+  the internals doc. A component that isn't in the guide is a component
+  nobody but you knows how to use.
 
 Naming what a change *doesn't* handle is part of the discipline. A known,
 tracked limitation is fine; a silent one is a trap for whoever hits it next.
@@ -85,9 +97,12 @@ hardware changes, docs synced, and gaps left behind. Fill it honestly — the
 
 ## Project conventions
 
-- **Target:** x86_64 first, ARM64 later. Single-core today, but written to be
-  SMP-safe where it's cheap (avoid hidden global mutable state; prefer passing
-  state explicitly over stashing it in a global).
+- **Target:** x86_64 first, ARM64 later. SMP is built and the default boot
+  config runs multi-core; keep new code SMP-safe (avoid hidden global
+  mutable state; prefer passing state explicitly over stashing it in a
+  global, and lock anything shared across cores — a lockless page-table
+  walk and an unlocked framebuffer dirty-rect accumulator have both been
+  real, live SMP bugs in this codebase, not hypothetical ones).
 - **Kernel:** higher half at `0xFFFFFFFF80100000`. Boot is a custom two-stage
   BIOS bootloader (UEFI is on `docs/TODO.md`).
 - **Diverge from Unix only with a concrete technical justification** (see
@@ -101,11 +116,34 @@ hardware changes, docs synced, and gaps left behind. Fill it honestly — the
 ## Build & run
 
 - **Environment:** Ubuntu, `x86_64-elf` cross compiler (`/usr/local/cross/bin`),
-  NASM, QEMU, GDB.
-- **Build:** `make`
-- **Run:** `make run` (base), plus targeted targets — `make run-embkfs-cow`
-  (boots a pristine EMBKFS image, then grades it against the Python oracle),
-  `make run-ahci`, `make run-fat`, `make run-part-embkfs`, etc.
+  a C99-enabled newlib rebuild (`NEWLIB_PREFIX`), NASM, QEMU, GDB, Python 3.
+  First-time setup for all of this: [`docs/BUILD_SETUP.md`](docs/BUILD_SETUP.md).
+- **Build the kernel + bootloader:** `make`
+- **Build userland + the UI toolkit + pack a disk image:** `make embkfs.img`
+  (every app in `user/bin/`, the shared `libembk.so` toolkit, and `font.ttf`,
+  packed into an EMBKFS image via `tools/embkfs_mkfs/mkfs_embkfs.py`).
+- **Run — kernel-only variants** (no userland disk image needed):
+  `make run` (base), `make run-smp` (`-smp 4`), `make run-bigmem`,
+  `make run-kvm` (if `/dev/kvm` is available), `make run-ahci`, `make run-fat`,
+  `make run-all` (FAT32 + AHCI together), `make run-part-fat` /
+  `run-part-embkfs` (MBR-partitioned disks), `make run-vga-std` /
+  `run-virtio-gpu` (display-path variants), `make run-usb-uhci` / `-ohci` /
+  `-ehci` / `-xhci` (per-generation USB HC tests).
+- **Run — boots to the graphical desktop** (needs `make embkfs.img` first):
+  `make run-embkfs-tree` (2-level EMBKFS image with every app), `make run-embkfs-cow`
+  (boots a pristine EMBKFS image, then grades the post-boot copy against the
+  Python oracle), `make run-embkfs-encrypted` (AES-256-XTS volume, test
+  passphrase `correcthorsebattery`), `make run-multivol`, `make run-usb-embkfs`
+  (EMBKFS over xHCI mass storage).
+- **Run — the UI toolkit specifically:** `make run-ui` (boots to a shell;
+  type `run /uidemo.elf` to launch the live EmUI demo), `make run-wm`
+  (boots straight to the window-compositor demo, two composited windows,
+  ESC quits).
+- **Test the UI toolkit without QEMU** (host-compiled, host-run, seconds not
+  minutes): `make scene-test backend-test font-test layout-test reactive-test declare-test`.
+  `make showcase-v2` (needs Pillow) renders EmUI DSL/V4/V5 screens to
+  `build/v2_*.png`/`build/v4_*.png` for a visual check before booting a VM —
+  see [`docs/EMUI_GUIDE.md`](docs/EMUI_GUIDE.md#testing-without-booting-a-whole-os).
 - **Debug:** `make debug` starts QEMU frozen with a GDB stub on `:1234`; connect
   with `gdb kernel/kernel.elf` → `target remote localhost:1234`.
 

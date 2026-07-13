@@ -190,7 +190,7 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 1024 * 1024):
+def make_image(path: str, size_bytes: int = 4 * 1024 * 1024):
     bs = L.BLOCK_SIZE
     total_blocks = size_bytes // bs
     gen = 1
@@ -215,6 +215,61 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
     except FileNotFoundError:
         hello_elf_data = None
 
+    # uidemo.elf -- the live EmbLink UI app (ring-3 toolkit -> surface -> screen).
+    # Optional, same as hello.elf.
+    try:
+        with open("build/uidemo.elf", "rb") as f:
+            uidemo_elf_data = f.read()
+    except FileNotFoundError:
+        uidemo_elf_data = None
+
+    # v4demo.elf -- the EmUI V4 reference app (chromeless window, app-owned
+    # chrome). Optional, same as uidemo.elf.
+    try:
+        with open("build/v4demo.elf", "rb") as f:
+            v4demo_elf_data = f.read()
+    except FileNotFoundError:
+        v4demo_elf_data = None
+
+    # clockw.elf -- the clock desktop widget (EmUI V5). Optional.
+    try:
+        with open("build/clockw.elf", "rb") as f:
+            clockw_elf_data = f.read()
+    except FileNotFoundError:
+        clockw_elf_data = None
+
+    # wmdemo.elf -- the window-compositor demo (two composited windows).
+    # Optional, same as uidemo.elf.
+    try:
+        with open("build/wmdemo.elf", "rb") as f:
+            wmdemo_elf_data = f.read()
+    except FileNotFoundError:
+        wmdemo_elf_data = None
+
+    # home.elf -- the HOME launcher, spawned at boot as the desktop layer.
+    # Optional, same as uidemo.elf.
+    try:
+        with open("build/home.elf", "rb") as f:
+            home_elf_data = f.read()
+    except FileNotFoundError:
+        home_elf_data = None
+
+    # libembk.so -- the shared UI toolkit (Phase 2). The kernel's dynamic loader
+    # reads it from /libembk.so when a dynamically-linked app is spawned.
+    try:
+        with open("build/libembk.so", "rb") as f:
+            libembk_so_data = f.read()
+    except FileNotFoundError:
+        libembk_so_data = None
+
+    # font.ttf -- a real TrueType font uidemo loads at runtime from the fast
+    # EMBKFS root. Optional: skipped if the host font isn't present.
+    try:
+        with open("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "rb") as f:
+            font_ttf_data = f.read()
+    except FileNotFoundError:
+        font_ttf_data = None
+
     # --- objects we put in the root directory ---
     # hello.txt is an ordinary single-entry item (the regression case).
     # wgyehkb.txt and illoeuw.txt share the SAME CRC32C name hash (0xC38842AB),
@@ -224,15 +279,30 @@ def make_image(path: str, size_bytes: int = 1024 * 1024):
          init_elf_data),
         (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
          b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
-        (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
-         b"Colliding file A: wgyehkb.txt resolves to object 3.\n"),
-        (b"illoeuw.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
-         b"Colliding file B: illoeuw.txt resolves to object 4.\n"),
+        # NOTE (V5): the wgyehkb/illoeuw hash-collision pair was dropped from
+        # the BOOT image -- the single-leaf builder overflowed 4KB once
+        # clockw.elf joined the app set, and the verifier explicitly tolerates
+        # their absence. make_tree_image (embkfs_tree.img) still exercises
+        # collision chains.
         (b"hello.lnk",   L.DT_LNK, L.S_IFLNK | L.PERM_LNK,
          b"hello.txt"),
     ]
     if hello_elf_data is not None:
         objects.append((b"hello.elf", L.DT_REG, L.S_IFREG | 0o755, hello_elf_data))
+    if uidemo_elf_data is not None:
+        objects.append((b"uidemo.elf", L.DT_REG, L.S_IFREG | 0o755, uidemo_elf_data))
+    if wmdemo_elf_data is not None:
+        objects.append((b"wmdemo.elf", L.DT_REG, L.S_IFREG | 0o755, wmdemo_elf_data))
+    if v4demo_elf_data is not None:
+        objects.append((b"v4demo.elf", L.DT_REG, L.S_IFREG | 0o755, v4demo_elf_data))
+    if clockw_elf_data is not None:
+        objects.append((b"clockw.elf", L.DT_REG, L.S_IFREG | 0o755, clockw_elf_data))
+    if home_elf_data is not None:
+        objects.append((b"home.elf", L.DT_REG, L.S_IFREG | 0o755, home_elf_data))
+    if libembk_so_data is not None:
+        objects.append((b"libembk.so", L.DT_REG, L.S_IFREG | 0o755, libembk_so_data))
+    if font_ttf_data is not None:
+        objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font_ttf_data))
 
     # --- build the leaf items (sorted by key at the end) ---
     items = []
@@ -532,10 +602,11 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
          init_elf_data),
         (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
          b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
-        (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
-         b"Colliding file A: wgyehkb.txt resolves to object 3.\n"),
-        (b"illoeuw.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
-         b"Colliding file B: illoeuw.txt resolves to object 4.\n"),
+        # NOTE (V5): the wgyehkb/illoeuw hash-collision pair was dropped from
+        # the BOOT image -- the single-leaf builder overflowed 4KB once
+        # clockw.elf joined the app set, and the verifier explicitly tolerates
+        # their absence. make_tree_image (embkfs_tree.img) still exercises
+        # collision chains.
         (b"hello.lnk",   L.DT_LNK, L.S_IFLNK | L.PERM_LNK,
          b"hello.txt"),
     ]

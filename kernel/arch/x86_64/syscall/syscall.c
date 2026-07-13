@@ -4,10 +4,20 @@
 #include "arch/x86_64/syscall/usercopy.h"
 #include "drivers/char/serial.h"
 #include "drivers/timer/rtc.h"
+#include "drivers/timer/hpet.h"
+#include "drivers/timer/timer.h"
 #include "include/errno.h"
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "gfx/surface.h"
+#include "gfx/compositor.h"
+#include "drivers/video/framebuffer.h"
+#include "drivers/input/mouse.h"
+#include "drivers/input/keyboard.h"
+#include "include/kmalloc.h"
+#include "ipc/channel.h"
+#include "ipc/endpoint.h"
 #include "fs/fd.h"
 #include "fs/vfs.h"
 #include <stdint.h>
@@ -106,6 +116,18 @@ static int64_t sys_read(struct regs *r) {
             return done > 0 ? (int64_t)done : rc;
         }
         if (got > 0 && copy_to_user(buf + done, chunk, got) != EMBK_OK) {
+            /* The fs already consumed `got` bytes (vfs_fd_read advanced the
+             * position) but the caller never received them. Returning here
+             * WITHOUT rewinding silently dropped this chunk -- the next read
+             * continued past it (observed: font.ttf arriving k*256 bytes
+             * short with varying content under -smp 4, -> textless UI).
+             * Rewind so a retrying caller sees every byte exactly once. */
+            uint64_t np = 0;
+            vfs_fd_seek(fd, -(int64_t)got, 1 /* SEEK_CUR */, &np);
+            kprintf("sys_read: copy_to_user FAULT pid=%u dst=0x%llx off_done=%llu (rewound %llu)\n",
+                    current_thread ? (unsigned)current_process->pid : 0u,
+                    (unsigned long long)(uintptr_t)(buf + done),
+                    (unsigned long long)done, (unsigned long long)got);
             return done > 0 ? (int64_t)done : -EMBK_EFAULT;
         }
         done += got;
@@ -520,6 +542,436 @@ static int64_t sys_gettimeofday(struct regs *r) {
     return 0;
 }
 
+/* ---- Surfaces (EmbLink UI Piece 1: shared-memory pixel buffers) ---------
+ * Thin wrappers over kernel/gfx/surface.c. current_process is the client for
+ * create; the caller for the rest. See surface.h and the design spec. */
+
+static int64_t sys_surface_create(struct regs *r) {
+    uint32_t w = (uint32_t)r->rdi, h = (uint32_t)r->rsi;
+    uint32_t fmt = (uint32_t)r->rdx, n = (uint32_t)r->r10;
+    struct surface_info *user_out = (struct surface_info *)r->r8;
+
+    struct surface_info info;
+    int handle = surface_create(current_process, w, h, fmt, n, &info);
+    if (handle < 0) {
+        return handle;
+    }
+    if (user_out && copy_to_user(user_out, &info, sizeof(info)) != EMBK_OK) {
+        surface_destroy(current_process, handle);   // don't leak a half-handed-out surface
+        return -EMBK_EFAULT;
+    }
+    return handle;
+}
+
+static int64_t sys_surface_map(struct regs *r) {
+    int handle = (int)r->rdi;
+    struct surface_info *user_out = (struct surface_info *)r->rsi;
+
+    struct surface_info info;
+    uint64_t base = surface_map(current_process, handle, &info);
+    if (!base) {
+        return -EMBK_EINVAL;
+    }
+    if (user_out && copy_to_user(user_out, &info, sizeof(info)) != EMBK_OK) {
+        return -EMBK_EFAULT;
+    }
+    return (int64_t)base;
+}
+
+static int64_t sys_surface_acquire(struct regs *r) {
+    return surface_acquire(current_process, (int)r->rdi);
+}
+static int64_t sys_surface_commit(struct regs *r) {
+    return surface_commit(current_process, (int)r->rdi, (int)r->rsi);
+}
+static int64_t sys_surface_release(struct regs *r) {
+    return surface_release(current_process, (int)r->rdi, (int)r->rsi);
+}
+static int64_t sys_surface_destroy(struct regs *r) {
+    return surface_destroy(current_process, (int)r->rdi);
+}
+
+/* ---- Direct present: blit a user BGRA8888 buffer to the framebuffer -------
+ * A minimal "get pixels on screen" path for a single full-screen UI process,
+ * standing in for a full compositor. Copies row-by-row via copy_from_user
+ * (safe against a bad/short user pointer) and centres the image, then presents.
+ * rdi=user pixels, rsi=w, rdx=h. Source pixels are premultiplied BGRA (== a
+ * little-endian 0xAARRGGBB uint32); fb_blit's opaque path copies the RGB. */
+static int64_t sys_ui_present(struct regs *r) {
+    const uint8_t *upx = (const uint8_t *)r->rdi;
+    uint32_t w = (uint32_t)r->rsi, h = (uint32_t)r->rdx;
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || w == 0 || h == 0 || w > fi->width || h > fi->height) return -EMBK_EINVAL;
+
+    uint32_t *line = (uint32_t *)kmalloc((size_t)w * 4);
+    if (!line) return -EMBK_ENOMEM;
+    int32_t x = (int32_t)(fi->width  - w) / 2;
+    int32_t y = (int32_t)(fi->height - h) / 2;
+    for (uint32_t row = 0; row < h; row++) {
+        if (copy_from_user(line, upx + (size_t)row * w * 4, (size_t)w * 4) != EMBK_OK) {
+            kfree(line);
+            return -EMBK_EFAULT;
+        }
+        fb_blit(x, y + (int32_t)row, (int32_t)w, 1, line, w);
+    }
+    kfree(line);
+    fb_present();
+    return 0;
+}
+
+/* Present only a sub-rectangle of the user surface to the framebuffer -- the
+ * interactive path: an app that only moved its cursor uploads a handful of
+ * rows instead of the whole surface (the full blit above dominates a TCG
+ * frame). Args are packed to fit the register ABI:
+ *   rdi = pixel base, rsi = (surf_w<<16)|surf_h,
+ *   rdx = (rx<<48)|(ry<<32)|(rw<<16)|rh  (each 16-bit, surface-local). */
+static int64_t sys_ui_present_rect(struct regs *r) {
+    const uint8_t *upx = (const uint8_t *)r->rdi;
+    uint32_t sw = ((uint32_t)r->rsi >> 16) & 0xFFFF, sh = (uint32_t)r->rsi & 0xFFFF;
+    uint64_t rp = (uint64_t)r->rdx;
+    uint32_t rx = (uint32_t)((rp >> 48) & 0xFFFF), ry = (uint32_t)((rp >> 32) & 0xFFFF);
+    uint32_t rw = (uint32_t)((rp >> 16) & 0xFFFF), rh = (uint32_t)(rp & 0xFFFF);
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || sw == 0 || sh == 0 || sw > fi->width || sh > fi->height) return -EMBK_EINVAL;
+    if (rx >= sw || ry >= sh || rw == 0 || rh == 0) return 0;   /* empty -> nothing to push */
+    if (rx + rw > sw) rw = sw - rx;
+    if (ry + rh > sh) rh = sh - ry;
+
+    uint32_t *line = (uint32_t *)kmalloc((size_t)rw * 4);
+    if (!line) return -EMBK_ENOMEM;
+    int32_t x0 = (int32_t)(fi->width  - sw) / 2;
+    int32_t y0 = (int32_t)(fi->height - sh) / 2;
+    for (uint32_t row = 0; row < rh; row++) {
+        const uint8_t *srow = upx + ((size_t)(ry + row) * sw + rx) * 4;
+        if (copy_from_user(line, srow, (size_t)rw * 4) != EMBK_OK) {
+            kfree(line);
+            return -EMBK_EFAULT;
+        }
+        fb_blit(x0 + (int32_t)rx, y0 + (int32_t)(ry + row), (int32_t)rw, 1, line, rw);
+    }
+    kfree(line);
+    fb_present();
+    return 0;
+}
+
+/* Poll current pointer state into a user struct {int32 x,y; uint32 buttons}.
+ * The ring-3 UI loop calls this each frame to drive hover/click. */
+struct ui_input_kbuf { int32_t x, y; uint32_t buttons; int32_t wheel; };
+static int64_t sys_ui_input(struct regs *r) {
+    struct ui_input_kbuf k;
+    int32_t x = 0, y = 0; uint32_t b = 0;
+    mouse_get_state(&x, &y, &b);
+    k.x = x; k.y = y; k.buttons = b; k.wheel = mouse_take_wheel();
+    if (copy_to_user((void *)r->rdi, &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
+/* Non-blocking keystroke poll: returns the next ASCII byte (incl. '\b' 0x08 and
+ * '\n'), or 0 if the keyboard buffer is empty. The ring-3 UI loop drains this
+ * each frame and routes chars to the focused text field. */
+static int64_t sys_key_poll(struct regs *r) {
+    (void)r;
+    if (keyboard_has_char()) return (int64_t)(unsigned char)keyboard_getchar();
+    return 0;
+}
+
+/* Grab/release the keyboard so the kernel shell stops draining it while a UI app
+ * owns keystrokes (rdi != 0 grabs). Auto-released when this process is reaped. */
+static int64_t sys_key_grab(struct regs *r) {
+    keyboard_set_grab(r->rdi != 0, current_process ? current_process->pid : 0);
+    return 0;
+}
+
+/* Monotonic milliseconds since boot, from the HPET counter -- the clock the
+ * ring-3 UI animator ticks on. Falls back to the coarse timer tick count. */
+static uint64_t uptime_ms_now(void) {
+    if (hpet_available()) {
+        uint64_t pf = hpet_period_fs();                 /* femtoseconds per tick */
+        if (pf) {
+            uint64_t tpms = 1000000000000ULL / pf;      /* ticks per millisecond */
+            if (tpms == 0) tpms = 1;
+            return hpet_read_counter() / tpms;
+        }
+    }
+    return timer_get_ticks();
+}
+
+static int64_t sys_uptime_ms(struct regs *r) {
+    (void)r;
+    return (int64_t)uptime_ms_now();
+}
+
+/* Sleep >= rdi milliseconds. Implemented as a yield loop against an HPET
+ * deadline -- every pass gives the CPU away, so a sleeping app costs a few
+ * microseconds per scheduler round instead of burning its whole timeslice
+ * (the ring-3 UI apps used to pace with volatile spin loops; with 2-3 apps
+ * live, each stole a full slice per round and everything crawled). Not a
+ * blocking timer wait (no scheduler-side wakeup list -- deliberately zero
+ * scheduler surgery), but it removes ~all of the idle CPU theft. */
+static int64_t sys_sleep_ms(struct regs *r) {
+    uint64_t end = uptime_ms_now() + r->rdi;
+    do { sys_yield(); } while (uptime_ms_now() < end);
+    return 0;
+}
+
+/* 1 if the child named by spawn HANDLE `rdi` is alive, else 0. Takes the same
+ * handle sys_spawn returned (NOT a raw pid -- spawn deliberately never exposes
+ * pids), so the check is pinned to the exact child instance: a recycled pid
+ * can't alias, and an unknown/freed handle is simply "not alive". The home
+ * launcher uses this to not re-spawn an app whose tile is clicked twice. */
+static int64_t sys_proc_alive(struct regs *r) {
+    uint32_t pid;
+    if (process_handle_resolve(current_process, (int)r->rdi, &pid) != 0)
+        return 0;
+    return (int64_t)process_alive(pid);
+}
+
+/* win_resize(id, w, h, &out_va) -> id, with the window's NEW shared-pixel
+ * mapping base written to *out_va (the old mapping is gone on return). */
+static int64_t sys_win_resize(struct regs *r) {
+    uint64_t cva = 0;
+    int64_t rc = compositor_win_resize(current_process, (uint32_t)r->rdi,
+                                       (uint32_t)r->rsi, (uint32_t)r->rdx, &cva);
+    if (rc < 0) return rc;
+    if (r->r10 && copy_to_user((void *)r->r10, &cva, sizeof(cva)) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return rc;
+}
+
+/* ---- window compositor (EmbLink UI Piece 2) -----------------------------
+ * Thin wrappers over kernel/gfx/compositor.c. The client renders into its own
+ * buffer and PRESENTS pixels (copy_from_user) into a kernel window content
+ * buffer; the compositor draws all windows over a desktop with chrome. */
+
+/* rdi=content_w, rsi=content_h, rdx=x, r10=y, r8=title(user char*),
+ * r9=out uint64_t* for the shared client VA (0 => plain copy window).
+ * Returns a window id (>0) or -EMBK_*. */
+static int64_t sys_win_create(struct regs *r) {
+    /* Window-style flags ride the high bits of rdi (cw is <= 16 bits real). */
+    uint32_t cw = (uint32_t)(r->rdi & 0xFFFFFFFFULL), ch = (uint32_t)r->rsi;
+    int chromeless = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
+    int widget     = (r->rdi >> 33) & 1;   /* EMBK_WINF_WIDGET */
+    int32_t x = (int32_t)r->rdx, y = (int32_t)r->r10;
+    char title[COMP_TITLE_MAX + 1];
+    int i = 0;
+    if (r->r8) {
+        for (; i < COMP_TITLE_MAX; i++) {
+            char c;
+            if (copy_from_user(&c, (const void *)(r->r8 + (uint64_t)i), 1) != EMBK_OK) break;
+            if (!c) break;
+            title[i] = c;
+        }
+    }
+    title[i] = 0;
+    int pid = current_process ? (int)current_process->pid : -1;
+
+    if (r->r9) {   /* zero-copy: map the pixel pages into the client, return VA */
+        uint64_t cva = 0;
+        int64_t id = widget
+            ? compositor_win_create_widget(current_process, cw, ch, x, y, title, &cva)
+            : chromeless
+            ? compositor_win_create_chromeless(current_process, cw, ch, x, y, title, &cva)
+            : compositor_win_create_shared(current_process, cw, ch, x, y, title, &cva);
+        if (id < 0) return id;
+        if (copy_to_user((void *)r->r9, &cva, sizeof(cva)) != EMBK_OK) {
+            compositor_win_destroy(pid, (uint32_t)id);
+            return -EMBK_EFAULT;
+        }
+        return id;
+    }
+    return compositor_win_create(pid, cw, ch, x, y, title);
+}
+
+/* rdi=win id, rsi=user pixels (whole cw*ch content), rdx=(cw<<16)|ch,
+ * r10=(rx<<48)|(ry<<32)|(rw<<16)|rh  (0 => present whole window). */
+static int64_t sys_win_present(struct regs *r) {
+    uint32_t id = (uint32_t)r->rdi;
+    const uint8_t *upx = (const uint8_t *)r->rsi;
+    uint32_t uw = ((uint32_t)r->rdx >> 16) & 0xFFFF, uh = (uint32_t)r->rdx & 0xFFFF;
+    int pid = current_process ? (int)current_process->pid : -1;
+
+    uint32_t cw = 0, ch = 0;
+    uint32_t *content = compositor_win_content(pid, id, &cw, &ch);
+    if (!content) return -EMBK_ENOENT;
+    if (uw != cw || uh != ch) return -EMBK_EINVAL;   /* client/kernel disagree */
+
+    uint64_t rp = (uint64_t)r->r10;
+    uint32_t rx, ry, rw, rh;
+    if (rp == 0) { rx = 0; ry = 0; rw = cw; rh = ch; }
+    else {
+        rx = (uint32_t)((rp >> 48) & 0xFFFF); ry = (uint32_t)((rp >> 32) & 0xFFFF);
+        rw = (uint32_t)((rp >> 16) & 0xFFFF); rh = (uint32_t)(rp & 0xFFFF);
+    }
+    if (rx >= cw || ry >= ch || rw == 0 || rh == 0) return 0;
+    if (rx + rw > cw) rw = cw - rx;
+    if (ry + rh > ch) rh = ch - ry;
+
+    /* A shared (zero-copy) window's client already rendered straight into the
+     * shared pages -- there's nothing to copy, just damage. A plain window
+     * uploads the presented rows from the client's private buffer. */
+    if (!compositor_win_is_shared(pid, id)) {
+        for (uint32_t row = 0; row < rh; row++) {
+            size_t off = ((size_t)(ry + row) * cw + rx);
+            if (copy_from_user(content + off, upx + off * 4, (size_t)rw * 4) != EMBK_OK)
+                return -EMBK_EFAULT;
+        }
+    }
+    return compositor_win_damage(pid, id, rx, ry, rw, rh);
+}
+
+/* rdi=win id, rsi=x, rdx=y (screen coords of the window frame's top-left). */
+static int64_t sys_win_move(struct regs *r) {
+    int pid = current_process ? (int)current_process->pid : -1;
+    return compositor_win_move(pid, (uint32_t)r->rdi, (int32_t)r->rsi, (int32_t)r->rdx);
+}
+
+/* rdi=win id. */
+static int64_t sys_win_destroy(struct regs *r) {
+    int pid = current_process ? (int)current_process->pid : -1;
+    return compositor_win_destroy(pid, (uint32_t)r->rdi);
+}
+
+/* Report the screen (framebuffer) size so a windowed app can fit itself to it.
+ * Writes width to *[rdi] and height to *[rsi]. */
+static int64_t sys_screen_size(struct regs *r) {
+    const fb_info_t *fi = fb_get_info();
+    uint32_t w = fi ? fi->width : 0, h = fi ? fi->height : 0;
+    if ((r->rdi && copy_to_user((void *)r->rdi, &w, sizeof w) != EMBK_OK) ||
+        (r->rsi && copy_to_user((void *)r->rsi, &h, sizeof h) != EMBK_OK))
+        return -EMBK_EFAULT;
+    return 0;
+}
+
+/* Create the full-screen chromeless HOME/desktop window (zero-copy). Returns the
+ * window id; writes the client pixel VA to *[rdi] and the screen size to *[rsi]
+ * (w) and *[rdx] (h) so the app learns the dimensions. */
+static int64_t sys_win_create_desktop(struct regs *r) {
+    uint64_t cva = 0; uint32_t w = 0, h = 0;
+    int64_t id = compositor_win_create_desktop(current_process, &cva, &w, &h);
+    if (id < 0) return id;
+    int pid = current_process ? (int)current_process->pid : -1;
+    if ((r->rdi && copy_to_user((void *)r->rdi, &cva, sizeof cva) != EMBK_OK) ||
+        (r->rsi && copy_to_user((void *)r->rsi, &w, sizeof w) != EMBK_OK) ||
+        (r->rdx && copy_to_user((void *)r->rdx, &h, sizeof h) != EMBK_OK)) {
+        compositor_win_destroy(pid, (uint32_t)id);
+        return -EMBK_EFAULT;
+    }
+    return id;
+}
+
+/* rdi = user ptr to struct { int32_t focused; int32_t x, y; uint32_t buttons,
+ * win; }. Delivers the content-local pointer if this process owns the window
+ * under the cursor (focused=1) else focused=0. */
+struct win_input_kbuf { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
+static int64_t sys_win_input(struct regs *r) {
+    int pid = current_process ? (int)current_process->pid : -1;
+    int32_t lx = 0, ly = 0, wheel = 0; uint32_t btn = 0, win = 0;
+    int foc = compositor_win_input(pid, &lx, &ly, &btn, &win, &wheel);
+    struct win_input_kbuf k = { foc, lx, ly, btn, win, wheel };
+    if (copy_to_user((void *)r->rdi, &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
+/* ---- IPC channels (EmbLink UI Piece 1, Layer A) -------------------------
+ * The syscall layer does the user<->kernel copies; kernel/ipc/channel.c does
+ * the queueing, blocking, and handle transfer. */
+
+static int64_t sys_chan_pair(struct regs *r) {
+    int *user_out = (int *)r->rdi;   /* -> int[2] */
+    int h0 = -1, h1 = -1;
+    int rc = channel_create_pair(current_process, &h0, &h1);
+    if (rc < 0) return rc;
+    int out[2] = { h0, h1 };
+    if (copy_to_user(user_out, out, sizeof(out)) != EMBK_OK) {
+        channel_close(current_process, h0);
+        channel_close(current_process, h1);
+        return -EMBK_EFAULT;
+    }
+    return 0;
+}
+
+static int64_t sys_chan_send(struct regs *r) {
+    int handle       = (int)r->rdi;
+    const void *ubytes = (const void *)r->rsi;
+    uint32_t len     = (uint32_t)r->rdx;
+    const int *uhnds = (const int *)r->r10;
+    const int *uflags= (const int *)r->r8;
+    uint32_t n_hnd   = (uint32_t)r->r9;
+
+    if (len > CHAN_MSG_MAX_BYTES || n_hnd > CHAN_MSG_MAX_HANDLES) return -EMBK_EINVAL;
+
+    uint8_t kbytes[CHAN_MSG_MAX_BYTES];
+    if (len && copy_from_user(kbytes, ubytes, len) != EMBK_OK) return -EMBK_EFAULT;
+
+    int khnds[CHAN_MSG_MAX_HANDLES];
+    int kflags[CHAN_MSG_MAX_HANDLES];
+    if (n_hnd) {
+        if (copy_from_user(khnds, uhnds, n_hnd * sizeof(int)) != EMBK_OK) return -EMBK_EFAULT;
+        if (uflags) {
+            if (copy_from_user(kflags, uflags, n_hnd * sizeof(int)) != EMBK_OK) return -EMBK_EFAULT;
+        } else {
+            for (uint32_t i = 0; i < n_hnd; i++) kflags[i] = CHAN_HANDLE_COPY;
+        }
+    }
+    return channel_send(current_process, handle, len ? kbytes : 0, len,
+                        n_hnd ? khnds : 0, n_hnd ? kflags : 0, n_hnd);
+}
+
+static int64_t sys_chan_recv(struct regs *r) {
+    int handle          = (int)r->rdi;
+    void *ubuf          = (void *)r->rsi;
+    uint32_t buflen     = (uint32_t)r->rdx;
+    uint32_t *u_outlen  = (uint32_t *)r->r10;
+    int *u_outhnds      = (int *)r->r8;
+    uint32_t *u_outnhnd = (uint32_t *)r->r9;
+
+    /* Effective limit = min(user buflen, kernel buffer). channel_recv returns
+     * EMSGSIZE (message left queued) if the message exceeds it, so we never
+     * overrun the user buffer. */
+    uint32_t eff = buflen > CHAN_MSG_MAX_BYTES ? CHAN_MSG_MAX_BYTES : buflen;
+    uint8_t kbuf[CHAN_MSG_MAX_BYTES];
+    uint32_t out_len = 0, out_nhnd = 0;
+    int out_hnds[CHAN_MSG_MAX_HANDLES];
+
+    int64_t rc = channel_recv(current_process, handle, kbuf, eff, &out_len, out_hnds, &out_nhnd);
+    if (rc < 0) return rc;
+
+    if (out_len && ubuf && copy_to_user(ubuf, kbuf, out_len) != EMBK_OK) return -EMBK_EFAULT;
+    if (u_outlen && copy_to_user(u_outlen, &out_len, sizeof(out_len)) != EMBK_OK) return -EMBK_EFAULT;
+    if (out_nhnd && u_outhnds &&
+        copy_to_user(u_outhnds, out_hnds, out_nhnd * sizeof(int)) != EMBK_OK) return -EMBK_EFAULT;
+    if (u_outnhnd && copy_to_user(u_outnhnd, &out_nhnd, sizeof(out_nhnd)) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
+static int64_t sys_chan_close(struct regs *r) {
+    return channel_close(current_process, (int)r->rdi);
+}
+
+/* ---- Rendezvous (EmbLink UI Piece 1, Layer B) ---------------------------
+ * VFS named listening endpoints (epfs, mounted at /run). `path` copied in
+ * through a bounded kernel buffer, same pattern as sys_open/sys_stat. */
+
+static int64_t sys_chan_listen(struct regs *r) {
+    const char *user_path = (const char *)r->rdi;
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, user_path, sizeof(path));
+    if (len < 0) return len;
+    return endpoint_listen(current_process, path);
+}
+
+static int64_t sys_chan_accept(struct regs *r) {
+    return endpoint_accept(current_process, (int)r->rdi);
+}
+
+static int64_t sys_chan_connect(struct regs *r) {
+    const char *user_path = (const char *)r->rdi;
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, user_path, sizeof(path));
+    if (len < 0) return len;
+    return endpoint_connect(current_process, path);
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -542,6 +994,35 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_sbrk    17
 #define SYS_fstat   18
 #define SYS_gettimeofday 19
+#define SYS_surface_create  20
+#define SYS_surface_map     21
+#define SYS_surface_acquire 22
+#define SYS_surface_commit  23
+#define SYS_surface_release 24
+#define SYS_surface_destroy 25
+#define SYS_chan_pair   26
+#define SYS_chan_send   27
+#define SYS_chan_recv   28
+#define SYS_chan_close  29
+#define SYS_chan_listen  30
+#define SYS_chan_accept  31
+#define SYS_chan_connect 32
+#define SYS_ui_present   33
+#define SYS_ui_input     34
+#define SYS_ui_present_rect 35
+#define SYS_key_poll     36
+#define SYS_key_grab     37
+#define SYS_uptime_ms    38
+#define SYS_win_create   39
+#define SYS_win_present  40
+#define SYS_win_move     41
+#define SYS_win_destroy  42
+#define SYS_win_create_desktop 43
+#define SYS_win_input    44
+#define SYS_screen_size  45
+#define SYS_sleep_ms     46
+#define SYS_proc_alive   47
+#define SYS_win_resize   48
 
 
 static syscall_handler_t syscall_table[] = {
@@ -564,6 +1045,35 @@ static syscall_handler_t syscall_table[] = {
     [SYS_sbrk]    = sys_sbrk,
     [SYS_fstat]   = sys_fstat,
     [SYS_gettimeofday] = sys_gettimeofday,
+    [SYS_surface_create]  = sys_surface_create,
+    [SYS_surface_map]     = sys_surface_map,
+    [SYS_surface_acquire] = sys_surface_acquire,
+    [SYS_surface_commit]  = sys_surface_commit,
+    [SYS_surface_release] = sys_surface_release,
+    [SYS_surface_destroy] = sys_surface_destroy,
+    [SYS_chan_pair]  = sys_chan_pair,
+    [SYS_chan_send]  = sys_chan_send,
+    [SYS_chan_recv]  = sys_chan_recv,
+    [SYS_chan_close] = sys_chan_close,
+    [SYS_chan_listen]  = sys_chan_listen,
+    [SYS_chan_accept]  = sys_chan_accept,
+    [SYS_chan_connect] = sys_chan_connect,
+    [SYS_ui_present]   = sys_ui_present,
+    [SYS_ui_input]     = sys_ui_input,
+    [SYS_ui_present_rect] = sys_ui_present_rect,
+    [SYS_key_poll]     = sys_key_poll,
+    [SYS_uptime_ms]    = sys_uptime_ms,
+    [SYS_key_grab]     = sys_key_grab,
+    [SYS_win_create]   = sys_win_create,
+    [SYS_win_present]  = sys_win_present,
+    [SYS_win_move]     = sys_win_move,
+    [SYS_win_destroy]  = sys_win_destroy,
+    [SYS_win_create_desktop] = sys_win_create_desktop,
+    [SYS_win_input]    = sys_win_input,
+    [SYS_screen_size]  = sys_screen_size,
+    [SYS_sleep_ms]     = sys_sleep_ms,
+    [SYS_proc_alive]   = sys_proc_alive,
+    [SYS_win_resize]   = sys_win_resize,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

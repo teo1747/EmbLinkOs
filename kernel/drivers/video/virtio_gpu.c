@@ -17,6 +17,7 @@
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "arch/x86_64/cpu/spinlock.h"
 
 // ---- virtio PCI capability layout ------------------------------------------
 #define VIRTIO_PCI_CAP_COMMON_CFG  1
@@ -208,10 +209,23 @@ static inline uint64_t vgpu_dma(const volatile void *p) {
 // ---- synchronous command execution -------------------------------------------
 // Places cmd (device-readable) + resp (device-writable) as a two-descriptor
 // chain, notifies the device, and busy-waits for the used-ring entry.
+/* One submitter at a time: cmd_buf/resp_buf, the descriptor+avail rings and
+ * last_used_idx are all SHARED single-slot state. Under SMP, one core painting
+ * (compositor -> fb -> flush) while another kprintf'd (console -> fb -> flush)
+ * submitted concurrently, desynced last_used_idx from the device and every
+ * later command spun its full timeout -- the "OS just hangs" under -smp 4.
+ * NOTE the error paths must NOT kprintf while holding this lock: kprintf's
+ * console flush re-enters this very function -> instant self-deadlock. */
+static spinlock_t vgpu_lock = SPINLOCK_INIT;
+
 static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
                         void *resp, uint32_t resp_len,
                         uint32_t expect_type) {
     struct virtio_gpu_state *s = &g_vgpu;
+    int fail = 0;   /* 0 ok, 1 bad response type, 2 timeout */
+    uint32_t bad_cmd = 0, bad_resp = 0;
+
+    spin_lock(&vgpu_lock);
 
     if (cmd != s->cmd_buf) memcpy(s->cmd_buf, cmd, cmd_len);
     memset(s->resp_buf, 0, resp_len < sizeof(s->resp_buf) ? resp_len : sizeof(s->resp_buf));
@@ -236,23 +250,33 @@ static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
          (uint32_t)s->queue_notify_off * s->notify_off_multiplier, 0);
 
     // Busy-wait for completion (control commands are quick on QEMU).
+    fail = 2;
     for (uint32_t spins = 0; spins < 200000000U; spins++) {
         __sync_synchronize();
         if (s->used.idx != s->last_used_idx) {
             s->last_used_idx = s->used.idx;
             struct virtio_gpu_ctrl_hdr *h = (struct virtio_gpu_ctrl_hdr *)s->resp_buf;
             if (h->type != expect_type) {
-                kprintf("virtio-gpu: cmd %x -> unexpected resp %x\n",
-                        (unsigned int)((const struct virtio_gpu_ctrl_hdr *)s->cmd_buf)->type,
-                        (unsigned int)h->type);
-                return false;
+                fail = 1;
+                bad_cmd  = ((const struct virtio_gpu_ctrl_hdr *)s->cmd_buf)->type;
+                bad_resp = h->type;
+            } else {
+                fail = 0;
+                if (resp && resp != s->resp_buf) memcpy(resp, s->resp_buf, resp_len);
             }
-            if (resp && resp != s->resp_buf) memcpy(resp, s->resp_buf, resp_len);
-            return true;
+            break;
         }
     }
-    kprintf("virtio-gpu: command timeout\n");
-    return false;
+
+    spin_unlock(&vgpu_lock);
+
+    /* report OUTSIDE the lock (kprintf re-enters this path via the console) */
+    if (fail == 1)
+        kprintf("virtio-gpu: cmd %x -> unexpected resp %x\n",
+                (unsigned int)bad_cmd, (unsigned int)bad_resp);
+    else if (fail == 2)
+        kprintf("virtio-gpu: command timeout\n");
+    return fail == 0;
 }
 
 static bool vgpu_simple_cmd(const void *cmd, uint32_t cmd_len) {

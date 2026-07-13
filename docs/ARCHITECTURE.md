@@ -1,6 +1,6 @@
 # EmbLinkOS — Architecture
 
-*Living document — last updated 2026-07-05.*
+*Living document — last updated 2026-07-13.*
 
 **Status legend:**
 `✅ Built` — implemented and verified · `🎯 Designed` — decided, not yet implemented · `🔓 Open` — undecided fork · `⏳ Later` — decided direction, off the near-term critical path
@@ -39,10 +39,10 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | Buddy allocator (PMM upgrade) | ⏳ Later |
 | | | Per-process address spaces | ✅ Built *(`mmap`/`brk` still 🎯 Designed)* |
 | | | Copy-on-write pages, NX bit | ⏳ Later *(COW arrives with `fork()`)* |
-| | | Scheduler — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (timer-preemptive priority-band round-robin + aging, wait queues, real blocking wait; no SMP yet — see spec §17) |
+| | | Scheduler — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | ✅ Built (timer-preemptive priority-band round-robin + aging, wait queues, real blocking wait, **SMP** — all detected cores brought up via ACPI/MADT, per-core idle threads, a global scheduler lock held across context switches; see spec §17) |
 | | | Ring 3 entry (`int 0x80`/`iretq`) | ✅ Built *(`SYSCALL`/`SYSRET` fast path still 🎯 Designed)* |
-| 3 | Process & IPC | Process objects, context switch — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | 🚧 Built (no thread/process split yet — see spec §4.1); per-process fd tables ✅, parent/child tracking ✅ |
-| | | `spawn()`-shaped process creation (`process_create`, ELF-based) | 🚧 Built (`sys_spawn`/`sys_wait`/`sys_kill` ✅, capability handles not raw pids ✅ — see spec §15.2; still no file-actions list) |
+| 3 | Process & IPC | Process objects, context switch — see [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md) | ✅ Built — real `struct thread`/`struct process` split (thread = schedulable unit, process = resource owner: address space, fd/handle tables, parent/child/zombie tracking); ring-3 threads with `thread_create_user`/`thread_join`/`thread_exit_self`, not just kernel threads (spec §4.1/§6.1) |
+| | | `spawn()`-shaped process creation (`process_create`, ELF-based) | ✅ Built (`sys_spawn`/`sys_wait`/`sys_kill` ✅, capability handles not raw pids ✅ — see spec §15.2; still no file-actions list) |
 | | | Uncatchable kernel-level kill | ✅ Built (`process_kill`; exposed to ring 3 via `sys_kill`, capability-handle-gated) |
 | | | Message/event ports | 🎯 Designed |
 | | | Pipes | 🎯 Designed |
@@ -58,10 +58,10 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | FAT32 (write, mkdir, LFN, FSInfo) | ✅ Built |
 | | | fd layer (base 3, create-on-open, `kcontext` unwind) | ✅ Built |
 | | | Page/buffer cache | ⏳ Later |
-| 6 | Syscall ABI + libc | Syscall surface (split: fds / handles) | ✅ Built (13 calls: write/read/open/close/lseek/stat/readdir/spawn/wait/yield/getpid/kill/exit, user-pointer-validated; process/thread objects now go through the typed-handle half of the split too — `sys_spawn`/`sys_wait`/`sys_kill` take/return capability handles, not raw pids, see §3.4) |
-| | | newlib (bring-up libc) → musl (later) | 🔓 / ⏳ |
-| 7 | Userspace runtime | Userspace ELF loader (static-first) | 🎯 Designed *(critical path)* |
-| | | init / service manager (PID 1) | 🔓 Open |
+| 6 | Syscall ABI + libc | Syscall surface (split: fds / handles) | ✅ Built (~48 calls: fd/file I/O, process spawn/wait/kill/thread, window/compositor, IPC channels, `sleep_ms`/`proc_alive`/`win_resize` among the newest; user-pointer-validated via `access_ok`/`copy_from_user`/`copy_to_user`; process/thread/window objects go through the typed-handle half of the split — see §3.4) |
+| | | newlib (bring-up libc) → musl (later) | ✅ Built *(newlib; musl swap still ⏳ Later, not currently planned)* |
+| 7 | Userspace runtime | Userspace ELF loader — static **and dynamic linking** | ✅ Built (in-kernel loader, no `PT_INTERP`/userspace `ld.so`: static `ET_EXEC` binaries, and `ET_EXEC` apps dynamically linked against one shared object, `libembk.so` — the UI toolkit — with eager `RELATIVE`/`64`/`GLOB_DAT`/`JUMP_SLOT`/`COPY` relocation and two-way symbol resolution between the app's static libc and the `.so`'s toolkit code; see [`BUILD_SETUP.md`](BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works)) |
+| | | init / service manager (PID 1) | 🔓 Open *(the home launcher currently plays this role informally — spawns/tracks apps, but is not a general service manager)* |
 | 8 | Core userspace (personality) | Native shell — structured; minimal runner first, ported dash for Linux scripts | 🎯 Designed |
 | | | Coreutils (downstream of shell builtins-vs-separate — see §6) | 🔓 Open |
 | | | TTY + terminal emulator | 🔓 Open |
@@ -70,8 +70,10 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | Editor / IDE (native) | 🔓 Open |
 | 9 | Compatibility | Linux-compat mechanism | 🔓 Open |
 | | | POSIX-"enough" surface | 🎯 Designed |
-| 10 | UI / graphics | Framebuffer console + TTY | 🎯 Designed *(enough for self-hosting)* |
-| | | Compositor / display server, toolkit, GUI apps | ⏳ Later *(post-self-hosting)* |
+| 10 | UI / graphics | Framebuffer console + TTY | ✅ Built *(framebuffer console; a full scrollback/line-editing TTY is still 🎯)* |
+| | | Compositor / display server | ✅ Built (`kernel/gfx/compositor.c` — z-ordered windows, kernel-drawn or app-owned chrome, zero-copy shared-memory windows, resizable windows, desktop widgets in their own z-band, pointer capture) |
+| | | UI toolkit ("EmUI") | ✅ Built — from-scratch, SwiftUI-flavored declarative toolkit (`ui/`); see [`EMUI_INTERNALS.md`](EMUI_INTERNALS.md) |
+| | | GUI apps | ✅ Built — the home launcher boots by default; reference apps (`uidemo`, `wmdemo`, `v4demo`, `clockw`) exercise the full toolkit; see [`EMUI_GUIDE.md`](EMUI_GUIDE.md) |
 | 11 | Security (cross-cutting) | Ring 0/3 + address-space isolation | 🎯 Designed |
 | | | Access control (see §3.5) | 🎯 Designed |
 | | | POSIX-capabilities (split root), multi-user policy | ⏳ Later |
@@ -137,11 +139,17 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 ## 4. Built Subsystems (current kernel)
 
 - **Boot:** custom two-stage BIOS bootloader, LBA via INT 13h extensions, E820 memory map, ELF kernel loader.
-- **CPU/interrupts:** GDT/IDT/TSS, exception handling, ACPI/MADT parsing, APIC (8259 PIC retired).
-- **Memory:** bitmap PMM, higher-half VMM (kernel @ `0xFFFFFFFF80100000`). *Known limits: maps only first 1 GB of physical RAM (breaks on real HW with more), hardcoded stack, no NX.*
-- **Storage:** AHCI driver (LBA48 read/write, verified vs. host ground truth), block layer with DMA bounce buffers (IDE primary channel for DMA; test disks as `sdb`).
-- **Filesystems:** VFS (filesystem-neutral mount registry, `vfs_resolve` with `.`/`..` breadcrumb stack, `vget` op, `ls`, live boot selftest). FAT32 (file write, `mkdir`, LFN with correct reverse on-disk ordering + checksums, FSInfo; clean vs. `fsck.vfat`/`mcopy`). EMBKFS (on-disk format, B-tree descent, mount-time allocator, CoW write path with superblock-swap atomicity, block reclaim; Python oracle produces byte-identical checksums).
-- **File layer:** fd table (base 3, stdio reserved), create-on-open, `kcontext` setjmp/longjmp so `sys_exit` unwinds to kernel (RFLAGS saved/restored — bypassing `iretq` had left IF cleared). Unlink-while-open safety via `g_open_refs` + deferred-free. *Known limit: no on-disk orphan list; mount-time sweep planned.*
+- **CPU/interrupts:** GDT/IDT/TSS, exception handling, ACPI/MADT parsing, APIC (8259 PIC retired), **SMP bring-up across all detected cores**.
+- **Memory:** bitmap PMM, higher-half VMM (kernel @ `0xFFFFFFFF80100000`), per-process address spaces. *Known limits: hardcoded stack size, no COW/NX yet.*
+- **Process & scheduling:** preemptive SMP scheduler (priority-band round-robin + aging), ring-3 processes and threads, `spawn()`/`wait()`/`kill()` via capability handles, uncatchable kernel-level kill. See [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
+- **Storage:** ATA + AHCI drivers (LBA48 read/write), block layer with DMA bounce buffers, MBR partitioning, USB mass storage as an alternate block-device backend.
+- **Filesystems:** VFS (filesystem-neutral mount registry, `vfs_resolve` with `.`/`..` breadcrumb stack, `vget` op, `ls`). FAT32 (file write, `mkdir`, LFN, FSInfo). **EMBKFS** — the primary filesystem: CoW B-tree on-disk format, checksums, AES-256-XTS encryption, compression, snapshots, self-heal, provenance, verified boot; a Python reference implementation (`tools/embkfs_mkfs/`) builds and independently verifies images. See [`EMBKFS_spec_v2.2.md`](EMBKFS_spec_v2.2.md).
+- **File layer:** fd table (base 3, stdio reserved), create-on-open, `kcontext` setjmp/longjmp so `sys_exit` unwinds to kernel. Unlink-while-open safety via `g_open_refs` + deferred-free. *Known limit: no on-disk orphan list; mount-time sweep planned.*
+- **USB:** all four host-controller generations (xHCI, EHCI, UHCI, OHCI) — keyboard, mouse, mass storage.
+- **Display:** GPU driver (virtio-gpu → Bochs DISPI → VBE fallback), a framebuffer console, and an in-kernel **window compositor** (z-order, kernel or app-owned chrome, zero-copy shared-memory windows, resizable windows, desktop widgets in a dedicated z-band, pointer capture).
+- **Userland runtime:** newlib port (freestanding / static / dynamically-linked build modes — see [`user/README.md`](../user/README.md)); in-kernel ELF loader supporting both static and dynamic linking (no userspace `ld.so`; see [`BUILD_SETUP.md`](BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works)).
+- **UI:** **EmUI**, a from-scratch SwiftUI-flavored declarative toolkit (`ui/`) — scene graph, flexbox layout, a reactive core, a themed widget kit, a CPU render backend with a from-scratch TrueType rasterizer, and a DSL with an app-runtime layer (`EM_APPLICATION`/`EM_WIDGET`) that removes essentially all app boilerplate. See [`EMUI_INTERNALS.md`](EMUI_INTERNALS.md).
+- **IPC:** capability handles, channels, and endpoints for cross-process communication (`kernel/ipc/`).
 
 ---
 
@@ -151,15 +159,16 @@ Ordered by dependency. Fine-grained tasks live in `TODO.md`.
 
 1. **Ring 3 entry** ✅ — via `int 0x80`/`iretq`, privilege separation working. The `SYSCALL`/`SYSRET` fast path (MSR setup, entry stub) is still 🎯, but no longer blocks anything below it.
 2. **Per-process address spaces** ✅ — separate page-table hierarchies; `process_create` builds one from an ELF path per §2's `spawn()`-shaped row.
-3. **Scheduler** *(Phases A–D landed)* — timer-driven preemptive priority-band round-robin with aging, wait queues, the **uncatchable kernel kill**, real blocking `wait()`, and capability handles for `spawn`/`wait`/`kill` are all built. Only SMP is still open, deferred until something concrete needs it. Full phased spec: [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
-4. **Userspace ELF loading** ✅ — static binaries, loaded from the filesystem (not an embedded blob); relocation/dynamic linking still later.
-5. **Syscall ABI surface for a libc** *(largely built)* — file I/O ✅ (open/read/write/close/lseek/stat/readdir, wired through to VFS/FAT32/EMBKFS), process spawn/wait ✅ (`sys_spawn`/`sys_wait`, still busy-poll-based — see the scheduling spec §7.4/§17), user-pointer validation ✅ (`access_ok`/`copy_from_user`/`copy_to_user`). Still open: memory (`brk`/`mmap`-equiv), basic TTY, and the `SYSCALL`/`SYSRET` fast path.
-6. **newlib** — supply the ~dozen low-level stubs (`_read`, `_write`, `_open`, `_close`, `_lseek`, `_sbrk`, `_fstat`, `_exit`, `_getpid`, …). Familiar from Cortex-M.
-7. **TTY/console** — keyboard input + the VBE framebuffer console.
-8. **Toolchain port — TCC first.** Single self-contained binary (built-in assembler + linker, no subprocess spawning), so it runs before a full `fork`/`exec`/pipe process model exists. GCC/LLVM later, once the subprocess-spawning model is in place.
-9. **Shell + editor** — the last mile to a livable environment.
+3. **Scheduler** ✅ — timer-driven preemptive priority-band round-robin with aging, wait queues, the **uncatchable kernel kill**, real blocking `wait()`, capability handles for `spawn`/`wait`/`kill`, and **SMP across all detected cores**. Full phased spec: [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
+4. **Userspace ELF loading** ✅ — static binaries loaded from the filesystem, **plus in-kernel dynamic linking** against a shared object (`libembk.so`, the UI toolkit) — see [`BUILD_SETUP.md`](BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works).
+5. **Syscall ABI surface for a libc** ✅ — file I/O, process spawn/wait/thread, memory (`sbrk`), window/compositor, IPC, user-pointer validation are all built (~48 calls). Still open: `mmap`-equivalent, the `SYSCALL`/`SYSRET` fast path.
+6. **newlib** ✅ — full port, including a C99-format-enabled rebuild (`%z`/`%ll` support the stock toolchain newlib lacks) — see [`user/README.md`](../user/README.md) and [`BUILD_SETUP.md`](BUILD_SETUP.md#the-newlib-c99-rebuild-why-there-are-two-newlibs).
+7. **Display + GUI** ✅ *(landed ahead of the shell, not blocking it)* — GPU driver, window compositor, and **EmUI** (a from-scratch declarative UI toolkit) all shipped; the OS boots straight into a graphical home launcher rather than a text shell. See [`EMUI_GUIDE.md`](EMUI_GUIDE.md) / [`EMUI_INTERNALS.md`](EMUI_INTERNALS.md).
+8. **TTY/console** *(partially built)* — the framebuffer console + keyboard input exist; a real scrollback/line-editing TTY for a text shell is still open.
+9. **Toolchain port — TCC first.** Single self-contained binary (built-in assembler + linker, no subprocess spawning), so it runs before a full `fork`/`exec`/pipe process model exists. GCC/LLVM later, once the subprocess-spawning model is in place.
+10. **Shell + editor** — the last mile to a livable environment. (A native *editor* could plausibly be built as an EmUI app before a text shell exists, now that the GUI stack is ahead of it — worth reconsidering the ordering here.)
 
-Steps 1–5 are the natural continuation of the existing kernel. Step 8 (TCC on metal) is the flag for "true self-hosting achieved."
+Steps 1–7 are done. Step 9 (TCC on metal) is the flag for "true self-hosting achieved" — note that GUI landed well ahead of self-hosting rather than after it, which is a deliberate reordering from this doc's original "later, post-self-hosting" framing (§1's "understand every seam" principle applied fine to a UI stack too, and having a working desktop made every other subsystem easier to demo and debug live).
 
 ---
 
@@ -182,7 +191,9 @@ Smaller open items: pipe file-action API shape (at ABI design), init/PID 1 model
 
 ## 7. Deferred / Later (off the near-term critical path)
 
-UEFI bootloader · buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · GUI stack (compositor, toolkit, apps) · SMP · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib).
+UEFI bootloader · buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
+
+*(GUI stack and SMP have shipped — see §2 rows 2 and 10 — and are removed from this list.)*
 
 ---
 

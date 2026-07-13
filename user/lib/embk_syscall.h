@@ -36,6 +36,35 @@
 #define EMBK_SYS_sbrk           17
 #define EMBK_SYS_fstat          18
 #define EMBK_SYS_gettimeofday   19
+#define EMBK_SYS_surface_create   20
+#define EMBK_SYS_surface_map      21
+#define EMBK_SYS_surface_acquire  22
+#define EMBK_SYS_surface_commit   23
+#define EMBK_SYS_surface_release  24
+#define EMBK_SYS_surface_destroy  25
+#define EMBK_SYS_chan_pair    26
+#define EMBK_SYS_chan_send    27
+#define EMBK_SYS_chan_recv    28
+#define EMBK_SYS_chan_close   29
+#define EMBK_SYS_chan_listen  30
+#define EMBK_SYS_chan_accept  31
+#define EMBK_SYS_chan_connect 32
+#define EMBK_SYS_ui_present   33
+#define EMBK_SYS_ui_input     34
+#define EMBK_SYS_ui_present_rect 35
+#define EMBK_SYS_key_poll     36
+#define EMBK_SYS_key_grab     37
+#define EMBK_SYS_uptime_ms    38
+#define EMBK_SYS_win_create   39
+#define EMBK_SYS_win_present  40
+#define EMBK_SYS_win_move     41
+#define EMBK_SYS_win_destroy  42
+#define EMBK_SYS_win_create_desktop 43
+#define EMBK_SYS_win_input    44
+#define EMBK_SYS_screen_size  45
+#define EMBK_SYS_sleep_ms     46
+#define EMBK_SYS_proc_alive   47
+#define EMBK_SYS_win_resize   48
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back
@@ -71,6 +100,16 @@ static inline int64_t embk_syscall3(int64_t n, int64_t a1, int64_t a2, int64_t a
     return ret;
 }
 
+static inline int64_t embk_syscall4(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4) {
+    int64_t ret;
+    register int64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("int $0x80" : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
 static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a3,
                                      int64_t a4, int64_t a5) {
     int64_t ret;
@@ -78,6 +117,18 @@ static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a
     register int64_t r8  __asm__("r8")  = a5;
     __asm__ volatile ("int $0x80" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4, int64_t a5, int64_t a6) {
+    int64_t ret;
+    register int64_t r10 __asm__("r10") = a4;
+    register int64_t r8  __asm__("r8")  = a5;
+    register int64_t r9  __asm__("r9")  = a6;
+    __asm__ volatile ("int $0x80" : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory");
     return ret;
 }

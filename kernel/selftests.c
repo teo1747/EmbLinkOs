@@ -19,6 +19,9 @@
 #include "crypto/aes.h"
 #include "crypto/xts.h"
 #include "fs/embkfs/embkfs_compress.h"
+#include "gfx/surface.h"
+#include "ipc/channel.h"
+#include "ipc/endpoint.h"
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -276,6 +279,11 @@ static void selftests_print_commands(void)
     kprintf("  test crypto all\n");
     kprintf("  test ring3\n");
     kprintf("  test ring3 threads\n");
+    kprintf("  test surface\n");
+    kprintf("  test channel\n");
+    kprintf("  test compositor\n");
+    kprintf("  test rendezvous\n");
+    kprintf("  test ui\n");
     kprintf("  test sched roundrobin\n");
     kprintf("  test fpu\n");
     kprintf("  test sched kill\n");
@@ -537,6 +545,188 @@ int selftests_handle_command(const char *cmd)
         int code = process_wait((uint32_t)pid);
         kprintf("\n[cmd] test ring3 threads: /init.elf exited with code %d (want 16): %s\n",
                 code, code == 16 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* EmbLink UI Piece 1: cross-address-space shared surfaces. Spawns
+     * /init.elf's "surface-parent" role, which runs S2/S3 (ownership +
+     * starvation) in-process and S1 (a child inherits the surface and reads a
+     * pattern the parent wrote, cross-address-space) exiting 55 iff all pass.
+     * Then checks the live-surface count returned to its baseline -- proving
+     * R2 (surfaces freed on process exit; refcount reaches 0 only after BOTH
+     * the parent and the inheriting child have exited). */
+    if (strcmp(cmd, "test surface") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test surface: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        uint32_t live_before = surface_live_count();
+        char *argv[] = { "/init.elf", "surface-parent", NULL };
+        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        if (pid < 0) {
+            kprintf("\n[cmd] test surface: process_create failed: %s\n", embk_strerror(pid));
+            return 1;
+        }
+        int code = process_wait((uint32_t)pid);
+        uint32_t live_after = surface_live_count();
+        bool ok = (code == 55) && (live_after == live_before);
+        kprintf("\n[cmd] test surface: parent exit=%d (want 55), live surfaces %u->%u: %s\n",
+                code, (unsigned)live_before, (unsigned)live_after, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* EmbLink UI Piece 1, Layer A: IPC channels. Spawns /init.elf's "chan"
+     * role, which runs A1/A2/A3 (boundaries + blocking + backpressure, via two
+     * threads), A4 + EMSGSIZE (peer-close / oversized recv), and S-chan-3
+     * (a surface handle sent COPY then dropped undelivered), exiting 77 iff
+     * all pass. Then checks BOTH live counts returned to baseline: channels
+     * (no channel leaked on close/exit) and surfaces (the undelivered handle's
+     * in-transit ref was released -- A6, no leak). */
+    if (strcmp(cmd, "test channel") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test channel: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        uint32_t s_before = surface_live_count();
+        uint32_t c_before = channel_live_count();
+        char *argv[] = { "/init.elf", "chan", NULL };
+        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        if (pid < 0) {
+            kprintf("\n[cmd] test channel: process_create failed: %s\n", embk_strerror(pid));
+            return 1;
+        }
+        int code = process_wait((uint32_t)pid);
+        uint32_t s_after = surface_live_count();
+        uint32_t c_after = channel_live_count();
+        bool ok = (code == 77) && (s_after == s_before) && (c_after == c_before);
+        kprintf("\n[cmd] test channel: exit=%d (want 77), surfaces %u->%u, channels %u->%u: %s\n",
+                code, (unsigned)s_before, (unsigned)s_after,
+                (unsigned)c_before, (unsigned)c_after, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* EmbLink UI Piece 1, Layer C: the real compositor loop (spec C.5), for
+     * real. Spawns /init.elf's "compositor" role, which itself spawns a
+     * "compositor-client" child; the two rendezvous via chan_listen/accept/
+     * connect (Layer B, /run/compositor), then the client attaches a surface
+     * COPY (S-surf-1 cross-address-space, S-surf-2 ownership, S-surf-3
+     * starvation all run on it) and a second surface MOVE (S-move both
+     * sides). NEITHER role explicitly destroys/closes anything -- exits 88
+     * iff every check passed AND the client's own exit code (66) was
+     * collected. Checks surface/channel/endpoint live counts all return to
+     * baseline after both processes are reaped: the strongest form of R2/R3
+     * -- a full session's worth of shared state, cleaned up automatically. */
+    if (strcmp(cmd, "test compositor") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test compositor: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        uint32_t s_before = surface_live_count();
+        uint32_t c_before = channel_live_count();
+        uint32_t e_before = endpoint_live_count();
+        char *argv[] = { "/init.elf", "compositor", NULL };
+        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        if (pid < 0) {
+            kprintf("\n[cmd] test compositor: process_create failed: %s\n", embk_strerror(pid));
+            return 1;
+        }
+        int code = process_wait((uint32_t)pid);
+        uint32_t s_after = surface_live_count();
+        uint32_t c_after = channel_live_count();
+        uint32_t e_after = endpoint_live_count();
+        bool ok = (code == 88) && (s_after == s_before) && (c_after == c_before) && (e_after == e_before);
+        kprintf("\n[cmd] test compositor: exit=%d (want 88), surfaces %u->%u, channels %u->%u, endpoints %u->%u: %s\n",
+                code, (unsigned)s_before, (unsigned)s_after,
+                (unsigned)c_before, (unsigned)c_after,
+                (unsigned)e_before, (unsigned)e_after, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* EmbLink UI Piece 1, Layer B invariant B4: a listener that registers
+     * then exits without ever accepting/closing (simulating a crash) must
+     * have its epfs node unregistered automatically (R2), so a LATER
+     * connect() from an unrelated process is refused cleanly -- never left
+     * dangling like a stale Unix socket file. */
+    if (strcmp(cmd, "test rendezvous") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test rendezvous: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        char *argv1[] = { "/init.elf", "b4-listen", NULL };
+        int pid1 = process_create("/init.elf", argv1, 2, NULL, 0);
+        if (pid1 < 0) {
+            kprintf("\n[cmd] test rendezvous: spawn listener failed: %s\n", embk_strerror(pid1));
+            return 1;
+        }
+        int code1 = process_wait((uint32_t)pid1);
+
+        /* By the time process_wait() returns, R2 cleanup (obj_handles_
+         * release_all, inside process_reap_slot) has already run -- so the
+         * epfs node is verifiably gone from kernel context too, not just
+         * "connect happened to fail for some other reason". */
+        struct vfs_stat st;
+        int stat_rc = vfs_stat("/run/compositor_b4test_should_not_exist", &st);
+        (void)stat_rc;   /* just proving vfs_stat itself doesn't crash on epfs; the real check is below */
+        int stat_rc2 = vfs_stat("/run/b4test", &st);
+
+        char *argv2[] = { "/init.elf", "b4-connect", NULL };
+        int pid2 = process_create("/init.elf", argv2, 2, NULL, 0);
+        if (pid2 < 0) {
+            kprintf("\n[cmd] test rendezvous: spawn connector failed: %s\n", embk_strerror(pid2));
+            return 1;
+        }
+        int code2 = process_wait((uint32_t)pid2);
+
+        /* b4-connect now exits with the POSITIVE errno it got. The node is
+         * verifiably gone (vfs_stat below), so connect's vfs_resolve must
+         * return -ENOENT -- assert that exact code, not merely "nonzero"
+         * (which had masked a get_endpoint wiring bug: ENOSYS on a live
+         * endpoint would also have looked like a pass). */
+        bool ok = (code1 == 0) && (code2 == EMBK_ENOENT) && (stat_rc2 == -EMBK_ENOENT);
+        kprintf("\n[cmd] test rendezvous: listener exit=%d (want 0), connect exit=%d (want %d=ENOENT), "
+                "node gone (vfs_stat=%s): %s\n",
+                code1, code2, EMBK_ENOENT, embk_strerror(stat_rc2), ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* EmbLink UI Piece 2: the compositor PROTOCOL (message vocabulary over
+     * Piece 1 channels -- no new kernel primitive). Each scenario is a ring-3
+     * /init.elf run ("ui-proto <scen>") that drives BOTH the client and
+     * compositor side of a real channel and exits 0 iff the invariant held:
+     *   hs        P2-S1  handshake + request_id correlation; version mismatch
+     *                    -> HELLO_ACK(-EPROTO) then peer close -> EPIPE (P3)
+     *   reorder   P2-S3  the crux: a POINTER_MOTION event enqueued AHEAD of a
+     *                    ROLE_CREATED reply is dispatched as an event, and the
+     *                    reply still matched by request_id (async/tagged)
+     *   privilege P2-S2  BACKGROUND role refused (-EACCES) on /run/compositor,
+     *                    allowed on /run/compositor-shell -- privilege follows
+     *                    the ENDPOINT (P4), never the client's claim
+     *   pacing    P2-S4  FRAME_DONE observed only AFTER surface_release ran --
+     *                    a 1-buffer surface stays un-acquirable until then (P5)
+     *   routing   P2-S5  pointer over window A delivered on A's channel only,
+     *                    never broadcast to B */
+    if (strcmp(cmd, "test ui") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test ui: VFS not registered (need /init.elf on disk)\n");
+            return 1;
+        }
+        static const char *scen[] = { "hs", "reorder", "privilege", "pacing", "routing" };
+        bool all = true;
+        for (int i = 0; i < 5; i++) {
+            char *argv[] = { "/init.elf", "ui-proto", (char *)scen[i], NULL };
+            int pid = process_create("/init.elf", argv, 3, NULL, 0);
+            if (pid < 0) {
+                kprintf("\n[cmd] test ui: %s: process_create failed: %s\n",
+                        scen[i], embk_strerror(pid));
+                all = false;
+                continue;
+            }
+            int code = process_wait((uint32_t)pid);
+            bool ok = (code == 0);
+            all = all && ok;
+            kprintf("\n[cmd] test ui: %s: exit=%d (want 0): %s", scen[i], code, ok ? "OK" : "FAIL");
+        }
+        kprintf("\n[cmd] test ui: %s\n", all ? "OK" : "FAIL");
         return 1;
     }
 

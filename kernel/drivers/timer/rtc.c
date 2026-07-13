@@ -1,7 +1,7 @@
-#include "drivers/timer/rtc.h"
-#include "include/io.h"
-#include "include/types.h"   /* bool */
-#include "include/kprintf.h"
+#include "rtc.h"
+#include "../../include/io.h"
+#include "../../include/types.h"   /* bool */
+#include "../../include/kprintf.h"
 #include "drivers/timer/pit.h"
 
 // Standard CMOS RTC ports (unchanged since the original IBM AT, present on

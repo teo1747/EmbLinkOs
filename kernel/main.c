@@ -10,6 +10,8 @@
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
+#include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
 #include "drivers/timer/timer.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
@@ -41,6 +43,7 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
+#include "fs/epfs.h"
 #include "selftests.h"
 
 #include "process/process.h"
@@ -381,6 +384,13 @@ void kernel_main(void) {
     console_init();
     keyboard_init();
     ioapic_route(1, 33, 0, false);   // keyboard GSI 1 -> vector 33 -> CPU 0
+    // Clamp the cursor to the ACTUAL screen size (varies by GPU: virtio-gpu is
+    // 1280x800, stdvga 1024x768) so it can reach every corner of the desktop.
+    {
+        const fb_info_t *fbi = fb_get_info();
+        mouse_init(fbi ? (int)fbi->width : 1024, fbi ? (int)fbi->height : 768);
+    }
+    ioapic_route(12, 44, 0, false);  // mouse GSI 12 -> vector 44 -> CPU 0
 
     // --- Timer (LAPIC) + retire PIC ---
     lapic_timer_init(48);
@@ -434,6 +444,18 @@ void kernel_main(void) {
     }
 
     vfs_init();
+
+    // EmbLink UI Piece 1, Layer B: the RAM-backed endpoint filesystem, mounted
+    // at /run independent of whatever real storage was found above -- IPC
+    // rendezvous (chan_listen/connect) shouldn't depend on a disk existing.
+    epfs_init();
+    {
+        int rc = epfs_vfs_register("/run");
+        if (rc != EMBK_OK) {
+            kprintf("VFS: epfs register at /run failed: %s\n", embk_strerror(rc));
+        }
+    }
+
     bool vfs_ready = false;
     struct embkfs_volume *embk_live = embkfs_live_volume();
 
@@ -516,6 +538,20 @@ void kernel_main(void) {
         }
     }
 
+    // Land the user in the graphical HOME launcher: a ring-3 app that takes the
+    // whole screen as the compositor's desktop layer and launches other apps
+    // (see user/bin/home.c). It runs as an ordinary round-robin sibling of this
+    // shell context -- the loop below keeps pumping the compositor pointer and
+    // USB, and the serial/keyboard REPL stays available as a debug console.
+    {
+        char *hargv[] = { (char *)"/home.elf", NULL };
+        int hpid = process_create("/home.elf", hargv, 1, NULL, 0);
+        if (hpid < 0)
+            kprintf("\nhome: failed to launch /home.elf: %s\n", embk_strerror(hpid));
+        else
+            kprintf("\nhome: launched /home.elf as pid %d\n", hpid);
+    }
+
     // Main loop: keyboard echo + tick heartbeat + process control shell
     uint64_t last = 0;
     char cmd_buf[128];
@@ -526,9 +562,14 @@ void kernel_main(void) {
         // Legacy USB HCs (UHCI/OHCI/EHCI) are polled: drain any completed
         // interrupt-IN transfers and re-arm them. xHCI input is IRQ-driven.
         usb_poll();
+        // Drive the window compositor's pointer: cursor, click-to-focus, and
+        // title-bar drag. Runs here (schedulable shell-process context) so the
+        // compositor spinlock is never taken from an IRQ handler. No-op until a
+        // window exists.
+        compositor_pointer_tick();
         // USB HID input now arrives via the xHCI interrupt (see xhci_enable_irq),
         // which wakes us from the hlt below and injects keys into the keyboard buffer.
-        if (keyboard_has_char()) {
+        if (!keyboard_is_grabbed() && keyboard_has_char()) {
             char c = keyboard_getchar();
             kprintf("%c", c);
 
