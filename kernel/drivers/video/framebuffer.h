@@ -31,14 +31,16 @@ void fb_init(void);
 void fb_put_pixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b);
 void fb_clear(uint8_t r, uint8_t g, uint8_t b);
 
-// Draw a single character on the screen at a pixel position(px,py)
-void fb_draw_char(char c, uint32_t px, uint32_t py,
+// Draw a single character on the screen at a pixel position (px,py). Signed:
+// callers (e.g. the compositor drawing a window title dragged off the top/left)
+// legitimately pass NEGATIVE coordinates; those must clip, not wrap.
+void fb_draw_char(char c, int32_t px, int32_t py,
                     uint8_t fg_r, uint8_t fg_g, uint8_t fg_b,
                     uint8_t bg_r, uint8_t bg_g, uint8_t bg_b);
 
 
 // Draw a null-terminated string on the screen at a pixel position(px,py)
-void fb_draw_string(char *str, uint32_t px, uint32_t py,
+void fb_draw_string(char *str, int32_t px, int32_t py,
                     uint8_t fg_r, uint8_t fg_g, uint8_t fg_b,
                     uint8_t bg_r, uint8_t bg_g, uint8_t bg_b);
 

@@ -250,20 +250,60 @@ void vmm_unmap(uint64_t virt_addr){
     spin_unlock(&vmm_lock);
 }
 
+/* Clear the PTE for `virt_addr` in a SPECIFIC address space, WITHOUT freeing
+ * the physical frame it pointed at. Mirrors vmm_unmap() but walks `pml4_phys`
+ * instead of the current CR3 -- needed to detach SHARED memory (surface
+ * buffers, kernel/gfx/surface.c) from a process before its address space is
+ * torn down: the frame is owned by the surface's refcount, not the process,
+ * so vmm_destroy_address_space() must NOT free it. Unmapping it here first
+ * makes that frame invisible to the destroy walk (which frees every present
+ * user-half frame it finds). No-op if the mapping isn't present. */
+void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+
+    pt[pt_index(virt_addr)] = 0;
+    vmm_flush_tlb(virt_addr);   /* harmless if this address space isn't active */
+
+    spin_unlock(&vmm_lock);
+}
+
 /* Look up the physical address a VA maps to IN A GIVEN address space.
    Mirrors vmm_get_phys but walks `pml4_phys` instead of the kernel PML4 —
    needed so elf_load can find the frame it just mapped into the process
    space and reach it via the direct map. */
 uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    /* MUST hold vmm_lock: every table mutator (vmm_map_in, vmm_unmap_in,
+     * vmm_destroy_address_space) does, and this is a MULTI-LEVEL walk. Reading
+     * it locklessly raced the writer -- e.g. the compositor mapping shared
+     * window pages into a client's PML4 on core A while the client's own
+     * copy_to_user/access_ok walked that PML4 on core B saw a half-installed
+     * intermediate table and reported an already-mapped heap page as absent
+     * (-EMBK_EFAULT on a valid read -> the "font.ttf open failed -14" / random
+     * app failures under -smp 4). An SMP data race, invisible on 1 core. */
+    spin_lock(&vmm_lock);
+    uint64_t result = 0;
     uint64_t *pml4 = vmm_table(pml4_phys);
-    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) return 0;
-    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) return 0;
-    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) return 0;
-    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) return 0;
-    return (pt[pt_index(virt_addr)] & VMM_ADDR_MASK) | (virt_addr & 0xfff);
+    if (pml4[pml4_index(virt_addr)] & VMM_PRESENT) {
+        uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+        if (pdpt[pdpt_index(virt_addr)] & VMM_PRESENT) {
+            uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+            if (pd[pd_index(virt_addr)] & VMM_PRESENT) {
+                uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+                if (pt[pt_index(virt_addr)] & VMM_PRESENT)
+                    result = (pt[pt_index(virt_addr)] & VMM_ADDR_MASK) | (virt_addr & 0xfff);
+            }
+        }
+    }
+    spin_unlock(&vmm_lock);
+    return result;
 }
 
 /* Existing public one becomes the kernel-space wrapper. */
@@ -450,6 +490,36 @@ uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
 
     // Return the virtual address of the first page
     return virt_base + offset;
+}
+
+/* Map `n` (possibly non-contiguous) physical pages into a fresh, CONTIGUOUS,
+ * CACHED kernel VA window -- a flat kernel view of scattered pages (e.g. a
+ * window's shared pixel buffer the compositor samples with fb_blit). Returns
+ * the base VA, or 0 on failure. Reuses the MMIO bump region deliberately: that
+ * PML4 slot is already populated before the first process address space is
+ * snapshotted, so the mapping is visible in every address space's kernel half
+ * -- the compositor reads it from a client's syscall context. Unlike MMIO this
+ * maps WRITE-BACK cached (no VMM_NOCACHE) for fast pixel access. */
+uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
+    if (!phys || n == 0) return 0;
+    spin_lock(&vmm_lock);
+    uint64_t virt_base = mmio_next_virt;
+    mmio_next_virt += (uint64_t)n * PAGE_SIZE;
+    spin_unlock(&vmm_lock);
+    for (uint32_t i = 0; i < n; i++) {
+        if (vmm_map(virt_base + (uint64_t)i * PAGE_SIZE, phys[i] & ~0xFFFULL,
+                    VMM_WRITABLE | VMM_NX) < 0) {
+            return 0;
+        }
+    }
+    return virt_base;
+}
+
+/* Unmap a window returned by vmm_kmap_pages. The VA itself is not reclaimed
+ * (bump allocator -- same simplification as MMIO/kernel-stack regions). */
+void vmm_kunmap_pages(uint64_t virt_base, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        vmm_unmap(virt_base + (uint64_t)i * PAGE_SIZE);
 }
 
 // Bump pointer for kernel-stack VA allocation.

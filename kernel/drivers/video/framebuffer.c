@@ -8,6 +8,7 @@
 #include "include/kprintf.h"
 #include <stdint.h>
 #include "drivers/video/font_8x16.h"
+#include "arch/x86_64/cpu/spinlock.h"
 
 
 static fb_info_t fb;
@@ -17,6 +18,13 @@ static uint8_t *fb_draw  = 0;   // where primitives write (back if available)
 static uint32_t fb_bypp  = 4;   // bytes per pixel
 
 // Accumulated dirty rectangle since the last fb_present(). x1/y1 exclusive.
+// GUARDED by fb_dirty_lock: under SMP, one core's fb_present() raced another
+// core's fb_mark_dirty() between "read the box" and "dirty_any = false" -- the
+// second core's region was silently DROPPED and never flushed to the device.
+// Observed as a freshly-created window staying black under -smp 4: its first
+// full-frame flush lost the race with a concurrent console print, and an idle
+// app never repaints, so the region stayed un-transferred forever.
+static spinlock_t fb_dirty_lock = SPINLOCK_INIT;
 static uint32_t dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 static bool     dirty_any = false;
 
@@ -25,15 +33,18 @@ static void fb_mark_dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (x1 > fb.width)  x1 = fb.width;
     if (y1 > fb.height) y1 = fb.height;
     if (x >= x1 || y >= y1) return;
+    spin_lock(&fb_dirty_lock);
     if (!dirty_any) {
         dirty_x0 = x; dirty_y0 = y; dirty_x1 = x1; dirty_y1 = y1;
         dirty_any = true;
+        spin_unlock(&fb_dirty_lock);
         return;
     }
     if (x  < dirty_x0) dirty_x0 = x;
     if (y  < dirty_y0) dirty_y0 = y;
     if (x1 > dirty_x1) dirty_x1 = x1;
     if (y1 > dirty_y1) dirty_y1 = y1;
+    spin_unlock(&fb_dirty_lock);
 }
 
 // Convert 0x00RRGGBB into the native pixel value for the current mode.
@@ -222,13 +233,23 @@ static void fb_push_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 void fb_present(void) {
-    if (!dirty_any) return;
-    fb_push_rect(dirty_x0, dirty_y0, dirty_x1 - dirty_x0, dirty_y1 - dirty_y0);
+    /* snapshot + clear ATOMICALLY; push OUTSIDE the lock (the push reaches the
+     * virtio submit, whose error path kprintf()s back through the console into
+     * fb_present -- holding fb_dirty_lock across it would self-deadlock). A
+     * mark that lands after the snapshot re-arms dirty_any and is flushed by
+     * the NEXT present -- nothing is lost. */
+    spin_lock(&fb_dirty_lock);
+    if (!dirty_any) { spin_unlock(&fb_dirty_lock); return; }
+    uint32_t x0 = dirty_x0, y0 = dirty_y0, x1 = dirty_x1, y1 = dirty_y1;
     dirty_any = false;
+    spin_unlock(&fb_dirty_lock);
+    fb_push_rect(x0, y0, x1 - x0, y1 - y0);
 }
 
 void fb_present_all(void) {
+    spin_lock(&fb_dirty_lock);
     dirty_any = false;
+    spin_unlock(&fb_dirty_lock);
     fb_push_rect(0, 0, fb.width, fb.height);
 }
 
@@ -443,14 +464,18 @@ void fb_clear(uint8_t r, uint8_t g, uint8_t b) {
 // Text
 // ---------------------------------------------------------------------------
 
-void fb_draw_char(char c, uint32_t px, uint32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
+void fb_draw_char(char c, int32_t px, int32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
     const uint8_t *glyph = &font_8x16[(uint8_t)c * FONT_HEIGHT];
     uint32_t fg = fb_pack(FB_RGB(fg_r, fg_g, fg_b));
     uint32_t bg = fb_pack(FB_RGB(bg_r, bg_g, bg_b));
 
-    // Fully on-screen glyphs take the fast row path; edge cases clip per pixel.
-    if (px + FONT_WIDTH <= fb.width && py + FONT_HEIGHT <= fb.height) {
-        uint8_t *row = fb_pixel_ptr(fb_draw, px, py);
+    // Fully on-screen glyphs take the fast row path; edge cases (incl. NEGATIVE
+    // px/py -- a title dragged off the top/left) clip per pixel. The px/py >= 0
+    // guard is load-bearing: without it a negative coord would pass the width/
+    // height check via unsigned overflow and write far out of the framebuffer.
+    if (px >= 0 && py >= 0 &&
+        px + FONT_WIDTH <= (int32_t)fb.width && py + FONT_HEIGHT <= (int32_t)fb.height) {
+        uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)px, (uint32_t)py);
         for (uint32_t r = 0; r < FONT_HEIGHT; r++) {
             uint8_t bits = glyph[r];
             if (fb.bpp == 32) {
@@ -479,8 +504,8 @@ void fb_draw_char(char c, uint32_t px, uint32_t py, uint8_t fg_r, uint8_t fg_g, 
     }
 }
 
-void fb_draw_string(char *str, uint32_t px, uint32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
-    uint32_t x = px;
+void fb_draw_string(char *str, int32_t px, int32_t py, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
+    int32_t x = px;
     while (*str) {
         fb_draw_char(*str, x, py, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
         x += FONT_WIDTH;

@@ -32,6 +32,11 @@ int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
 // Unmap a virtual address
 void vmm_unmap(uint64_t virt);
 
+// Clear the PTE for `virt` in a SPECIFIC address space WITHOUT freeing the
+// backing frame (for detaching shared memory before an address space is torn
+// down -- see vmm.c and kernel/gfx/surface.c).
+void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt);
+
 // Get the physical address of a virtual address (returns 0 if not mapped)
 uint64_t vmm_get_phys(uint64_t virt);
 
@@ -48,6 +53,11 @@ uint64_t vmm_get_kernel_pml4(void);
 // In the MMIO_BASE range. Returns the virtual address on success, 0 on failure.
 // Size in bytes, will be rounded up to a multiple of PAGE_SIZE.
 uint64_t vmm_map_mmio(uint64_t phys, uint64_t size);
+
+// Map n (possibly scattered) physical pages into a contiguous, cached kernel VA
+// window (a flat kernel view of shared pixel pages). Returns base VA or 0.
+uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n);
+void     vmm_kunmap_pages(uint64_t virt_base, uint32_t n);
 
 // Map a virtual address to a physical address in a specific PML4 (address space)
 int vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags);

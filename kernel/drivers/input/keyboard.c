@@ -108,3 +108,19 @@ char keyboard_getchar(void) {
 int keyboard_has_char(void) {
     return buf_head != buf_tail;
 }
+
+/* --- keyboard grab -------------------------------------------------------
+ * A ring-3 UI app (e.g. uidemo) grabs the keyboard so the kernel shell stops
+ * draining it; both otherwise poll the same buffer and split keystrokes. The
+ * grab is auto-released when the grabbing process is reaped (see process.c). */
+static volatile int      g_kbd_grabbed;
+static volatile uint32_t g_kbd_grabber_pid;
+
+void keyboard_set_grab(int grab, uint32_t pid) {
+    g_kbd_grabbed = grab ? 1 : 0;
+    g_kbd_grabber_pid = grab ? pid : 0;
+}
+int keyboard_is_grabbed(void) { return g_kbd_grabbed; }
+void keyboard_release_grab_pid(uint32_t pid) {
+    if (g_kbd_grabbed && g_kbd_grabber_pid == pid) { g_kbd_grabbed = 0; g_kbd_grabber_pid = 0; }
+}

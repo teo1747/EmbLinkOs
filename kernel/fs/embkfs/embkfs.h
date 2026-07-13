@@ -382,6 +382,18 @@ struct embkfs_volume {
                                       * Phase 5b; see the snapshot section
                                       * above for why this is conservative
                                       * rather than exact refcounting) */
+
+    /* Single-object read cache: the whole decoded contents of the most-recently
+     * read object. embkfs_read_object_at used to re-decode the entire
+     * [0, offset+want) prefix on EVERY call, making a sequentially-chunked read
+     * of one file O(n^2); this serves later reads of the same file from RAM.
+     * Keyed by (oid, generation) -- every write commit bumps `generation`, so a
+     * stale entry is detected and refreshed automatically, no manual
+     * invalidation needed. */
+    uint64_t  rcache_oid;
+    uint64_t  rcache_gen;
+    uint64_t  rcache_len;
+    uint8_t  *rcache_buf;
 };
 
 

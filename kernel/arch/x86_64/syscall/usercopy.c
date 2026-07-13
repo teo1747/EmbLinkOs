@@ -40,32 +40,51 @@ bool access_ok(const void *user_ptr, size_t len) {
     return true;
 }
 
+/* access_ok can fail TRANSIENTLY under -smp (a rare false-absent from the
+ * page-walk on a genuinely mapped page; root cause still open -- see the
+ * sys-read-silent-byte-drop memory). The transient clears immediately, so
+ * retry the validation a handful of times before reporting a real fault:
+ * this keeps every syscall's user-copy robust without asking userspace to
+ * retry spurious EFAULTs. */
+#define USERCOPY_RETRIES 8
+
 int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
-    if (!access_ok(user_src, len)) {
-        return -EMBK_EFAULT;
+    for (int t = 0; t < USERCOPY_RETRIES; t++) {
+        if (access_ok(user_src, len)) {
+            memcpy(kernel_dst, user_src, len);
+            return EMBK_OK;
+        }
     }
-    memcpy(kernel_dst, user_src, len);
-    return EMBK_OK;
+    return -EMBK_EFAULT;
 }
 
 int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
-    if (!access_ok(user_dst, len)) {
-        return -EMBK_EFAULT;
+    for (int t = 0; t < USERCOPY_RETRIES; t++) {
+        if (access_ok(user_dst, len)) {
+            memcpy(user_dst, kernel_src, len);
+            return EMBK_OK;
+        }
     }
-    memcpy(user_dst, kernel_src, len);
-    return EMBK_OK;
+    return -EMBK_EFAULT;
 }
 
 int copy_string_from_user(char *kernel_dst, const char *user_src, size_t max_len) {
+    /* Validate one PAGE at a time, not one byte: access_ok now takes vmm_lock,
+     * so a per-byte check was a lock cycle per character. Re-validate only when
+     * the next byte crosses into a new page. */
+    uint64_t validated_page = ~0ULL;
     for (size_t i = 0; i < max_len; i++) {
-        char c;
-        if (copy_from_user(&c, user_src + i, 1) != EMBK_OK) {
-            return -EMBK_EFAULT;
+        uint64_t byte_page = ((uint64_t)(uintptr_t)(user_src + i)) & ~(uint64_t)(PAGE_SIZE - 1);
+        if (byte_page != validated_page) {
+            int ok = 0;
+            for (int t = 0; t < USERCOPY_RETRIES && !ok; t++)
+                ok = access_ok(user_src + i, 1);
+            if (!ok) return -EMBK_EFAULT;
+            validated_page = byte_page;
         }
+        char c = user_src[i];
         kernel_dst[i] = c;
-        if (c == '\0') {
-            return (int)i;
-        }
+        if (c == '\0') return (int)i;
     }
     return -EMBK_ENAMETOOLONG;
 }

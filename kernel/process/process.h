@@ -7,6 +7,9 @@
 #include "arch/x86_64/cpu/percpu.h"
 #include "fs/fd.h"
 #include "process/spawn.h"
+#include "ipc/handle.h"    /* struct obj_handle + OBJ_HANDLE_MAX + the typed
+                            * object-handle table (handle.h forward-declares
+                            * struct process, so no cycle) */
 
 /* Raised from 16/16 once ring-3 processes could genuinely have more than one
  * thread each (Phase 5, below) — 16 was sized for "one process, one thread"
@@ -329,6 +332,17 @@ struct process {
      * see PROC_HANDLE_MAX's comment above. */
     struct proc_handle handles[PROC_HANDLE_MAX];
 
+    /* Typed object-handle table for structural shared resources -- surfaces
+     * (kernel/gfx/surface.h). Distinct from handles[] above (which is a
+     * pid mapping): each entry points at a refcounted kernel object. */
+    struct obj_handle obj_handles[OBJ_HANDLE_MAX];
+
+    /* Bump allocator for this process's shared-memory VA window (slot 5,
+     * USER_SHARED_VA_BASE): each surface mapping consumes a run here. VA
+     * space is not reclaimed, same simplification as the kernel-stack and
+     * MMIO allocators. */
+    uint64_t shared_next_va;
+
     /* current break pointer for this process's heap (user-mode threads only) 
      * grows/shrinks as the process allocates/frees heap memory. via sys_brk(). */
     uint64_t heap_brk;  
@@ -421,6 +435,15 @@ void wait_queue_wake_one(struct wait_queue *wq);
 
 /** @brief Wake every thread waiting on `wq` (BLOCKED -> READY). */
 void wait_queue_wake_all(struct wait_queue *wq);
+
+/* Blocking primitives for IPC and other kernel subsystems outside process.c.
+ * sched_lock/unlock take/release the global scheduler lock (which the
+ * wait_queue_* calls must be serialized under); sched_block_current_locked
+ * blocks the caller on `wq` and switches away, returning with the lock
+ * released once woken. See the block-until-woken usage note in process.c. */
+void sched_lock(void);
+void sched_unlock(void);
+void sched_block_current_locked(struct wait_queue *wq);
 
 /**
  * @brief Unconditionally terminate a process (every one of its threads),
@@ -619,6 +642,11 @@ struct process_info {
  * process, for `ps`. Returns the number of entries written (<= max).
  */
 int process_list(struct process_info *out, int max);
+
+/* Self-locking liveness probe: 1 if `pid` exists with a live thread, else 0.
+ * A snapshot (inherently racy); used by sys_proc_alive so the home launcher
+ * can avoid double-spawning an app that is still running. */
+int process_alive(uint32_t pid);
 
 /**
  * @name Ring-3 process handle table (docs/ARCHITECTURE.md §3.4/§3.5)

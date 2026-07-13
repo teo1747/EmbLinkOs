@@ -53,6 +53,11 @@
 #define EMBK_EILSEQ       84    // illegal byte sequence (bad UTF-8 etc.)
 #define EMBK_ECANCELED   125    // operation cancelled
 #define EMBK_ETIMEDOUT   110    // operation timed out
+#define EMBK_ENOTSUP      95    // operation not supported (e.g. unimpl'd pixel format)
+#define EMBK_EPIPE        32    // broken pipe / channel peer has closed
+#define EMBK_EMSGSIZE     90    // message too long for the supplied buffer
+#define EMBK_ECONNREFUSED 111   // endpoint has no live owner (Layer B rendezvous)
+#define EMBK_EPROTO       71    // protocol error (EmbLink UI Piece 2: HELLO version mismatch)
 
 // Helper: turn an error code into a short human-readable string.
 // Returns a static string; never NULL.

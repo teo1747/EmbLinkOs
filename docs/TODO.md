@@ -505,6 +505,68 @@ interrupt-driven.
 
 ---
 
+## User Interface (EmUI), Compositor & Userland Runtime
+
+Design/usage docs: `docs/EMUI_GUIDE.md` (how to build an app),
+`docs/EMUI_INTERNALS.md` (how the toolkit is built), `docs/BUILD_SETUP.md`
+(newlib + dynamic linking). Open items only — the toolkit itself, the
+compositor, and dynamic linking are all built and live-verified; what
+follows are known gaps and rough edges, not missing features.
+
+- [ ] **Dynamic linker: eager relocation only, no lazy PLT binding.** Every
+  `R_X86_64_JUMP_SLOT` is resolved at load time in
+  `kernel/arch/x86_64/syscall/elf.c`, not on first call. Simpler and
+  currently fine at this app count/size; revisit if process start latency
+  becomes a real cost.
+- [ ] **A residual, unexplained transient `EFAULT` under SMP** in
+  `copy_from_user`/`copy_to_user` (`kernel/arch/x86_64/syscall/usercopy.c`)
+  — `access_ok` occasionally reports a genuinely-mapped user page as absent
+  under `-smp 4`, cause not found (suspects: a `this_cpu()`/APIC-ID
+  misattribution window, or a memory-ordering gap in the page-table walk
+  that only TCG's multi-threaded emulation exposes). Currently masked, not
+  fixed: both copy functions retry `access_ok` up to `USERCOPY_RETRIES` (8)
+  times before actually reporting a fault, which has been reliable in
+  practice but is a workaround, not a diagnosis. If unrelated EFAULTs
+  reappear elsewhere, start here.
+- [ ] **EMBKFS has latent (not yet triggered) SMP hazards from the UI
+  bring-up's heavier concurrent I/O.** Several `embkfs.c` functions use
+  `static uint8_t probe[4096]`/`datablk[4096]` scratch buffers shared across
+  calls, and the per-volume whole-object read cache (`vol->rcache_*`) is
+  unlocked — both are use-after-free/data-race risks if two cores genuinely
+  race a read against that cache's replace/free path. Worth a per-volume
+  lock at the `embk_vfs` bridge before apps start doing more concurrent
+  filesystem I/O than they do today.
+- [ ] **`mkfs_embkfs.py`'s single-leaf image builder overflows past ~7 packed
+  files.** Adding `clockw.elf` to the default boot image already required
+  dropping the `wgyehkb.txt`/`illoeuw.txt` hash-collision-chain test
+  fixtures from `make_image`/`make_tree_image` (the verifier tolerates their
+  absence, but collision-chain coverage on freshly generated images is
+  currently untested). The generated superblock never *needs* everything in
+  one B-tree leaf — a real fix is multi-leaf image generation in the
+  builder, not further fixture removal, if more apps get added.
+- [ ] **Overlay/modal (`ui_overlay_begin/end`, `ui_dialog_begin/end` in
+  `ui/kit`) is built and host-tested but was flagged unstable in live
+  interaction** during the V2/V3 toolkit work and deferred rather than
+  root-caused. Re-verify live before building new features on top of it
+  (`Overlay`/`Dialog` in `ui/dsl/em.h` wrap the same kit primitives).
+- [ ] **Adding a new app requires three manual registration points**
+  (a Makefile build rule, the `embkfs.img`/`embkfs_tree.img` dependency
+  line, and an entry in `mkfs_embkfs.py`'s object list — see
+  `docs/EMUI_GUIDE.md#wiring-your-app-into-the-boot-image`). Mechanical and
+  documented, but a real papercut for anyone adding apps often; a small
+  Makefile/mkfs helper that discovers `user/bin/*.c` automatically would
+  remove it.
+- [ ] **No real TTY.** The framebuffer console is output-only (no
+  scrollback, no line editing); a text shell (see Architecture roadmap)
+  needs this built first.
+- [ ] **`home.elf` plays an informal init/service-manager role** (spawns and
+  tracks every app the user launches, including the clock widget at boot)
+  without being a real PID-1/service-manager abstraction — fine for a
+  single-user desktop today, a real gap if multiple always-running services
+  are ever needed.
+
+---
+
 ## Process & Scheduling
 
 Full phased spec, comparative analysis (Linux/Windows/BSD/XNU), and every bug

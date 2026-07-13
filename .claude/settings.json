@@ -116,7 +116,11 @@
       "Bash(git log *)",
       "Bash(xargs -I{} echo \"commits after it on HEAD path: {}\")",
       "Bash(git stash *)",
-      "Bash(git ls-tree *)"
+      "Bash(git ls-tree *)",
+      "Bash(make build/init.elf)",
+      "Bash(make build/hello.elf)",
+      "Bash(pkill -f qemu-system-x86_64)",
+      "Bash(timeout 60 python3 /tmp/claude-1000/-home-motsou-myos/4b746f41-6725-4167-a536-c66079e2827c/scratchpad/run_tests.py \"test surface\")"
     ],
     "additionalDirectories": [
       "/usr/local/cross/x86_64-elf/include/sys"

@@ -211,6 +211,322 @@ static inline void embk_yield(void) {
 }
 
 /* ==================================================================== */
+/* Surfaces -- shared-memory pixel buffers (EmbLink UI Piece 1). A surface */
+/* is a kernel-owned, refcounted run of pages that a UI client and the      */
+/* compositor both map (their own VAs, same physical memory) to share       */
+/* pixels with zero copies. Named by a typed handle in the process's        */
+/* obj_handle table. See kernel/gfx/surface.h.                              */
+/* ==================================================================== */
+
+#define EMBK_PIXFMT_BGRA8888_PRE 1   /* premultiplied alpha; only one impl'd */
+
+/* spawn() file-action kind: transfer+map a surface the parent holds into
+ * the child (target_fd carries the parent's surface handle). The minimal
+ * handle_transfer for Piece 1. */
+#define EMBK_SPAWN_ACTION_INHERIT_SURFACE 2
+
+/* Geometry the kernel fills on create/map so both sides agree without
+ * re-querying. Mirrors struct surface_info (kernel/gfx/surface.h). */
+struct embk_surface_info {
+    uint32_t width, height, stride, format, n_buffers;
+    uint64_t buffer_size;   /* bytes per buffer; buffer i is at base + i*this */
+};
+
+/* Create a surface and map it into THIS process (the client). Returns a
+ * surface handle (>= 0) or -EMBK_*. `out` is filled with the geometry. */
+static inline int embk_surface_create(uint32_t w, uint32_t h, uint32_t fmt,
+                                      uint32_t n_buffers, struct embk_surface_info *out) {
+    return (int)embk_syscall5(EMBK_SYS_surface_create, w, h, fmt, n_buffers,
+                              (int64_t)(intptr_t)out);
+}
+
+/* Map a surface this process holds a handle to (e.g. one inherited at spawn)
+ * into this address space. Returns the base VA (buffer 0), or a negative
+ * -EMBK_* (test with < 0). Fills `out` with geometry. */
+static inline int64_t embk_surface_map(int handle, struct embk_surface_info *out) {
+    return embk_syscall2(EMBK_SYS_surface_map, handle, (int64_t)(intptr_t)out);
+}
+
+/* Get a buffer index the client may draw into (owner==CLIENT), or
+ * -EMBK_EAGAIN if all are held by the compositor (B2). */
+static inline int embk_surface_acquire(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_surface_acquire, handle);
+}
+/* Post `idx` as the newest frame (client -> compositor). */
+static inline int embk_surface_commit(int handle, int idx) {
+    return (int)embk_syscall2(EMBK_SYS_surface_commit, handle, idx);
+}
+/* Return `idx` to the client (compositor -> client). */
+static inline int embk_surface_release(int handle, int idx) {
+    return (int)embk_syscall2(EMBK_SYS_surface_release, handle, idx);
+}
+/* Drop this process's handle + mapping (refcount--; frees at 0). */
+static inline int embk_surface_destroy(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_surface_destroy, handle);
+}
+
+/* Direct present: blit a premultiplied-BGRA8888 pixel buffer (w*h, tight) to
+ * the centre of the framebuffer and flush. A minimal single-fullscreen-app
+ * path standing in for a compositor. Returns 0 or -EMBK_*. */
+static inline int embk_ui_present(const void *pixels, uint32_t w, uint32_t h) {
+    return (int)embk_syscall3(EMBK_SYS_ui_present, (int64_t)(intptr_t)pixels, w, h);
+}
+
+/* Present only a surface-local sub-rectangle (rx,ry,rw,rh) -- the interactive
+ * fast path, so a cursor that moved a few pixels doesn't re-upload the whole
+ * surface. Same pixel buffer (w*h tight BGRA8888_PRE) as embk_ui_present. */
+static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t h,
+                                       uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
+    int64_t dims = ((int64_t)(w & 0xFFFF) << 16) | (h & 0xFFFF);
+    int64_t rect = ((int64_t)(rx & 0xFFFF) << 48) | ((int64_t)(ry & 0xFFFF) << 32)
+                 | ((int64_t)(rw & 0xFFFF) << 16) |  (int64_t)(rh & 0xFFFF);
+    return (int)embk_syscall3(EMBK_SYS_ui_present_rect, (int64_t)(intptr_t)pixels, dims, rect);
+}
+
+/* Pointer (mouse) state for the UI event loop. x/y are screen pixels; buttons
+ * is a bitmask of EMBK_MOUSE_*. */
+#define EMBK_MOUSE_LEFT   0x01
+#define EMBK_MOUSE_RIGHT  0x02
+#define EMBK_MOUSE_MIDDLE 0x04
+struct embk_ui_input { int32_t x, y; uint32_t buttons; int32_t wheel; };
+static inline int embk_ui_input(struct embk_ui_input *out) {
+    return (int)embk_syscall1(EMBK_SYS_ui_input, (int64_t)(intptr_t)out);
+}
+
+/* Non-blocking keystroke poll for the UI loop: returns the next ASCII byte
+ * ('\b'=0x08 backspace, '\n' enter), or 0 when nothing is pending. Drain it in
+ * a loop each frame and feed chars to the UI via ui_input_char(). */
+static inline int embk_key_poll(void) {
+    return (int)embk_syscall0(EMBK_SYS_key_poll);
+}
+
+/* Grab (1) or release (0) exclusive keyboard: while grabbed, the kernel shell
+ * stops consuming keystrokes so this app gets them all. Auto-released on exit. */
+static inline int embk_key_grab(int on) {
+    return (int)embk_syscall1(EMBK_SYS_key_grab, on);
+}
+
+/* Monotonic milliseconds since boot -- the clock a UI animator ticks on. */
+static inline uint64_t embk_uptime_ms(void) {
+    return (uint64_t)embk_syscall0(EMBK_SYS_uptime_ms);
+}
+
+/* ==================================================================== */
+/* Window compositor (EmbLink UI Piece 2). A WINDOW is a positioned tile of */
+/* client-rendered pixels the kernel composites over a desktop with a title  */
+/* bar and z-order. Unlike embk_ui_present (one centred surface), many        */
+/* windows from many processes coexist. Pixels are BGRA8888_PRE (premult),    */
+/* same as surfaces: a uint32 is 0xAARRGGBB.                                  */
+/* ==================================================================== */
+
+/* Create a window: content `cw` x `ch`, window frame's top-left at screen
+ * (x,y) (the title bar occupies the first rows of the frame, content below).
+ * Returns a window id (>0) or a negative -errno. */
+static inline int embk_win_create(uint32_t cw, uint32_t ch, int32_t x, int32_t y,
+                                  const char *title) {
+    return (int)embk_syscall5(EMBK_SYS_win_create, cw, ch, x, y,
+                              (int64_t)(intptr_t)title);
+}
+
+/* Zero-copy window: the kernel maps the window's pixel pages into THIS process
+ * and returns the base pointer in *out_pixels. Render directly into it, then
+ * call embk_win_present/_rect (which becomes a damage-only call -- no copy).
+ * Returns a window id (>0) or a negative -errno. */
+static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, int32_t y,
+                                         const char *title, void **out_pixels) {
+    uint64_t va = 0;
+    int id = (int)embk_syscall6(EMBK_SYS_win_create, cw, ch, x, y,
+                                (int64_t)(intptr_t)title, (int64_t)(intptr_t)&va);
+    if (id >= 0 && out_pixels) *out_pixels = (void *)(intptr_t)va;
+    return id;
+}
+
+/* Window-style flags for embk_win_create_shared_ex (high bits of the cw arg). */
+#define EMBK_WINF_CHROMELESS (1ULL << 32)   /* no kernel bar/close/border: the app
+                                             * draws its own chrome (EmUI Window/
+                                             * WindowBar) and moves itself. */
+#define EMBK_WINF_WIDGET     (1ULL << 33)   /* DESKTOP WIDGET: chromeless AND kept
+                                             * in a z-band above the desktop but
+                                             * below every app window. */
+
+/* Resize a shared window's content to w x h. The window's pixel pages are
+ * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is
+ * dead the moment this returns. Returns the window id, or -EMBK_*. */
+static inline int embk_win_resize(int id, uint32_t w, uint32_t h, void **out_pixels) {
+    uint64_t va = 0;
+    int rc = (int)embk_syscall4(EMBK_SYS_win_resize, id, w, h, (int64_t)(intptr_t)&va);
+    if (rc >= 0 && out_pixels) *out_pixels = (void *)(intptr_t)va;
+    return rc;
+}
+
+/* Zero-copy window with style flags. Same as embk_win_create_shared plus
+ * EMBK_WINF_* or'd into `flags`. */
+static inline int embk_win_create_shared_ex(uint32_t cw, uint32_t ch, int32_t x, int32_t y,
+                                            const char *title, uint64_t flags,
+                                            void **out_pixels) {
+    uint64_t va = 0;
+    int id = (int)embk_syscall6(EMBK_SYS_win_create, (int64_t)(flags | cw), ch, x, y,
+                                (int64_t)(intptr_t)title, (int64_t)(intptr_t)&va);
+    if (id >= 0 && out_pixels) *out_pixels = (void *)(intptr_t)va;
+    return id;
+}
+
+/* Present the whole content buffer (cw*ch tight BGRA) to window `id`. */
+static inline int embk_win_present(int id, const void *pixels,
+                                   uint32_t cw, uint32_t ch) {
+    int64_t dims = ((int64_t)(cw & 0xFFFF) << 16) | (ch & 0xFFFF);
+    return (int)embk_syscall4(EMBK_SYS_win_present, id,
+                              (int64_t)(intptr_t)pixels, dims, 0);
+}
+
+/* Present only a content-local sub-rectangle (rx,ry,rw,rh) -- the fast path,
+ * so a small change doesn't re-upload the whole window. Same cw*ch buffer. */
+static inline int embk_win_present_rect(int id, const void *pixels,
+                                        uint32_t cw, uint32_t ch,
+                                        uint32_t rx, uint32_t ry,
+                                        uint32_t rw, uint32_t rh) {
+    int64_t dims = ((int64_t)(cw & 0xFFFF) << 16) | (ch & 0xFFFF);
+    int64_t rect = ((int64_t)(rx & 0xFFFF) << 48) | ((int64_t)(ry & 0xFFFF) << 32)
+                 | ((int64_t)(rw & 0xFFFF) << 16) |  (int64_t)(rh & 0xFFFF);
+    return (int)embk_syscall4(EMBK_SYS_win_present, id,
+                              (int64_t)(intptr_t)pixels, dims, rect);
+}
+
+/* Move a window's frame top-left to screen (x,y); also raises it to the front. */
+static inline int embk_win_move(int id, int32_t x, int32_t y) {
+    return (int)embk_syscall3(EMBK_SYS_win_move, id, x, y);
+}
+
+/* Destroy a window and erase it from the desktop. */
+static inline int embk_win_destroy(int id) {
+    return (int)embk_syscall1(EMBK_SYS_win_destroy, id);
+}
+
+/* Create the full-screen chromeless HOME/desktop window (zero-copy): sized to
+ * the framebuffer, pinned at the back, no title bar. The pixel base is returned
+ * in out_pixels and the screen size in out_w and out_h. Only one app should hold
+ * the desktop (the home launcher). Returns a window id (>0) or a negative -errno. */
+static inline int embk_win_create_desktop(void **out_pixels, uint32_t *out_w, uint32_t *out_h) {
+    uint64_t va = 0; uint32_t w = 0, h = 0;
+    int id = (int)embk_syscall3(EMBK_SYS_win_create_desktop,
+                                (int64_t)(intptr_t)&va, (int64_t)(intptr_t)&w,
+                                (int64_t)(intptr_t)&h);
+    if (id >= 0) {
+        if (out_pixels) *out_pixels = (void *)(intptr_t)va;
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+    }
+    return id;
+}
+
+/* Sleep at least `ms` milliseconds, YIELDING the CPU the whole time. This is
+ * how a UI event loop paces itself -- a volatile spin loop burns the app's
+ * whole scheduler slice and starves every other process; this costs ~nothing.
+ * Granularity is a scheduler round trip, not a hard timer. */
+static inline int embk_sleep_ms(uint64_t ms) {
+    return (int)embk_syscall1(EMBK_SYS_sleep_ms, (int64_t)ms);
+}
+
+/* 1 if the child named by spawn HANDLE `handle` (what embk_spawn returned) is
+ * still alive, else 0 (unknown/freed handles are "not alive"). Handle-based on
+ * purpose: spawn never exposes raw pids, and a handle stays pinned to the
+ * exact child instance even after pids recycle. Lets a launcher avoid starting
+ * a second instance of an app that is still running. */
+static inline int embk_proc_alive(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_proc_alive, handle);
+}
+
+/* Screen (framebuffer) size, so a windowed app can size itself to fit -- e.g.
+ * clamp a tall window so it isn't rejected on a short display. */
+static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
+    return (int)embk_syscall2(EMBK_SYS_screen_size,
+                              (int64_t)(intptr_t)w, (int64_t)(intptr_t)h);
+}
+
+/* Content-local pointer for a windowed app. `focused` is 1 when the pointer is
+ * over THIS process's window content (then x,y are window-local pixels and
+ * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
+ * launcher reads this to make its tiles clickable. */
+struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
+static inline int embk_win_input(struct embk_win_input *out) {
+    return (int)embk_syscall1(EMBK_SYS_win_input, (int64_t)(intptr_t)out);
+}
+
+/* ==================================================================== */
+/* IPC channels (EmbLink UI Piece 1, Layer A). A channel is a bidirectional */
+/* message-oriented endpoint pair. Messages carry a byte payload + 0..N     */
+/* ancillary handles, each passed COPY or MOVE. Bulk data (pixels) goes      */
+/* through shared surfaces, not payloads -- channels carry control + handles.*/
+/* ==================================================================== */
+
+#define EMBK_CHAN_HANDLE_COPY 0   /* sender keeps its handle; receiver gets one too */
+#define EMBK_CHAN_HANDLE_MOVE 1   /* sender's handle consumed; capability moves */
+
+/* spawn() file-action: MOVE a channel end the parent holds into the child
+ * (target_fd = parent's channel handle). Bootstraps a parent/child channel. */
+#define EMBK_SPAWN_ACTION_INHERIT_CHANNEL 3
+
+/* Create a connected pair in THIS process; out[0]/out[1] receive the two end
+ * handles. Returns 0 or -EMBK_*. */
+static inline int embk_chan_pair(int out_handles[2]) {
+    return (int)embk_syscall1(EMBK_SYS_chan_pair, (int64_t)(intptr_t)out_handles);
+}
+
+/* Send one message: `len` payload bytes plus `n_hnd` ancillary handles
+ * (`hnds[]`) with per-handle COPY/MOVE (`flags[]`, or NULL for all-COPY).
+ * Blocks if the peer's inbox is full; -EMBK_EPIPE if the peer has closed.
+ * Returns 0 or -EMBK_*. */
+static inline int embk_chan_send(int handle, const void *bytes, unsigned len,
+                                 const int *hnds, const int *flags, unsigned n_hnd) {
+    return (int)embk_syscall6(EMBK_SYS_chan_send, handle, (int64_t)(intptr_t)bytes,
+                              len, (int64_t)(intptr_t)hnds, (int64_t)(intptr_t)flags, n_hnd);
+}
+
+/* Receive one message. Blocks until one arrives or the peer closes
+ * (-EMBK_EPIPE). Fills up to `buflen` payload bytes (-EMBK_EMSGSIZE, message
+ * left queued, if it's bigger); *out_len gets the real length. Ancillary
+ * handles are installed in this process's table, their ints written to
+ * out_hnds[], count to *out_nhnd. Returns 0 or -EMBK_*. */
+static inline int embk_chan_recv(int handle, void *buf, unsigned buflen,
+                                 unsigned *out_len, int *out_hnds, unsigned *out_nhnd) {
+    return (int)embk_syscall6(EMBK_SYS_chan_recv, handle, (int64_t)(intptr_t)buf,
+                              buflen, (int64_t)(intptr_t)out_len,
+                              (int64_t)(intptr_t)out_hnds, (int64_t)(intptr_t)out_nhnd);
+}
+
+/* Close this process's end (wakes the peer with EPIPE). */
+static inline int embk_chan_close(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_chan_close, handle);
+}
+
+/* ==================================================================== */
+/* Rendezvous (EmbLink UI Piece 1, Layer B): find a channel peer by a VFS   */
+/* path (e.g. "/run/compositor") instead of needing an already-open        */
+/* channel or a spawn-time handoff. Backed by a RAM filesystem mounted at   */
+/* /run -- a crashed server's path vanishes automatically (kernel/ipc/     */
+/* endpoint.h's B4).                                                        */
+/* ==================================================================== */
+
+/* Publish a listening endpoint at `path`. Returns an ENDPOINT handle, or
+ * -EMBK_EEXIST if the path is already taken. */
+static inline int embk_chan_listen(const char *path) {
+    return (int)embk_syscall1(EMBK_SYS_chan_listen, (int64_t)(intptr_t)path);
+}
+
+/* Block until a client connects; returns a new CHANNEL handle for that
+ * connection, or -EMBK_*. */
+static inline int embk_chan_accept(int listen_handle) {
+    return (int)embk_syscall1(EMBK_SYS_chan_accept, listen_handle);
+}
+
+/* Connect to the listener at `path`. Returns a new CHANNEL handle, or
+ * -EMBK_ENOENT (no such path) / -EMBK_ECONNREFUSED (path exists but its
+ * owner is dead / mid-teardown). */
+static inline int embk_chan_connect(const char *path) {
+    return (int)embk_syscall1(EMBK_SYS_chan_connect, (int64_t)(intptr_t)path);
+}
+
+/* ==================================================================== */
 /* Tiny freestanding helpers (no libc). A newlib program has string.h and  */
 /* ignores these; a freestanding one (user/init.c) leans on them.          */
 /* ==================================================================== */
