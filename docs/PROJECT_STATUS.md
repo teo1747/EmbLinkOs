@@ -626,12 +626,34 @@ newlib-based libc port.*
   reconciliation (`ui/declare`), a design-token theme system (`ui/theme`),
   a themed widget kit (`ui/kit`), a CPU render backend with a from-scratch
   TrueType rasterizer (`ui/backend`), and a DSL (`ui/dsl/em.{h,c}`) that
-  progressed through five iterations: V1/V2 (brace-scoped containers,
+  progressed through seven iterations: V1/V2 (brace-scoped containers,
   chainable modifiers), V3 (components, navigation, charts/lists), V4
   (app-owned "chromeless" window chrome, a larger modern component set —
   Dropdown/Toast/Spinner/Gauge/SearchField/Disclosure/StatCard/EmptyState,
-  tab and split-view navigation), and V5 (resizable windows via a corner
-  grip, always-on-desktop widgets via `EM_WIDGET`). A V4.1 app-runtime
+  tab and split-view navigation), V5 (resizable windows via a corner
+  grip, always-on-desktop widgets via `EM_WIDGET`), V6 (a **menu system** —
+  a `MenuBar` of drop-down `Menu`s and a right-click `ContextMenu`, both in
+  the overlay layer with outside-click dismiss; right-button input is plumbed
+  through the app runtime), and V7 (a focusable, scrolling, multi-line
+  `TextEditor` with full caret navigation — the kernel keyboard driver gained
+  extended-scancode arrow/Home/End/Delete keys, delivered as `EMBK_KEY_*`
+  codes, to support it). The backend also got a **performance pass** this
+  cycle (see `EMUI_INTERNALS.md`): table-based gamma text blending (~5× on
+  the text path, replacing 3 per-pixel Newton-loop `sqrtf`s) and an integer
+  premultiplied source-over fast path in `draw_image`. The toolkit also gained
+  its first signature **material** — frosted **glass** (`.glass = 1` / the
+  `Glass()` container): the pre-existing backdrop-blur render primitive, now
+  surfaced in the DSL with a translucent accent-tinted fill and an edge
+  highlight, and applied to the V6 menus by default so the UI reads as layered
+  rather than a flat Windows/Linux clone. Glass also went **compositor-deep**:
+  an `Acrylic` window (`EMBK_WINF_GLASS`) has the kernel compositor blur the
+  *desktop* behind it and composite the window over it (`fb_blur_region` +
+  `fb_blit_uniform` in the framebuffer driver), so the title bar frosts the
+  wallpaper and other windows show through — a real desktop-showthrough effect,
+  not just an in-window blur. The desktop itself became an **aurora** — a soft
+  mesh-gradient of overlapping color blobs (`aurora_build` in the compositor)
+  shown through the home launcher's translucent scrim, so the acrylic windows
+  now blur a colorful field and the frosted glass genuinely glows. A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into
@@ -662,8 +684,12 @@ newlib-based libc port.*
   call fails and kills the child it just created.
 - **Reference apps**: `uidemo.elf`/`wmdemo.elf` (V1–V3 toolkit + compositor
   demos), `v4demo.elf` (the fullest reference — chromeless chrome, tabs,
-  split view, every V4/V5 component), `clockw.elf` (the minimal `EM_WIDGET`
-  reference, an uptime clock ticking on the desktop).
+  split view, every V4/V5 component), `v6demo.elf` (the V6 menu system — the
+  "Menus" home tile), `v7demo.elf` (the V7 text editor — the "Editor" home
+  tile), `clockw.elf` (the minimal `EM_WIDGET` reference, an uptime clock
+  ticking on the desktop). New EmUI apps under `user/bin/*.c` are
+  auto-discovered by the Makefile and packed into the EMBKFS image — no
+  per-app build rule or mkfs entry to add by hand.
 
 ---
 

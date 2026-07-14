@@ -63,6 +63,33 @@ static enum layout_justify map_justify(EmAlign a) {
                  case Trailing: return JUSTIFY_END; case SpaceBetween: return JUSTIFY_SPACE_BETWEEN; default: return JUSTIFY_START; }
 }
 
+/* True when the active theme is dark (glass tint/edge differ by ground). */
+static int em_theme_is_dark(void) {
+    Color b = TH->bg;
+    return (0.299f * b.r + 0.587f * b.g + 0.114f * b.b) < 0.5f;
+}
+
+/* The GLASS material: blur whatever is behind this box, lay a translucent tint
+ * over the blur (theme surface nudged toward the EmbLink accent so it reads as
+ * ours, not neutral frosted glass), and rim it with a light edge highlight for
+ * depth. The tint is <1.0 alpha so it takes cpu_draw_rect's constant-alpha
+ * integer-LUT fast path; the blur is the only costly part and, because the
+ * app runs a retained loop, a static panel over a static backdrop blurs once
+ * and then idles. */
+static void em_glass_apply(float blur) {
+    const struct ui_theme *t = TH;
+    int dark = em_theme_is_dark();
+    Color base = t->surface_alt, acc = t->accent;
+    Color tint = { base.r * 0.90f + acc.r * 0.10f,
+                   base.g * 0.90f + acc.g * 0.10f,
+                   base.b * 0.90f + acc.b * 0.10f,
+                   dark ? 0.55f : 0.66f };
+    Color edge = dark ? (Color){ 1, 1, 1, 0.18f } : (Color){ 1, 1, 1, 0.85f };
+    ui_set_backdrop_blur(true, blur > 0 ? blur : 12.0f);
+    ui_set_paint(solid(tint));
+    ui_set_border(1.0f, edge);
+}
+
 static void em_apply_box(EmProps p) {
     if (p.spacing > 0) ui_set_spacing(p.spacing);
     int any_pad = (p.padding > 0 || p.px > 0 || p.py > 0 || p.pt > 0 || p.pr > 0 || p.pb > 0 || p.pl > 0);
@@ -91,6 +118,7 @@ static void em_apply_box(EmProps p) {
     } else if (p.shadow < 0) {
         ui_set_shadow(false, 0, 0, 0, (Color){0,0,0,0});
     }
+    if (p.glass) em_glass_apply(p.blur);   /* overrides fill+border, adds blur */
     if (p.align)   ui_set_align(map_align(p.align));
     if (p.justify) ui_set_justify(map_justify(p.justify));
     if (p.clip)    ui_set_clip_children(true);
@@ -119,6 +147,9 @@ void em_flush(void);
 void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(0); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
 void em_zstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
+void em_glass_(EmProps p)  { em_flush(); ui_begin_vstack(0); p.glass = 1;
+                             if (p.corner <= 0) p.corner = TH->radius_lg;
+                             em_apply_box(p); }
 void em_row_(EmProps p)    { em_flush(); ui_begin_hstack(0); ui_set_align(ALIGN_CENTER); if (!p.spacing) ui_set_spacing(TH->sp3); em_apply_box(p); }
 void em_end_(void)         { em_flush(); ui_end_stack(); }
 
@@ -799,9 +830,11 @@ void em_window_bind(int win, int32_t x, int32_t y) {
  * RELEASE, parks it here for the runtime to apply (live re-backing every frame
  * would thrash the page allocator; commit-on-release keeps it one realloc). */
 static int g_win_resizable;
+static int g_win_glass;
 static int g_rz_active, g_rz_pend;
 static float g_rz_grab_x, g_rz_grab_y, g_rz_dx, g_rz_dy;
 void em_window_set_resizable(int on) { g_win_resizable = on; }
+void em_window_set_glass(int on) { g_win_glass = on; }
 int em_window_take_resize(int *dw, int *dh) {
     if (!g_rz_pend) return 0;
     g_rz_pend = 0;
@@ -809,6 +842,63 @@ int em_window_take_resize(int *dw, int *dh) {
     if (dh) *dh = (int)g_rz_dy;
     return 1;
 }
+
+/* ---- drag-to-dismiss close (EmbLink's own close gesture) ----------------- *
+ * Instead of a fixed X button, the window has a GRIP you pull: as you drag it
+ * the window fades + slides toward the pull (a "peel away" preview); release
+ * past the threshold and it closes, release early and it springs back. Same
+ * commit-on-release shape as the resize grip. The runtime reads the commit via
+ * em_window_take_close(); the visual (fade/slide) is applied by em_window_. */
+#define CLOSE_PULL 95.0f           /* px of drag that commits the close */
+static int   g_cl_active, g_cl_pend;
+static float g_cl_grab_x, g_cl_grab_y, g_cl_dx, g_cl_dy, g_cl_progress;
+
+int em_window_take_close(void) { if (!g_cl_pend) return 0; g_cl_pend = 0; return 1; }
+
+bool em_close_grip(void) {
+    const struct ui_theme *t = TH;
+    float pr = g_cl_progress;
+    ui_begin_hstack(0xC105E);   /* stable key so the drag-owner identity survives rebuilds */
+    struct instance_handle self = ui_open(); (void)self;
+    bool active = ui_is_active();
+    /* a pull HANDLE (wider than a button, so it reads as draggable), tinting from
+     * the surface toward danger-red as the pull progresses. */
+    Color bg = { t->surface.r + (t->danger.r - t->surface.r) * pr,
+                 t->surface.g + (t->danger.g - t->surface.g) * pr,
+                 t->surface.b + (t->danger.b - t->surface.b) * pr, 1.0f };
+    ui_set_paint(solid(bg));
+    ui_set_corner_radius(t->radius_pill);
+    ui_set_border(1.0f, (active || pr > 0.05f) ? t->danger : t->border);
+    ui_set_size(sz_fixed(48), sz_fixed(28));
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    { EmProps ip = { .font = BodyBold, .color = pr > 0.5f ? t->on_accent : t->text_secondary };
+      em_icon_impl(IconClose, ip); }
+    ui_end_stack();
+
+    if (active) {
+        float px, py; ui_pointer_pos(&px, &py);
+        if (!g_cl_active) { g_cl_active = 1; g_cl_grab_x = px; g_cl_grab_y = py; }
+        g_cl_dx = px - g_cl_grab_x; g_cl_dy = py - g_cl_grab_y;
+        float dist = (g_cl_dx < 0 ? -g_cl_dx : g_cl_dx) + (g_cl_dy < 0 ? -g_cl_dy : g_cl_dy);
+        g_cl_progress = dist / CLOSE_PULL;
+        if (g_cl_progress >= 1.0f) { g_cl_progress = 1.0f; g_cl_pend = 1; }  /* pulled far enough -> close */
+        em_request_frame();
+    } else if (g_cl_active) {
+        g_cl_active = 0;                               /* released before the threshold */
+    }
+    /* spring back when released below the threshold */
+    if (!g_cl_active && !g_cl_pend && g_cl_progress > 0.001f) {
+        g_cl_progress *= 0.72f; g_cl_dx *= 0.72f; g_cl_dy *= 0.72f;
+        if (g_cl_progress < 0.02f) { g_cl_progress = 0; g_cl_dx = g_cl_dy = 0; }
+        em_request_frame();
+    }
+    return g_cl_pend != 0;
+}
+
+/* True while a close pull is in progress (or springing back) -- the app runtime
+ * force-repaints so the fade/slide don't ghost under the dirty-rect present. */
+int em_window_pulling(void) { return g_cl_active || g_cl_progress > 0.001f; }
 
 /* Window: the full-bleed top-level surface of a chromeless app window. Fills
  * the whole pixel buffer with the theme background (rectangular -- the OS
@@ -818,11 +908,24 @@ void em_window_(const char *title, EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->bg));
+    /* the app renders opaque (the compositor makes a glass window translucent
+     * and frosts the desktop behind it); a glass window just gets a faint accent
+     * cast in its bg so the frost reads as EmbLink's, not a neutral gray. */
+    Color bg = p.background.a > 0 ? p.background : t->bg;
+    if (g_win_glass) { Color a = t->accent;
+        bg = (Color){ bg.r * 0.92f + a.r * 0.08f, bg.g * 0.92f + a.g * 0.08f,
+                      bg.b * 0.92f + a.b * 0.08f, 1.0f }; }
+    ui_set_paint(solid(bg));
     ui_set_size(sz_grow(), sz_grow());
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
     em_apply_box(p);
+    /* drag-to-dismiss preview: fade + slide the whole window toward the pull as
+     * the close grip is dragged (springs back if released early). */
+    if (g_cl_progress > 0.001f) {
+        ui_set_opacity(1.0f - g_cl_progress * 0.88f);
+        ui_set_offset(g_cl_dx * 0.30f, g_cl_dy * 0.30f);
+    }
 }
 void em_window_end_(void) {
     em_flush();
@@ -1455,3 +1558,336 @@ void em_image_view(const char *path, EmProps p) {
 }
 
 void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }
+
+/* ======================================================================= */
+/* EmUI V6 -- menus (menu bar, dropdown menus, context menus)              */
+/* ======================================================================= */
+
+/* One menu is open at a time, keyed by the Menu's label pointer. The open
+ * menu's items float in an out-of-flow overlay anchored where the button was
+ * clicked (ui_pointer_pos at open time -- no layout query needed). */
+static const void *g_menu_open;          /* label ptr of the open Menu, or NULL */
+static float g_menu_ax, g_menu_ay;       /* anchor (window-content coords) */
+static int   g_menu_cur_open;            /* is the Menu being emitted right now open? */
+static int   g_menu_item_chosen;         /* a MenuItem was clicked this frame */
+static struct instance_handle g_menu_scrim;
+
+/* right-click edge, fed by em_feed_right_button (em_app_run). */
+static int   g_rclick_pending;
+static float g_rclick_x, g_rclick_y;
+static int   g_rbtn_prev;
+
+void em_feed_right_button(float x, float y, bool down) {
+    if (down && !g_rbtn_prev) { g_rclick_pending = 1; g_rclick_x = x; g_rclick_y = y; }
+    g_rbtn_prev = down ? 1 : 0;
+}
+int em_right_clicked(float *ox, float *oy) {
+    if (!g_rclick_pending) return 0;
+    g_rclick_pending = 0;
+    if (ox) *ox = g_rclick_x;
+    if (oy) *oy = g_rclick_y;
+    return 1;
+}
+
+void em_menubar_(EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    ui_begin_hstack(0);
+    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    ui_set_border(0, t->border);
+    ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp1);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    em_apply_box(p);
+}
+void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
+
+/* Shared: open the floating popover panel for the currently-open menu at
+ * (ax, ay). Items emit into it; em_*_menu_end_ closes it + handles dismiss. */
+static void em_menu_panel_open(uint64_t key, float ax, float ay) {
+    const struct ui_theme *t = TH;
+    ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
+    g_menu_scrim = ui_open();
+    ui_set_overlay(true);
+    ui_set_paint(solid((Color){0,0,0,0}));        /* transparent: catches outside clicks, no dim */
+    ui_set_size(sz_grow(), sz_grow());
+    ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
+    ui_set_offset(ax, ay);
+    ui_set_corner_radius(t->radius_md);
+    ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
+    em_glass_apply(12.0f);                 /* blur behind + tint + edge highlight */
+    ui_set_clip_children(true);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(0);
+    ui_set_padding(t->sp1, t->sp1, t->sp1, t->sp1);
+    ui_set_size(sz_fixed(200), sz_intrinsic());
+}
+/* returns 1 if the transparent scrim (outside the panel) was clicked */
+static int em_menu_panel_close(void) {
+    ui_end_stack();                       /* panel */
+    int scrim_hit = ui_consume_click(g_menu_scrim);
+    ui_end_stack();                       /* overlay */
+    return scrim_hit;
+}
+/* the hidden container a CLOSED menu's items emit into (built but invisible) */
+static void em_menu_hidden_open(void) {
+    ui_begin_vstack(0);
+    ui_set_size(sz_fixed(0), sz_fixed(0));
+    ui_set_clip_children(true);
+}
+
+void em_menu_(const char *label, EmProps p) {
+    (void)p;
+    em_flush();
+    const struct ui_theme *t = TH;
+    int is_open = (g_menu_open == (const void *)label);
+    ui_begin_hstack(0);                   /* the menu button in the bar */
+    struct instance_handle btn = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_paint(solid(is_open ? t->accent_soft : pressed ? shade(t->surface_alt, 0.94f)
+                                : hov ? t->surface_alt : t->surface_alt));
+    if (!is_open && !hov && !pressed) ui_set_paint(solid((Color){0,0,0,0}));   /* flat until hovered */
+    ui_set_corner_radius(t->radius_sm);
+    ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);
+    ui_set_align(ALIGN_CENTER);
+    { EmProps lp = { .font = Body, .color = is_open ? t->accent : t->text }; em_text_impl(label, lp); }
+    ui_end_stack();
+    if (ui_consume_click(btn)) {
+        if (is_open) g_menu_open = 0;
+        else { g_menu_open = (const void *)label; float px, py; ui_pointer_pos(&px, &py);
+               g_menu_ax = px; g_menu_ay = py + 8.0f; }
+        g_em_epoch++;
+        is_open = (g_menu_open == (const void *)label);
+    }
+    g_menu_cur_open = is_open;
+    if (is_open) em_menu_panel_open((uint64_t)(uintptr_t)label, g_menu_ax, g_menu_ay);
+    else         em_menu_hidden_open();
+}
+void em_menu_end_(void) {
+    em_flush();
+    if (g_menu_cur_open) { if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; } }
+    else ui_end_stack();                  /* hidden box */
+}
+
+bool em_menu_item(const char *label, const char *shortcut) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    ui_begin_hstack(0);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_paint(solid(pressed ? shade(t->accent_soft, 0.94f) : hov ? t->accent_soft : t->surface));
+    ui_set_corner_radius(t->radius_sm);
+    ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp3);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp3);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    { EmProps lp = { .font = Body, .color = hov ? t->accent : t->text }; em_text_impl(label, lp); }
+    if (shortcut && shortcut[0]) {
+        ui_spacer();
+        EmProps sp = { .font = Caption, .color = t->text_tertiary }; em_text_impl(shortcut, sp);
+    }
+    ui_end_stack();
+    if (ui_consume_click(self)) { g_menu_open = 0; g_menu_item_chosen = 1; g_em_epoch++; return true; }
+    return false;
+}
+
+void em_menu_separator(void) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    ui_box_begin(0);
+    ui_set_paint(solid(t->border));
+    ui_set_size(sz_grow(), sz_fixed(1));
+    ui_box_end();
+}
+
+/* ContextMenu: a popover at (x,y) while *open; item-click or outside-click
+ * clears *open. Same panel machinery as Menu. g_menu_item_chosen (set by
+ * MenuItem on click) is the "an item was picked" signal both Menu and
+ * ContextMenu use to dismiss. */
+static int   g_ctx_cur_open;
+static bool *g_ctx_open_flag;
+void em_context_menu_(bool *open, float x, float y, EmProps p) {
+    (void)p;
+    em_flush();
+    g_ctx_cur_open = (open && *open) ? 1 : 0;
+    g_ctx_open_flag = open;
+    g_menu_item_chosen = 0;               /* fresh: only THIS frame's item clicks count */
+    if (g_ctx_cur_open) em_menu_panel_open((uint64_t)(uintptr_t)open, x, y);
+    else                em_menu_hidden_open();
+}
+void em_context_menu_end_(void) {
+    em_flush();
+    if (g_ctx_cur_open) {
+        int scrim_hit = em_menu_panel_close();
+        if ((scrim_hit || g_menu_item_chosen) && g_ctx_open_flag) {
+            *g_ctx_open_flag = false;
+            g_em_epoch++;
+        }
+    } else {
+        ui_end_stack();                   /* hidden box */
+    }
+}
+
+/* ======================================================================= */
+/* EmUI V7 -- multi-line text editor                                       */
+/* ======================================================================= */
+
+/* Private key codes the kernel keyboard driver emits for the extended nav keys
+ * (kept in lockstep with kernel/drivers/input/keyboard.c EK_* and embk.h
+ * EMBK_KEY_*). Defined here so em.c stays SDK-free and host-testable. */
+#define EMK_LEFT  0x11
+#define EMK_RIGHT 0x12
+#define EMK_UP    0x13
+#define EMK_DOWN  0x14
+#define EMK_HOME  0x02
+#define EMK_END   0x05
+#define EMK_DEL   0x7F
+
+/* ---- editing primitives on a NUL-terminated buffer + byte cursor -------- */
+static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
+    if (*len + 1 >= (int)cap) return;
+    memmove(buf + *cur + 1, buf + *cur, (size_t)(*len - *cur + 1));  /* incl. NUL */
+    buf[*cur] = c;
+    (*cur)++; (*len)++;
+}
+static void te_backspace(char *buf, int *len, int *cur) {
+    if (*cur <= 0) return;
+    memmove(buf + *cur - 1, buf + *cur, (size_t)(*len - *cur + 1));
+    (*cur)--; (*len)--;
+}
+static void te_delete(char *buf, int *len, int *cur) {
+    if (*cur >= *len) return;
+    memmove(buf + *cur, buf + *cur + 1, (size_t)(*len - *cur));
+    (*len)--;
+}
+static int te_line_start(const char *buf, int cur) {
+    int i = cur;
+    while (i > 0 && buf[i - 1] != '\n') i--;
+    return i;
+}
+static int te_line_end(const char *buf, int len, int cur) {
+    int i = cur;
+    while (i < len && buf[i] != '\n') i++;
+    return i;
+}
+
+bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
+    em_flush();                       /* emit any pending staged leaf first */
+    const struct ui_theme *t = TH;
+    int len = (int)strlen(buf);
+    int cur = cursor ? *cursor : 0;
+    if (cur > len) cur = len;
+    if (cur < 0) cur = 0;
+
+    ui_begin_vstack(0);
+    struct instance_handle self = ui_open();
+    if (ui_consume_click(self)) ui_request_focus(self);
+    bool focused = ui_has_focus(self);
+
+    if (focused) {
+        char in[64];
+        int n = ui_input_take(in, (int)sizeof in);
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)in[i];
+            switch (c) {
+                case '\b':      te_backspace(buf, &len, &cur); break;
+                case EMK_DEL:   te_delete(buf, &len, &cur); break;
+                case '\n': case '\r': te_insert(buf, cap, &len, &cur, '\n'); break;
+                case '\t':      te_insert(buf, cap, &len, &cur, ' ');
+                                te_insert(buf, cap, &len, &cur, ' '); break;
+                case EMK_LEFT:  if (cur > 0) cur--; break;
+                case EMK_RIGHT: if (cur < len) cur++; break;
+                case EMK_HOME:  cur = te_line_start(buf, cur); break;
+                case EMK_END:   cur = te_line_end(buf, len, cur); break;
+                case EMK_UP: {
+                    int ls = te_line_start(buf, cur), col = cur - ls;
+                    if (ls > 0) { int pls = te_line_start(buf, ls - 1), ple = ls - 1;
+                                  cur = pls + (col < ple - pls ? col : ple - pls); }
+                    break;
+                }
+                case EMK_DOWN: {
+                    int ls = te_line_start(buf, cur), col = cur - ls;
+                    int le = te_line_end(buf, len, cur);
+                    if (le < len) { int nls = le + 1, nle = te_line_end(buf, len, nls);
+                                    cur = nls + (col < nle - nls ? col : nle - nls); }
+                    break;
+                }
+                default:
+                    if (c >= 32 && c < 127) te_insert(buf, cap, &len, &cur, (char)c);
+                    break;
+            }
+        }
+        if (cursor) *cursor = cur;
+        em_request_frame();   /* keep the loop live while typing */
+    }
+
+    /* the editor surface */
+    ui_set_paint(solid(t->surface_alt));
+    ui_set_corner_radius(t->radius_md);
+    ui_set_border(focused ? 1.5f : 1.0f, focused ? t->accent : t->border);
+    ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp3);
+    ui_set_clip_children(true);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_size(sz_grow(), sz_fixed(height));
+
+    /* auto-scroll: shift the lines up so the cursor line stays visible */
+    float line_h = t->text_body + 5.0f;
+    int cur_line = 0; for (int i = 0; i < cur; i++) if (buf[i] == '\n') cur_line++;
+    float caret_y = (cur_line + 1) * line_h;
+    float view_h = height - 2 * t->sp2;
+    float scroll = caret_y > view_h ? caret_y - view_h : 0.0f;
+
+    ui_begin_vstack(0);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(5);
+    ui_set_offset(0, -scroll);
+
+    if (len == 0 && !focused) {
+        EmProps pp = { .font = Body, .color = t->text_tertiary };
+        em_text_impl("Type here...", pp);
+    } else {
+        /* render each line; the cursor line splits around a caret box */
+        int line = 0, i = 0;
+        while (i <= len) {
+            int e = i; while (e < len && buf[e] != '\n') e++;
+            int is_cur = (cur >= i && cur <= e);
+            char tmp[512];
+            if (is_cur && focused) {
+                ui_begin_hstack((uint64_t)(line + 1));
+                ui_set_align(ALIGN_CENTER);
+                ui_set_spacing(0);
+                int bn = cur - i; if (bn > (int)sizeof tmp - 1) bn = sizeof tmp - 1;
+                memcpy(tmp, buf + i, (size_t)bn); tmp[bn] = 0;
+                /* skip empty text nodes: an empty string in an ALIGN_CENTER hstack
+                 * collapses the row's layout (same reason the plain-line path below
+                 * substitutes a space). Cursor at line start -> no before-text;
+                 * cursor at line end -> no after-text; the caret always draws. */
+                if (bn > 0) { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp, tp); }
+                ui_box_begin(0);              /* caret */
+                ui_set_paint(solid(t->accent));
+                ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
+                ui_box_end();
+                int an = e - cur; if (an > (int)sizeof tmp - 1) an = sizeof tmp - 1;
+                memcpy(tmp, buf + cur, (size_t)an); tmp[an] = 0;
+                if (an > 0) { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp, tp); }
+                ui_spacer();
+                ui_end_stack();
+            } else {
+                int ln = e - i; if (ln > (int)sizeof tmp - 1) ln = sizeof tmp - 1;
+                memcpy(tmp, buf + i, (size_t)ln); tmp[ln] = 0;
+                ui_begin_hstack((uint64_t)(line + 1));
+                ui_set_align(ALIGN_CENTER);
+                { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp[0] ? tmp : " ", tp); }
+                ui_spacer();
+                ui_end_stack();
+            }
+            line++;
+            i = e + 1;
+            if (e == len) break;
+        }
+    }
+    ui_end_stack();     /* lines */
+    ui_end_stack();     /* editor surface */
+    return focused;
+}

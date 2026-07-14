@@ -80,7 +80,7 @@ static void app(void) {
     };
     Window("V4 Demo") {
         WindowBar("V4 Demo") {
-            if (CloseButton().clicked()) { /* observed via em_window_closed() in the loop */ }
+            CloseGrip();   /* pull to dismiss -- the runtime handles teardown */
         }
         TabView(&g_tab, tabs, 3);
         ToastHost();

@@ -224,9 +224,54 @@ borders by walking only the actual border band instead of the whole bounding
 box, (3) integer reciprocal-multiply instead of a real divide in the blur
 kernel, (4) **caching** any rasterized-once-per-value bitmap (the `Gauge`
 ring is keyed on a quantized fraction + color and only re-rasterizes when
-that key changes) rather than redrawing it every frame. If you're adding a
-new rasterized primitive, budget for this from the start rather than
-optimizing after the fact.
+that key changes) rather than redrawing it every frame, (5) a
+**constant-alpha integer-LUT** fast path for translucent solid fills (the
+modal scrim and tinted panels: build four 256-entry `dst→out` blend tables
+once per rect, then each interior pixel is a table lookup, not a float
+`blend_over`), (6) **table-based gamma text** — the glyph blend mixes in
+linear light (`out = sqrt(src²·eff + dst²·inv)`), which done literally was 3
+per-pixel `sqrtf`s, and in the freestanding `-mno-sse` build `sqrtf` is an
+8-iteration Newton loop (~24 float divides per text pixel). `font.c` replaces
+it with two static tables — `g_lin[d]` linearizes a destination byte and
+`g_delin[k]` de-linearizes via a 12-bit sqrt table — measured ~5× faster on
+the text path with no visible change, and (7) an **integer premultiplied
+source-over** fast path in `draw_image` (opaque source = a bare copy;
+translucent = the same carry-safe `dst*(255-a)/255 + src` trick the shadow
+blit uses) for full-opacity, full-coverage image pixels — this is what the
+`Gauge` ring, sparklines, and `LineChart`/`AreaChart` composite through. If
+you're adding a new rasterized primitive, budget for this from the start
+rather than optimizing after the fact: keep the *inner* per-pixel loop
+integer, hoist any float or transcendental work out to per-primitive setup or
+a precomputed table.
+
+**The glass material.** `draw_backdrop_blur` (sample the region behind a box,
+box-blur it, write it back SDF-clipped to the rounded shape) is what makes
+frosted glass possible; it's exposed as `ui_set_backdrop_blur(enabled, radius)`
+and, at the DSL top, as `.glass = 1` / the `Glass()` container (see
+`em_glass_apply` in `em.c`): backdrop blur + a translucent theme-surface tint
+nudged toward the accent + a light edge-highlight border. The tint is `< 1.0`
+alpha so it rides the constant-alpha integer-LUT path (cheap); the **blur is
+the only costly primitive**, so glass is meant for panels that hold still
+(menus, bars, sheets) — and because the render is dirty-rect + retained, a
+static glass panel over a static backdrop blurs once and then idles. A menu
+panel's backdrop blur samples the render target *after* the content behind it
+is drawn (menus live in the overlay layer, painted last), so it correctly
+frosts whatever it covers.
+
+**Frosted windows (Acrylic) are done in the compositor**, not the toolkit,
+because a window needs to frost the *desktop* behind it — pixels the app can't
+see. `paint_region` already paints the desktop and lower windows before it
+blits each window on top, so the backdrop is sitting in the framebuffer at that
+moment. A window created with `EMBK_WINF_GLASS` (`comp_window.glass`, set via
+`.material = Acrylic` on `EM_APPLICATION`) takes a different blit path in
+`paint_window`: `fb_blur_region` box-blurs the framebuffer strip the window is
+about to cover, then `fb_blit_uniform` lays the window's (opaque) pixels over it
+at a fixed ~85% alpha — so the whole window, title bar included, reads as
+frosted acrylic with no app-side render changes. Cost is bounded to the window's
+damage rect, and paid only when the window paints; a *drag* re-blurs each step
+(cheap on real GPUs, heavier under plain QEMU/TCG). See
+`kernel/drivers/video/framebuffer.c` (`fb_blit_uniform`, `fb_blur_region`) and
+`kernel/gfx/compositor.c` (`GLASS_BLUR`, `GLASS_ALPHA`).
 
 ### `ui/dsl/em.{h,c}` — the DSL
 

@@ -288,6 +288,19 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_MOUSE_LEFT   0x01
 #define EMBK_MOUSE_RIGHT  0x02
 #define EMBK_MOUSE_MIDDLE 0x04
+
+/* Private single-byte key codes the kernel keyboard driver emits for the
+ * extended (0xE0-prefixed) navigation keys -- kept in lockstep with
+ * kernel/drivers/input/keyboard.c's EK_*. A text widget reads these from the
+ * same byte stream as typed characters (ui_input_char) to move its cursor.
+ * Backspace is the usual 0x08, Enter 0x0A, Tab 0x09. */
+#define EMBK_KEY_LEFT   0x11
+#define EMBK_KEY_RIGHT  0x12
+#define EMBK_KEY_UP     0x13
+#define EMBK_KEY_DOWN   0x14
+#define EMBK_KEY_HOME   0x02
+#define EMBK_KEY_END    0x05
+#define EMBK_KEY_DEL    0x7F
 struct embk_ui_input { int32_t x, y; uint32_t buttons; int32_t wheel; };
 static inline int embk_ui_input(struct embk_ui_input *out) {
     return (int)embk_syscall1(EMBK_SYS_ui_input, (int64_t)(intptr_t)out);
@@ -348,6 +361,10 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
 #define EMBK_WINF_WIDGET     (1ULL << 33)   /* DESKTOP WIDGET: chromeless AND kept
                                              * in a z-band above the desktop but
                                              * below every app window. */
+#define EMBK_WINF_GLASS      (1ULL << 34)   /* GLASS: chromeless AND the compositor
+                                             * blurs the backdrop behind the window
+                                             * and composites its translucent pixels
+                                             * over it (frosted acrylic). */
 
 /* Resize a shared window's content to w x h. The window's pixel pages are
  * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is

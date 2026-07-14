@@ -70,7 +70,8 @@ int em_app_run(const EmApp *app) {
     embk_screen_size(&sw, &sh);
     int winw = app->size.w > 0 ? app->size.w : 640;
     int winh = app->size.h > 0 ? app->size.h : 480;
-    int chromeless = (app->chrome == Chromeless);
+    int glass = (app->material == Acrylic);      /* frosted window (implies chromeless) */
+    int chromeless = (app->chrome == Chromeless) || glass;
     int bar = chromeless ? 0 : 26;
     if (sw && winw > (int)sw - 8)        winw = (int)sw - 8;
     if (sh && winh > (int)sh - bar - 16) winh = (int)sh - bar - 16;
@@ -80,8 +81,9 @@ int em_app_run(const EmApp *app) {
     int wy = ((int)sh - winh - bar) / 2;  if (wy < 0) wy = 0;
 
     uint32_t *px = 0;
+    uint64_t wflags = glass ? EMBK_WINF_GLASS : (chromeless ? EMBK_WINF_CHROMELESS : 0);
     int win = embk_win_create_shared_ex((uint32_t)winw, (uint32_t)winh, wx, wy, title,
-                                        chromeless ? EMBK_WINF_CHROMELESS : 0, (void **)&px);
+                                        wflags, (void **)&px);
     if (win < 0 || !px) {
         char b[64]; snprintf(b, sizeof b, "%s: win_create FAILED\n", title); embk_puts(1, b);
         return 1;
@@ -91,6 +93,7 @@ int em_app_run(const EmApp *app) {
         em_window_bind(win, wx, wy);
     }
     em_window_set_resizable(app->resize == Resizable);
+    em_window_set_glass(glass);          /* Window() adds a faint accent cast when glass */
     embk_key_grab(1);
 
     struct render_target rt = { px, (uint32_t)winw, (uint32_t)winh, (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
@@ -121,21 +124,34 @@ int em_app_run(const EmApp *app) {
                                          in.buttons != prev_in.buttons || in.wheel));
         prev_in = in;
 
-        /* --- retained updates: skip ALL ui work on untouched frames --------- */
+        /* --- retained updates: skip ALL ui work on untouched frames --------- *
+         * em_overlay_active() MUST be a build trigger: a modal's scrim-dismiss
+         * is debounced for a few consecutive shown frames (em.c's g_ov_frames
+         * >= 3, to swallow the click that opened it). Without this, a retained
+         * loop only builds on input, so the debounce counter never advances and
+         * the scrim-dismiss never fires (it'd take repeated clicks). Keeping
+         * frames coming while a modal is up costs nothing -- modals are
+         * transient -- and matches the always-build loop the modal was designed
+         * against. */
         int build = first || input_edge || em_take_frame_request() ||
-                    em_ui_epoch() != prev_epoch || em_nav_transitioning();
+                    em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
+                    em_overlay_active();
         if (!build) { embk_sleep_ms(pace); continue; }
 
         if (in.focused) {
             ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
+            em_feed_right_button((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_RIGHT) != 0);
             if (in.wheel) ui_wheel((float)in.wheel);
         } else {
             ui_pointer(-100.0f, -100.0f, false);
+            em_feed_right_button(0, 0, false);
         }
 
-        /* full clear+repaint on structural frames (epoch bump / first) */
+        /* full clear+repaint on structural frames (epoch bump / first), and while
+         * a close pull animates (the fade/slide moves the whole window, which the
+         * dirty-rect present would otherwise ghost). */
         bool force_full = false;
-        if (first || em_ui_epoch() != prev_epoch) {
+        if (first || em_ui_epoch() != prev_epoch || em_window_pulling()) {
             const struct ui_theme *t = ui_theme();
             uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
@@ -149,9 +165,9 @@ int em_app_run(const EmApp *app) {
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
-        if (em_window_closed()) {        /* the view's OWN close control fired */
+        if (em_window_closed() || em_window_take_close()) {  /* CloseButton or CloseGrip pull */
             embk_win_destroy(win); embk_key_grab(0);
-            char b[64]; snprintf(b, sizeof b, "%s: closed by its own button\n", title); embk_puts(1, b);
+            char b[64]; snprintf(b, sizeof b, "%s: closed by its own control\n", title); embk_puts(1, b);
             return 0;
         }
 
@@ -236,9 +252,11 @@ int em_widget_run(const EmWidget *wg) {
     int winw = wg->size.w > 0 ? wg->size.w : 190;
     int winh = wg->size.h > 0 ? wg->size.h : 96;
     uint32_t *px = 0;
+    int glass = (wg->material == Acrylic);
+    uint64_t wflags = EMBK_WINF_WIDGET | (glass ? EMBK_WINF_GLASS : 0);
     int win = embk_win_create_shared_ex((uint32_t)winw, (uint32_t)winh,
                                         wg->pos.x, wg->pos.y, title,
-                                        EMBK_WINF_WIDGET, (void **)&px);
+                                        wflags, (void **)&px);
     if (win < 0 || !px) {
         char b[64]; snprintf(b, sizeof b, "%s: widget create FAILED\n", title); embk_puts(1, b);
         return 1;
@@ -272,7 +290,14 @@ int em_widget_run(const EmWidget *wg) {
         if (in.focused) ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
         else            ui_pointer(-100.0f, -100.0f, false);
 
-        if (first || em_ui_epoch() != prev_epoch) {
+        if (glass) {
+            /* a glass widget renders a translucent tint the compositor lays over
+             * the blurred aurora -- clear to TRANSPARENT + full-render every build
+             * (dirty-rect would re-blend the translucent bg and accumulate). */
+            for (int i = 0; i < winw * winh; i++) px[i] = 0;
+            scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+            prev_epoch = em_ui_epoch();
+        } else if (first || em_ui_epoch() != prev_epoch) {
             const struct ui_theme *t = ui_theme();
             uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);

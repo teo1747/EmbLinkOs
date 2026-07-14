@@ -63,6 +63,19 @@ void fb_blit(int32_t x, int32_t y, int32_t w, int32_t h,
 // Same, but honours the source alpha channel (0 = transparent, 255 = opaque).
 void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
                    const uint32_t *argb, uint32_t stride);
+// Premultiplied per-pixel source-over -- for the desktop over the aurora.
+void fb_blit_over(int32_t x, int32_t y, int32_t w, int32_t h,
+                  const uint32_t *argb, uint32_t stride);
+// Blit with a UNIFORM window alpha over the destination -- for glass windows.
+void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
+                     const uint32_t *argb, uint32_t stride, uint32_t alpha);
+// In-place box blur of a framebuffer region (the backdrop behind a glass window).
+void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius);
+// Soft accent glow band around the OUTSIDE of a rect (the focused-window halo),
+// clipped to [clx0,cly0)-(clx1,cly1) and the screen.
+void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw,
+                  uint8_t cr, uint8_t cg, uint8_t cb, uint8_t max_a,
+                  int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 
 // Screen-to-screen copy (handles overlap). Coordinates are clipped.
 void fb_copy_rect(int32_t dst_x, int32_t dst_y,

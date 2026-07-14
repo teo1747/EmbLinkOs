@@ -176,6 +176,9 @@ Icons are Unicode codepoints from a DejaVu-Sans-safe set —
 | `EmptyState` | `(icon, title, subtitle)` | centered placeholder |
 | `DividerLabel` | `(text)` | labeled section divider |
 | `Image` | `(path, .height=...)` | see [Resources](#resources-fonts--images) |
+| `MenuBar` / `Menu` | `MenuBar(){ Menu("File"){ items } }` | drop-down menu strip, see [Menus](#menus-v6) |
+| `ContextMenu` | `ContextMenu(&open, x, y){ items }` | right-click popover |
+| `TextEditor` | `(buf, cap, &cursor, height)` | multi-line editor, see [Text editor](#text-editor-v7) |
 
 ## Navigation
 
@@ -199,6 +202,116 @@ pill and the current page above it.
 
 **Split view** — `Split(sidebar_width) { SidebarPane(){...} ContentPane(){...} }`
 for a desktop-style two-pane layout.
+
+## Menus (V6)
+
+A **menu bar** is a strip of drop-down `Menu`s; a **context menu** is the same
+popover opened by a right-click. Both float above content in the overlay layer
+and dismiss on an outside click.
+
+```c
+MenuBar() {
+    Menu("File") {
+        if (MenuItemK("New",  "Ctrl+N")) do_new();
+        if (MenuItemK("Open", "Ctrl+O")) do_open();
+        MenuSeparator();
+        if (MenuItemK("Quit", "Ctrl+Q")) quit();
+    }
+    Menu("Edit") { if (MenuItem("Undo")) undo(); /* ... */ }
+}
+```
+
+`MenuItem(label)` and `MenuItemK(label, shortcut)` each **return `bool`** — true
+on the frame they're chosen (act on it directly in an `if`). `MenuSeparator()`
+draws a divider. Clicking a bar `Menu` toggles its panel open at the label; an
+item click or an outside click closes it.
+
+**Context menu** — anchor a popover where the pointer was right-pressed:
+
+```c
+static bool ctx = false; static float cx, cy;
+if (RightClicked(&cx, &cy)) ctx = true;      // right-press writes the anchor
+ContextMenu(&ctx, cx, cy) {
+    if (MenuItem("Copy"))  copy();
+    if (MenuItem("Paste")) paste();
+}
+```
+
+The `EM_APPLICATION` runtime feeds the right mouse button in for you, so
+`RightClicked()` fires anywhere in the content. `v6demo.c` (the "Menus" home
+tile) is the reference app.
+
+## Text editor (V7)
+
+`TextEditor(buf, cap, &cursor, height)` is a focusable, scrolling, multi-line
+plain-text editor over a caller-owned `char buf[cap]` with a byte `cursor`.
+Click it to focus; then it takes typed characters, `Enter` (newline), `Tab`
+(two spaces), `Backspace`/`Delete`, and the `Left`/`Right`/`Up`/`Down`/`Home`/
+`End` navigation keys. The view auto-scrolls to keep the caret visible, and it
+returns `true` while focused.
+
+```c
+static char doc[4096] = "Type here...\n";
+static int  cur = 0;
+VStack(.spacing = 10, .padding = 16, .align = Fill) {
+    Text("Notes").heading();
+    TextEditor(doc, sizeof doc, &cur, 320);   // 320px tall
+}
+```
+
+The arrow/Home/End keys arrive as `EMBK_KEY_*` codes the kernel keyboard driver
+emits for the extended scancodes; under `EM_APPLICATION` the runtime grabs the
+keyboard and forwards everything, so no extra wiring is needed. `v7demo.c` (the
+"Editor" home tile) is the reference app.
+
+## Materials: glass
+
+EmbLink's signature material is **glass** — a frosted panel that blurs whatever
+is behind it, tinted with the theme surface nudged toward the EmbLink accent,
+and finished with a light edge highlight for depth. Use it for chrome, menus,
+and sheets to make the UI feel layered rather than flat.
+
+Two equivalent ways to get it:
+
+```c
+Glass(.width = 360, .padding = 20, .spacing = 12) {   // dedicated container
+    Text("Panel").title();
+    Text("I blur what's behind me.").caption().secondary();
+}
+
+VStack(.glass = 1, .corner = 16, .padding = 20) { ... }  // any box, .glass = 1
+```
+
+`.blur = <radius>` overrides the default blur (12px). Glass sets its own fill
+and border, so don't also set `.background`; you can still add `.corner`,
+`.padding`, `.shadow`, and sizing. The tint is translucent (it rides the fast
+integer blend path), but the **blur itself is the one expensive primitive** on
+this CPU renderer — use glass on panels that sit still (menus, bars, dialogs),
+not on every card, and not over fast-animating content. Because apps run a
+retained loop, a static glass panel over a static backdrop blurs **once** and
+then costs nothing until something behind it changes. The V6 menus are glass
+by default; `make showcase-v2` with the `g` gallery renders a glass panel over
+a color field (`build/glass_{dark,light}.png`).
+
+**Frosted windows (Acrylic).** A whole window can be glass — the compositor
+blurs the *desktop* behind it and composites the window over it at ~85%, so the
+title bar and the gaps around your content show the wallpaper and other windows
+frosted through. Opt in from the app runtime:
+
+```c
+EM_APPLICATION {
+    .title    = "Editor",
+    .chrome   = Chromeless,
+    .material = Acrylic,     // frosted window (implies Chromeless)
+    .view     = app,
+};
+```
+
+That's the whole change — your view still renders normally (opaque); the
+compositor does the frosting (`EMBK_WINF_GLASS`, a kernel-side blur + uniform
+alpha). The blur runs when the window paints, so a still window is cheap; a
+*drag* re-blurs each step (fine under a GPU, a little heavier under plain QEMU).
+`v7demo.c` (the "Editor" tile) is an Acrylic window.
 
 ## App-owned chrome: chromeless windows
 
@@ -306,41 +419,34 @@ else runs.
 
 ## Wiring your app into the boot image
 
-Building the `.elf` is not enough — three places need to know about a new
-app before it shows up on disk and on the home screen. Using `v4demo.elf` as
-the template (grep the Makefile for `v4demo` to see it verbatim):
+**Just drop the `.c` file in `user/bin/` and rebuild — that's it.** The build
+system auto-discovers apps: any `user/bin/*.c` (except the two special-linked
+programs `init.c` and `hello.c`) is treated as a dynamically-linked EmUI app,
+built by a Makefile pattern rule and packed onto the boot image by
+`mkfs_embkfs.py`'s `discover_userland_objects()` (which globs `build/*.elf`).
+No per-app Makefile rule, no mkfs edit.
 
-**1. Makefile** — add a build rule (copy this block, rename):
-```make
-build/hello_ui.o: user/bin/hello_ui.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
-
-build/hello_ui.elf: build/crt0.o build/syscalls.o build/hello_ui.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/hello_ui.o \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 ```
-Then add `build/hello_ui.elf` to the `embkfs.img embkfs_tree.img &: ...`
-dependency line so a plain `make embkfs.img` rebuilds it in.
-
-**2. `tools/embkfs_mkfs/mkfs_embkfs.py`** — add the matching read + pack
-block (copy the `v4demo_elf_data` pattern): read `build/hello_ui.elf` if it
-exists, append `(b"hello_ui.elf", L.DT_REG, L.S_IFREG | 0o755, hello_ui_elf_data)`
-to `objects`.
-
-**3. (optional) a home-screen tile** — in `user/bin/home.c`'s tile grid, add
-`tile("Hello UI", "/hello_ui.elf");` to launch it by click.
-
-Then rebuild the image and boot:
+# create user/bin/hello_ui.c with a view + EM_APPLICATION, then:
+make embkfs.img            # discovers, builds, and packs hello_ui.elf automatically
+make run-embkfs-cow        # boots to the desktop; see CONTRIBUTING.md for run targets
 ```
-make build/hello_ui.elf
-make embkfs.img
-make run-embkfs-tree      # or run-embkfs-cow / run-ui, see CONTRIBUTING.md
-```
+
+The **only** optional manual step is a home-screen tile: in
+[`user/bin/home.c`](../user/bin/home.c)'s tile grid, add
+`tile("Hello UI", "/hello_ui.elf");` if you want to launch it by click rather
+than by `run /hello_ui.elf` at the shell.
+
 Every EmUI app links **dynamically** against the shared toolkit
-(`libembk.so`) — this is why the build rule references it and why apps stay
-small (~370–380 KB each vs. bundling the whole toolkit). See
-[BUILD_SETUP.md](BUILD_SETUP.md#dynamic-linking-libembkso) if you want to
-understand what's actually happening at load time.
+(`libembk.so`), which is why apps stay small (~370–380 KB each vs. bundling
+the whole toolkit) — see
+[BUILD_SETUP.md](BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works)
+for what happens at load time.
+
+> One build-hygiene note: the packer globs `build/*.elf`, so if you *delete*
+> an app's `.c`, its stale `build/<name>.elf` will keep getting packed until
+> you `make clean` (or `rm build/<name>.elf`). Adding apps needs nothing;
+> only removing one needs that cleanup.
 
 ## Testing without booting a whole OS
 

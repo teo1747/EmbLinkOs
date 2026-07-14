@@ -64,7 +64,13 @@ int64_t compositor_win_create_chromeless(struct process *client, uint32_t cw, ui
  * every app window. */
 int64_t compositor_win_create_widget(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
-                                     uint64_t *out_client_va);
+                                     int glass, uint64_t *out_client_va);
+
+/* GLASS window (EmUI V8): chromeless, but the compositor blurs the backdrop
+ * behind it and composites its translucent pixels over the frost (acrylic). */
+int64_t compositor_win_create_glass(struct process *client, uint32_t cw, uint32_t ch,
+                                    int32_t x, int32_t y, const char *title,
+                                    uint64_t *out_client_va);
 
 /* Resize a shared window's content: fresh page backing, new client VA out.
  * The caller must switch to the new pointer immediately. */

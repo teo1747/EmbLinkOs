@@ -358,18 +358,53 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
      * ~10s for one 560x728 frame). Edges/corners/AA bands keep the exact path. */
     int fast_solid = (fill->kind == PAINT_SOLID &&
                       fill->solid.a >= 0.999f && opacity >= 0.999f);
+    /* CONSTANT-ALPHA (TRANSLUCENT) SOLID FAST PATH: a solid fill with a fixed
+     * partial alpha -- the modal scrim (a=0.55 over the whole window), tinted
+     * banners, accent-soft fills -- has NO fast path above, so every interior
+     * pixel took the float blend_over. For a 560x760 scrim that's ~425k float
+     * blends per frame; under TCG one modal frame took multiple SECONDS, and
+     * screenshots caught it mid-render (a scrim covering only the top rows, no
+     * dialog yet -- the "modal doesn't render" bug). The blend for a constant
+     * premultiplied source over the interior is per-channel integer:
+     *   out = round(dst*(1-a)) + round(src*a)
+     * which is carry-safe (max is 255) and bakes into four 256-entry LUTs. */
+    int fast_alpha = (fill->kind == PAINT_SOLID && !fast_solid && opacity >= 0.999f &&
+                      fill->solid.a > 0.003f && fill->solid.a < 0.999f);
     uint32_t solid_pix = 0;
+    uint8_t lutB[256], lutG[256], lutR[256], lutA[256];
     int in_x0 = 0, in_x1 = -1, in_y0 = 0, in_y1 = -1;
-    if (fast_solid) {
-        solid_pix = px_pack((int)(fill->solid.b * 255.0f + 0.5f),
-                            (int)(fill->solid.g * 255.0f + 0.5f),
-                            (int)(fill->solid.r * 255.0f + 0.5f), 255);
+    if (fast_solid || fast_alpha) {
+        if (fast_solid) {
+            solid_pix = px_pack((int)(fill->solid.b * 255.0f + 0.5f),
+                                (int)(fill->solid.g * 255.0f + 0.5f),
+                                (int)(fill->solid.r * 255.0f + 0.5f), 255);
+        } else {
+            float a = fill->solid.a, inv = 1.0f - a;
+            int sB = (int)(fill->solid.b * a * 255.0f + 0.5f);
+            int sG = (int)(fill->solid.g * a * 255.0f + 0.5f);
+            int sR = (int)(fill->solid.r * a * 255.0f + 0.5f);
+            int sA = (int)(a * 255.0f + 0.5f);
+            for (int v = 0; v < 256; v++) {
+                int d = (int)(v * inv + 0.5f);
+                lutB[v] = (uint8_t)(d + sB > 255 ? 255 : d + sB);
+                lutG[v] = (uint8_t)(d + sG > 255 ? 255 : d + sG);
+                lutR[v] = (uint8_t)(d + sR > 255 ? 255 : d + sR);
+                lutA[v] = (uint8_t)(d + sA > 255 ? 255 : d + sA);
+            }
+        }
         /* rows clear of the top/bottom corner bands; columns 1px inside */
         in_y0 = (int)ceilf(y + radius + 1.0f);
         in_y1 = (int)floorf(y + h - radius - 1.0f);
         in_x0 = (int)ceilf(x + 1.0f);
         in_x1 = (int)floorf(x + w - 1.0f);
     }
+    /* one interior pixel: opaque -> a bare store; translucent -> an integer
+     * LUT blend over the existing dst. Both avoid the float blend_over. */
+    #define CPU_INTERIOR_STORE(ROW, IX) do {                                   \
+        if (fast_solid) (ROW)[IX] = solid_pix;                                 \
+        else { int _b,_g,_r,_a; px_unpack((ROW)[IX], &_b,&_g,&_r,&_a);         \
+               (ROW)[IX] = px_pack(lutB[_b], lutG[_g], lutR[_r], lutA[_a]); }  \
+    } while (0)
 
     /* no dirty restriction and no clips at all -> interior coverage is 1.0 by
      * construction; the interior fill degenerates to a bare row of stores. */
@@ -378,11 +413,11 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         uint32_t *row = rt_row(rt, (uint32_t)iy);
-        int row_interior = fast_solid && iy >= in_y0 && iy < in_y1;
+        int row_interior = (fast_solid || fast_alpha) && iy >= in_y0 && iy < in_y1;
         int sp_a = in_x0 > x0 ? in_x0 : x0, sp_b = in_x1 < x1 ? in_x1 : x1;
         if (row_interior && cov_trivial && sp_a < sp_b) {
             int a = sp_a, b = sp_b;
-            for (int ix = a; ix < b; ix++) row[ix] = solid_pix;
+            for (int ix = a; ix < b; ix++) CPU_INTERIOR_STORE(row, ix);
             /* left/right AA columns still take the exact path below */
             for (int ix = x0; ix < x1; ix++) {
                 if (ix == a) { ix = b - 1; continue; }   /* skip the filled span */
@@ -402,7 +437,7 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
         for (int ix = x0; ix < x1; ix++) {
             float fx = ix + 0.5f;
             if (row_interior && ix >= in_x0 && ix < in_x1 && coverage_full_at(fx, fy)) {
-                row[ix] = solid_pix;
+                CPU_INTERIOR_STORE(row, ix);
                 continue;
             }
             float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
@@ -416,6 +451,7 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
             blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
         }
     }
+    #undef CPU_INTERIOR_STORE
 }
 
 /* ------------------------------------------------------------------------- */
@@ -433,16 +469,38 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
     int y1 = clampi((int)ceilf(y + h), 0, (int)rt->height);
     if (!clamp_to_dirty(rt, &x0, &y0, &x1, &y1)) return;
 
+    /* INTEGER fast path: at full opacity with full coverage the premultiplied
+     * source-over is pure integer -- opaque source is a bare copy, translucent
+     * is dst*(255-sa)/255 + src per channel (same carry-safe trick the shadow
+     * blit uses). Avoids 4 float divides + the float blend_over per pixel; the
+     * exact float path still runs for opacity<1 and clip/dirty AA edges. */
+    int img_trivial_all = (opacity >= 0.999f) && g_dirty_full && g_clip_n == 0;
+    int img_opaque_op   = (opacity >= 0.999f);
+
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         float v = (fy - y) / h; if (v < 0) v = 0; if (v >= 1) v = 0.999999f;
         uint32_t sy = (uint32_t)(v * src_h);
         const uint32_t *srow = (const uint32_t *)((const unsigned char *)pixels + (size_t)sy * src_stride);
+        uint32_t *drow = rt_row(rt, (uint32_t)iy);
         for (int ix = x0; ix < x1; ix++) {
             float fx = ix + 0.5f;
             float u = (fx - x) / w; if (u < 0) u = 0; if (u >= 1) u = 0.999999f;
             uint32_t sx = (uint32_t)(u * src_w);
-            int sb, sg, sr, sa; px_unpack(srow[sx], &sb, &sg, &sr, &sa);
+            uint32_t s = srow[sx];
+            if (img_trivial_all || (img_opaque_op && coverage_full_at(fx, fy))) {
+                uint32_t sa = s >> 24;
+                if (!sa) continue;
+                if (sa == 255) { drow[ix] = s; continue; }   /* opaque: bare copy */
+                uint32_t inv = 255u - sa, dv = drow[ix];
+                uint32_t t = (dv & 0xFF00FFu) * inv + 0x800080u;
+                t = ((t + ((t >> 8) & 0xFF00FFu)) >> 8) & 0xFF00FFu;
+                uint32_t g = ((dv >> 8) & 0xFF00FFu) * inv + 0x800080u;
+                g = ((g + ((g >> 8) & 0xFF00FFu)) >> 8) & 0xFF00FFu;
+                drow[ix] = (t + (s & 0xFF00FFu)) | ((g + ((s >> 8) & 0xFF00FFu)) << 8);
+                continue;
+            }
+            int sb, sg, sr, sa; px_unpack(s, &sb, &sg, &sr, &sa);
             float factor = opacity * coverage_at(fx, fy);
             if (factor <= 0.0f) continue;
             /* source is premultiplied; scaling all channels by factor keeps it so */
