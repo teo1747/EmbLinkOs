@@ -319,6 +319,22 @@ static void process_reap_slot(struct process *proc) {
      * frame" walk from freeing shared memory another process still maps. */
     obj_handles_release_all(proc);
 
+    /* Release every fd the dying process still holds -- the memset below wipes
+     * the table WITHOUT dispatching any close, which (before this loop) leaked
+     * the reference behind each fd: a vnode's on-disk open-refcount, or a pipe
+     * end whose reader would then wait forever for an EOF that never comes.
+     * Runs with g_sched_lock HELD (structural invariant of every reap path) --
+     * hence close_locked, never close: a self-locking close here would
+     * re-enter the non-reentrant spinlock. Backings whose teardown can block
+     * (vnode: obj_put may hit disk) defer the real work to the kworker instead
+     * of doing it under the lock. */
+    for (int i = 0; i < FD_MAX_OPEN; i++) {
+        struct fd_entry *e = &proc->fds[i];
+        if (e->used && e->ops && e->ops->close_locked) {
+            e->ops->close_locked(e);
+        }
+    }
+
     /* Reclaim compositor windows BEFORE the address space is destroyed: a shared
      * (zero-copy) window's pixel pages are mapped in this process's user half but
      * OWNED by the compositor -- they must be unmapped here so the address-space

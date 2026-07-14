@@ -5,6 +5,7 @@
 #include "gfx/surface.h"
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
+#include "ipc/pipe.h"
 #include "include/errno.h"
 
 int obj_handle_alloc(struct process *owner, enum handle_kind k, void *obj) {
@@ -50,6 +51,11 @@ static void obj_handle_free_dispatch(struct process *owner, int handle, bool loc
             if (locked) endpoint_release_for_handle_locked(owner, handle);
             else        endpoint_release_for_handle(owner, handle);
             break;
+        case HANDLE_KIND_PIPE:
+            if (locked) pipe_release_for_handle_locked(h->obj);
+            else        pipe_release_for_handle(h->obj);
+            break;
+    
         default: break;
     }
 

@@ -4,6 +4,7 @@
 #include "arch/x86_64/syscall/usercopy.h"
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
+#include "ipc/pipe.h"          /* sys_pipe: pipe_create */
 #include "drivers/timer/rtc.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
@@ -148,6 +149,27 @@ static int64_t sys_open(struct regs *r) {
 static int64_t sys_close(struct regs *r) {
     int fd = (int)r->rdi;
     return vfs_close(fd);
+}
+
+/* pipe(out[2]) -> 0, or -errno. Writes {read_handle, write_handle} -- typed
+ * OBJ-HANDLES (the capability table sys_spawn's INSTALL action consumes),
+ * NOT fds. The caller turns one into an fd by installing it, or hands it to
+ * a child at spawn. On a copy_to_user fault both handles are released via
+ * the kind dispatch (which drops the pipe refs), so a bad pointer can't leak
+ * a pipe. */
+static int64_t sys_pipe(struct regs *r) {
+    uint64_t user_out = r->rdi;    /* int[2]: {read_handle, write_handle} */
+    int handles[2];
+    int rc = pipe_create(&handles[0], &handles[1]);
+    if (rc != EMBK_OK) {
+        return rc;
+    }
+    if (copy_to_user((void *)user_out, handles, sizeof handles) != EMBK_OK) {
+        obj_handle_free(current_process, handles[0]);   /* dispatch drops the refs */
+        obj_handle_free(current_process, handles[1]);
+        return -EMBK_EFAULT;
+    }
+    return 0;
 }
 
 /* lseek(fd, offset, whence) -> new absolute offset, or -errno.
@@ -1028,6 +1050,7 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_sleep_ms     46
 #define SYS_proc_alive   47
 #define SYS_win_resize   48
+#define SYS_pipe         49
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1079,6 +1102,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_sleep_ms]     = sys_sleep_ms,
     [SYS_proc_alive]   = sys_proc_alive,
     [SYS_win_resize]   = sys_win_resize,
+    [SYS_pipe]         = sys_pipe,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

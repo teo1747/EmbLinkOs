@@ -46,6 +46,8 @@
 #include "fs/epfs.h"
 #include "selftests.h"
 
+#include "kworker/kworker.h"
+
 #include "process/process.h"
 
 
@@ -537,6 +539,8 @@ void kernel_main(void) {
             kprintf("warning: no idle kthread for cpu %u\n", (unsigned int)ci);
         }
     }
+
+    kworker_init();
 
     // Land the user in the graphical HOME launcher: a ring-3 app that takes the
     // whole screen as the compositor's desktop layer and launches other apps

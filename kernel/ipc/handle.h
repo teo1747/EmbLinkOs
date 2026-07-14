@@ -23,6 +23,7 @@ enum handle_kind {
     HANDLE_KIND_SURFACE,    /* struct surface *      (kernel/gfx/surface.h) */
     HANDLE_KIND_CHANNEL,    /* struct channel_end *  (kernel/ipc/channel.h) */
     HANDLE_KIND_ENDPOINT,   /* struct listen_endpoint * (kernel/ipc/endpoint.h) */
+    HANDLE_KIND_PIPE,       /* struct pipe_end *     (kernel/ipc/pipe.h) */
 };
 
 struct obj_handle {

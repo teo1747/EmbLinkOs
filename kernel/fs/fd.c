@@ -6,6 +6,8 @@
 #include "process/process.h"
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
+#include "ipc/pipe.h"                 /* pipe fd backing: pipe_read/write + ref/unref */
+#include "kworker/kworker.h"          /* vnode close_locked: defer obj_put off the lock */
 #include "include/types.h"
 #include <stdint.h>
 #include <string.h>
@@ -505,6 +507,14 @@ static void vnode_fd_close(struct fd_entry *e) {
         (void)e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
 }
 
+static void vnode_fd_close_locked(struct fd_entry *e) {
+    /* Cannot obj_put here: last-close reads the on-disk link count and may
+     * destroy the object (block reclamation + metadata writes) -- real disk
+     * I/O, disqualifying under g_sched_lock. Defer to the kworker, which
+     * obj_puts from a normal schedulable thread holding nothing. This CLOSES
+     * the pre-existing exit-time vnode refcount leak. */
+    kworker_defer_obj_put_locked(e->u.file.vn);
+}
 
 static const struct fd_ops vnode_fd_ops = {
     .read  = vnode_fd_read,
@@ -513,6 +523,7 @@ static const struct fd_ops vnode_fd_ops = {
     .fstat = vnode_fd_fstat,
     .inherit = vnode_fd_inherit,
     .close = vnode_fd_close,
+    .close_locked = vnode_fd_close_locked,
 };
 
 
@@ -589,7 +600,49 @@ static const struct fd_ops console_fd_ops = {
     .fstat = console_fd_fstat,
     .inherit = console_fd_inherit,
     .close = console_fd_close,
+    .close_locked = NULL,
 };
+
+static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
+    if (e->u.pipe.side != 0) return -EMBK_EBADF;    /* direction enforced at the
+                                                      * op, per the one-kind design */
+    return pipe_read(e->u.pipe.p, buf, len, out);
+}
+static int pipe_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
+    if (e->u.pipe.side != 1) return -EMBK_EBADF;
+    return pipe_write(e->u.pipe.p, buf, len, out);
+}
+static int pipe_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
+    (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
+}
+static int pipe_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e; out->size = 0; out->type = VFS_DT_FIFO; return EMBK_OK;
+    /* FIFO keeps isatty(fd) correctly FALSE when stdio is a pipe -- the
+     * mirror-image favor of the console's VFS_DT_CHAR making it true */
+}
+static int pipe_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    *dst = *src;
+    sched_lock();
+    pipe_ref_locked(dst->u.pipe.p, dst->u.pipe.side);   /* a copy IS a new
+                                                          * reference -- the exact
+                                                          * under-ref trap the
+                                                          * blanket-memcpy had */
+    sched_unlock();
+    return EMBK_OK;
+}
+static void pipe_fd_close(struct fd_entry *e) {
+    sched_lock(); pipe_unref_locked(e->u.pipe.p, e->u.pipe.side); sched_unlock();
+}
+static void pipe_fd_close_locked(struct fd_entry *e) {
+    pipe_unref_locked(e->u.pipe.p, e->u.pipe.side);
+}
+
+static const struct fd_ops pipe_fd_ops = {
+    .read = pipe_fd_read, .write = pipe_fd_write, .seek = pipe_fd_seek,
+    .fstat = pipe_fd_fstat, .inherit = pipe_fd_inherit,
+    .close = pipe_fd_close, .close_locked = pipe_fd_close_locked,
+};
+
 
 int vfs_fd_run_selftests(void)
 {

@@ -48,7 +48,11 @@ enum fd_backing {
     FD_BACKING_NONE = 0,      /**< free / not backed */
     FD_BACKING_VNODE,         /**< a VFS file */
     FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
+    FD_BACKING_PIPE,          /**< one end of a kernel pipe (kernel/ipc/pipe.c) */
 };
+
+struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
+                * stores the pointer + side and dispatches through pipe_fd_ops. */
 
 /* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
  * Adding a fourth backing later touches this table, not four switch statements. 
@@ -79,6 +83,12 @@ struct fd_ops {
      * is wrong, and once an fd can be REPLACED in-place (a redirect landing
      * on an inherited stdio slot), the release has to happen there too. */
     void (*close)(struct fd_entry *e);
+
+    /* like close(), but assumes the caller already holds g_sched_lock. Needed
+     * by obj_handles_release_all() (process.c) which is ALWAYS called with
+     * that lock held, and which can be called from process_reap_slot() while
+     * running R2 cleanup. */
+    void (*close_locked)(struct fd_entry *e);
 };
 
 struct fd_entry {
@@ -88,6 +98,7 @@ struct fd_entry {
     int flags;
     union {
         struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
+        struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
