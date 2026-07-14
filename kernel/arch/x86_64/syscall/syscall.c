@@ -3,6 +3,7 @@
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/syscall/usercopy.h"
 #include "drivers/char/serial.h"
+#include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
 #include "drivers/timer/rtc.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
@@ -62,24 +63,12 @@ static int64_t sys_write(struct regs *r) {
         }
 
         size_t advanced;
-        if (fd == 1 || fd == 2) {
-            /* stdout (1) AND stderr (2) both go to the serial console -- newlib
-             * writes diagnostics to fd 2, and without routing it here every
-             * stderr write would fall through to vfs_fd_write(2, ...) and fail
-             * (fd 2 < FD_BASE). No separate error stream to split them onto
-             * yet; both land on the same console. */
-            for (size_t i = 0; i < n; i++) {
-                serial_write_char(chunk[i]);
-            }
-            advanced = n;   // serial writes always take the whole chunk
-        } else {
-            size_t written = 0;
-            int rc = vfs_fd_write(fd, chunk, n, &written);
-            if (rc != EMBK_OK) {
-                return done > 0 ? (int64_t)done : rc;
-            }
-            advanced = written;
+        size_t written = 0;
+        int rc = vfs_fd_write(fd, chunk, n, &written);
+        if (rc != EMBK_OK) {
+            return done > 0 ? (int64_t)done : rc;
         }
+        advanced = written;
 
         done += advanced;
         if (advanced < n) {
@@ -99,7 +88,7 @@ static int64_t sys_read(struct regs *r) {
     char *buf = (char *)r->rsi;
     size_t len = (size_t)r->rdx;
 
-    if (fd == 0 || fd == 1 || fd == 2) {
+    if ( fd == 1 || fd == 2) {
         return -EMBK_EINVAL;   // no stdio-fd read support yet
     }
 

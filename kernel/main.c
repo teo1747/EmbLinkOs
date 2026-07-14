@@ -545,15 +545,20 @@ void kernel_main(void) {
     // USB, and the serial/keyboard REPL stays available as a debug console.
     {
         char *hargv[] = { (char *)"/home.elf", NULL };
+        /* The desktop is about to own the framebuffer -- disable the text
+         * console's on-screen half BEFORE home becomes a schedulable sibling.
+         * Ordering matters: process_create() makes home RUNNABLE, and userspace
+         * stdout/stderr (fd 1/2) now route through console_putchar. If the fb
+         * were still enabled here, a timer preemption in the gap between spawn
+         * and this call could let home's first write() paint over the boot
+         * screen. Disabling first closes that window. All kernel logging + the
+         * serial debug console below stay on COM1 and never touch the fb. */
+        console_set_fb_enabled(false);
         int hpid = process_create("/home.elf", hargv, 1, NULL, 0);
         if (hpid < 0)
             kprintf("\nhome: failed to launch /home.elf: %s\n", embk_strerror(hpid));
         else
             kprintf("\nhome: launched /home.elf as pid %d\n", hpid);
-        /* The desktop now owns the framebuffer -- stop the text console from
-         * drawing on it. All kernel logging + the serial debug console below
-         * stay on COM1 and never paint over the userspace UI. */
-        console_set_fb_enabled(false);
     }
 
     // Main loop (boot CPU): pump the polled drivers (legacy USB + the window

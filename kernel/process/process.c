@@ -977,6 +977,8 @@ int process_create(const char *path, char *const argv[], int argc,
         return rc;  // ELF load failed
     }
 
+    fds_init_stdio(proc);
+
     /* 2.5. Apply file_actions -- give the child its fds before it ever runs.
      * proc->fds[] is guaranteed empty here (see fd_open_into()'s comment),
      * so there's nothing to close/overwrite first. */

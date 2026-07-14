@@ -8,6 +8,7 @@
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
 #include "include/types.h"
 #include <stdint.h>
+#include <string.h>
 
 
 
@@ -45,22 +46,11 @@ void vfs_fd_init(void)
     }
 }
 
-/* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
- * Adding a fourth backing later touches this table, not four switch statements. 
- * Signatures deliberately MATCH the existing vfs_fd_* out-param style.
- * (out_read/out_written/out_offset) rather than returning ssize_t -- so the
- * vnode arm is a straight move of the code that's already there and already
- * correct, not a rewrite. */
- struct fd_ops {
-    int (*read)(struct fd_entry *e, void *buf, size_t count, size_t *out_read);
-    int (*write)(struct fd_entry *e, const void *buf, size_t count, size_t *out_written);
-    int (*seek)(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset);
-    int (*fstat)(struct fd_entry *e, struct vfs_stat *out);
-};
 
-/* the vnode-backed dispatch table (defined below, near its handlers);
- * forward-declared so the open paths can point new fds at it. */
+/* the per-backing dispatch tables (defined below, near their handlers);
+ * forward-declared so the open + stdio-init paths can point new fds at them. */
 static const struct fd_ops vnode_fd_ops;
+static const struct fd_ops console_fd_ops;
 
 /* Map an fd to its live table entry (in the CALLING process's own table). */
 static struct fd_entry *fd_lookup(int fd)
@@ -170,6 +160,38 @@ static int fd_seek_compute(uint64_t base, int64_t delta, uint64_t *out)
     return EMBK_OK;
 }
 
+/* Populate a new process's stdio (fds 0/1/2): inherit each from the spawning
+ * parent via the per-backing inherit op, or default to the console when there's
+ * no parent / no inheritable entry. Called from process_create() BEFORE file
+ * actions, so a spawn redirect can override an inherited slot. */
+void fds_init_stdio(struct process *proc) {
+    struct fd_entry *parent_fds = current_thread ? current_process->fds : NULL;
+
+    for (int i = 0; i < FD_STDIO_MAX; i++) {
+        struct fd_entry *dst = &proc->fds[i];
+        if (parent_fds && parent_fds[i].used && parent_fds[i].ops
+             && parent_fds[i].ops->inherit) {
+            if (parent_fds[i].ops->inherit(dst, &parent_fds[i]) == EMBK_OK)
+                continue;
+            /* Inheritance refused (today: any VNODE --see vnode_fd_inherit).
+             * Leaves the slot unset; the child gets EBADF on that fd, which
+             * is loud and traceable, rather than silently-shared cursor. */
+            memset(dst, 0, sizeof(*dst));
+            continue;
+        }
+
+        /* No parent (the kernel spawned us -- `home`\init, where
+         * current_thread is NULL and the boot context's g_boot_fds has no
+         * stdio), or the parent's own slot is empty. Defaults to the console,
+         * so the very first userland process has working stdio and the
+         * inheritance chain has something to propagate. */
+        dst->used = true;
+        dst->backing = FD_BACKING_CONSOLE;
+        dst->ops = &console_fd_ops;
+        dst->flags = (i == 0) ? O_RDONLY : O_WRONLY;  /* stdin vs stdout/stderr */
+        memset(&dst->u, 0, sizeof(dst->u));
+    }
+}
 
 int vfs_open(const char *path, int flags, uint32_t mode)
 {
@@ -283,26 +305,35 @@ int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset)
     return e->ops->seek(e, delta, whence, out_offset);
 }
 
+int vfs_fd_inherit(int fd, struct fd_entry *dst)
+{
+
+
+        struct fd_entry *src = fd_lookup(fd);
+    if (!src)
+        return -EMBK_EBADF;
+
+    if (!dst)
+        return -EMBK_EINVAL;
+
+    if (!src->ops || !src->ops->inherit)
+        return -EMBK_ENOSYS;
+
+    return src->ops->inherit(dst, src);
+}
+
 int vfs_close(int fd)
 {
     struct fd_entry *e = fd_lookup(fd);
     if (!e)
         return -EMBK_EBADF;
 
-    int rc = EMBK_OK;
-    if (e->backing == FD_BACKING_VNODE &&
-        e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
-        rc = e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
+    if (!e->ops || !e->ops->close)
+        return -EMBK_ENOSYS;
 
-    e->used = false;
-    e->backing = FD_BACKING_NONE;
-    e->ops = NULL;
-    e->flags = 0;
-    e->u.file.pos = 0;
-    e->u.file.vn.mnt = NULL;
-    e->u.file.vn.ino = 0;
-    e->u.file.vn.type = VFS_DT_UNKNOWN;
-    return rc;
+    e->ops->close(e);
+    memset(e, 0, sizeof(*e));
+    return EMBK_OK;
 }
 
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
@@ -362,14 +393,10 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     }
 
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
-    if (e->used)
-        return -EMBK_EBUSY;
+    if (e->used && e->ops && e->ops->close)
+        e->ops->close(e);
 
-    if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
-        err = vn.mnt->ops->obj_get(vn.mnt, vn.ino);
-        if (err)
-            return err;
-    }
+    memset(e, 0, sizeof(*e));
 
     e->used = true;
     e->backing = FD_BACKING_VNODE;
@@ -385,7 +412,7 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
             e->u.file.pos = st.size;
     }
 
-    return EMBK_OK;
+    return target_fd;
  }
 
 static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
@@ -456,12 +483,40 @@ static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
 }
 
 
+static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    (void)dst; (void)src;
+    /* Deliberately NOT "obj_get + struct copy". That would fix the LIFETIME
+     * bug (refcount) while leaving the CURSOR bug: the child would get an
+     * independent u.file.pos onto the same object -- neither POSIX (which
+     * shares the offset through a shared open-file-description) nor a fresh
+     * open. It's an accidental third thing, and it corrupts silently.
+     *
+     * Nothing can put a vnode in fds 0/1/2 today, so this cannot fire. When
+     * something eventually redirects a child's stdout to a FILE, it will
+     * fail LOUDLY here rather than quietly sharing a cursor -- and that's
+     * the moment to build the real shared open-file-description (the gap
+     * already tracked in TODO.md), not before. */
+    return -EMBK_ENOSYS;
+}
+
+
+static void vnode_fd_close(struct fd_entry *e) {
+    if (e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
+        (void)e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
+}
+
+
 static const struct fd_ops vnode_fd_ops = {
-    .read = vnode_fd_read,
+    .read  = vnode_fd_read,
     .write = vnode_fd_write,
-    .seek = vnode_fd_seek,
+    .seek  = vnode_fd_seek,
     .fstat = vnode_fd_fstat,
+    .inherit = vnode_fd_inherit,
+    .close = vnode_fd_close,
 };
+
+
+
 
 
 static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
@@ -514,11 +569,26 @@ static int console_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
     return EMBK_OK;
 }
 
+static int console_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    (void)dst; (void)src;
+    
+    *dst = *src; /* shallow copy is fine -- console fds are process-global, not per-process */
+    return EMBK_OK;
+}
+
+static void console_fd_close(struct fd_entry *e) {
+    (void)e; 
+    /* Console fds are process-global, not per-process. Closing them is
+     * meaningless -- the console remains open for everyone. */
+}
+
 static const struct fd_ops console_fd_ops = {
     .read = console_fd_read,
     .write = console_fd_write,
     .seek = console_fd_seek,
     .fstat = console_fd_fstat,
+    .inherit = console_fd_inherit,
+    .close = console_fd_close,
 };
 
 int vfs_fd_run_selftests(void)

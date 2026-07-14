@@ -35,7 +35,11 @@ struct process;
  * FD_BASE and map to slot (fd - FD_BASE). Public (not fd.c-local) because
  * struct process (process.h) embeds a table of these -- each process gets
  * its own fd namespace rather than sharing one global table. */
-#define FD_BASE 3
+#define FD_BASE 0        /* was 3. Fds 0/1/2 are now REAL table slots. */
+#define FD_STDIO_MAX 3   /* slots 0,1,2 are reserved for stdin/stdout/stderr;
+                          * vfs_open's free-slot scan starts ABOVE them, so a
+                          * fresh open() can never be handed fd 0 and later
+                          * collide with a stdio write. */
 #define FD_MAX_OPEN 64
 
 /* What backs an open fd. The per-backing behaviour is a struct fd_ops table
@@ -45,7 +49,37 @@ enum fd_backing {
     FD_BACKING_VNODE,         /**< a VFS file */
     FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
 };
-struct fd_ops;   /* opaque here; fd_entry needs only a pointer, defined in fd.c */
+
+/* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
+ * Adding a fourth backing later touches this table, not four switch statements. 
+ * Signatures deliberately MATCH the existing vfs_fd_* out-param style.
+ * (out_read/out_written/out_offset) rather than returning ssize_t -- so the
+ * vnode arm is a straight move of the code that's already there and already
+ * correct, not a rewrite. */
+struct fd_entry;   /* completed below; fd_ops' fn-ptrs take it by pointer, so a
+                    * forward decl here keeps every including TU agreeing on the
+                    * type (without it GCC warns "declared inside parameter list"
+                    * and scopes a phantom fd_entry to each prototype). */
+struct fd_ops {
+    int  (*read)(struct fd_entry *e, void *buf, size_t len, size_t *out_read);
+    int  (*write)(struct fd_entry *e, const void *buf, size_t len, size_t *out_written);
+    int  (*seek)(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset);
+    int  (*fstat)(struct fd_entry *e, struct vfs_stat *out);
+
+    /* Populate `dst` as a child's inherited copy of `src`. Per-backing
+     * because "inherit" means genuinely different things: a stateless
+     * singleton is a struct copy; a refcounted object needs its count
+     * bumped. Getting this wrong is a silent UAF, so it's a dispatch, not
+     * a memcpy. */
+    int  (*inherit)(struct fd_entry *dst, const struct fd_entry *src);
+
+    /* Release whatever this entry holds, WITHOUT clearing the entry itself
+     * (the caller does that). Exists because vfs_close currently hardcodes
+     * a vnode obj_put inline -- once an fd can hold a pipe, that assumption
+     * is wrong, and once an fd can be REPLACED in-place (a redirect landing
+     * on an inherited stdio slot), the release has to happen there too. */
+    void (*close)(struct fd_entry *e);
+};
 
 struct fd_entry {
     bool used;
@@ -70,6 +104,11 @@ int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
+
+/* Give a new process its stdin/stdout/stderr (fds 0/1/2): inherit from the
+ * spawning parent per-backing, or default to the console. process_create()
+ * calls this BEFORE applying file actions. */
+void fds_init_stdio(struct process *proc);
 int vfs_fd_run_selftests(void);
 
 
