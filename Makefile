@@ -271,59 +271,38 @@ build/libembk.so: $(LIBEMBK_OBJS)
 libembk: build/libembk.so
 	@echo "libembk.so OK"
 
-build/uidemo.o: user/bin/uidemo.c user/lib/embk.h | $(BUILD)
+# --- EmUI apps: AUTO-DISCOVERED from user/bin/*.c -----------------------------
+# Every user/bin/*.c EXCEPT the two special-linked programs (init.c is
+# freestanding; hello.c is static-newlib) is a dynamically-linked EmUI app,
+# built by the identical pattern below and packed onto the boot image
+# automatically. So adding a new app is just: drop user/bin/foo.c in and
+# `make embkfs.img` -- no per-app Makefile rule, no mkfs edit. (uidemo,
+# wmdemo, home, v4demo, clockw all previously had five copies of the same
+# two rules here; this replaces them.)
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c, $(wildcard user/bin/*.c))
+EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
+
+# One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
+# include paths).
+build/%.o: user/bin/%.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
 
-build/uidemo.elf: build/crt0.o build/syscalls.o build/uidemo.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/uidemo.o \
+# One DYNAMIC link rule for any EmUI app: it imports the toolkit from
+# libembk.so instead of statically bundling it. NO -static (would forbid the
+# .so), NO -T newlib.ld (the default script emits the .dynamic/.dynsym/
+# .rela.plt/.got the in-kernel loader needs); libembk.so comes BEFORE -lc -lm
+# so ld pulls the libc the .so needs INTO the app and --export-dynamic exports
+# it back to the .so. --no-dynamic-linker: the kernel is the loader (no
+# PT_INTERP); --hash-style=sysv: DT_HASH for symcount.
+build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
-# --- wmdemo.elf: the window-compositor demo (two composited windows) -----------
-# Reuses the exact same toolkit object set + include paths as uidemo; one window
-# hosts the real EmUI toolkit, a second is drawn directly, and the kernel
-# compositor draws both over a desktop with chrome + z-order.
-build/wmdemo.o: user/bin/wmdemo.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+# Build every discovered app.
+emui-apps: $(EMUI_APPS)
+	@echo "EmUI apps: $(notdir $(EMUI_APPS))"
 
-build/wmdemo.elf: build/crt0.o build/syscalls.o build/wmdemo.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/wmdemo.o \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
-
-# --- home.elf: the HOME launcher (the OS's user-space landing screen) ----------
-# Full-screen chromeless desktop window (embk_win_create_desktop) hosting a
-# toolkit launcher; clicking a tile embk_spawn()s that app as a floating window.
-# Reuses the same toolkit object set + include paths as uidemo/wmdemo.
-build/home.o: user/bin/home.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
-
-# home.elf is DYNAMICALLY LINKED (Phase 2): it imports the toolkit from
-# libembk.so instead of statically bundling it. Note: NO -static (that would
-# forbid the .so), NO -T newlib.ld (the default script emits the dynamic
-# sections .dynamic/.dynsym/.rela.plt/.got the loader needs), and libembk.so
-# comes BEFORE -lc -lm so ld pulls the libc functions the .so needs INTO the app
-# and --export-dynamic exports them back to the .so. --no-dynamic-linker: the
-# kernel is the loader (no PT_INTERP); --hash-style=sysv: DT_HASH for symcount.
-build/home.elf: build/crt0.o build/syscalls.o build/home.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/home.o \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
-
-# --- v4demo.elf: the EmUI V4 reference app (CHROMELESS window, app-owned
-# chrome: WindowBar drag + its own CloseButton; TabView/Split/V4 components).
-build/v4demo.o: user/bin/v4demo.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
-
-build/v4demo.elf: build/crt0.o build/syscalls.o build/v4demo.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/v4demo.o \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
-
-# --- clockw.elf: the CLOCK desktop widget (EmUI V5, EM_WIDGET runtime) ---------
-build/clockw.o: user/bin/clockw.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
-
-build/clockw.elf: build/crt0.o build/syscalls.o build/clockw.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/clockw.o \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
-
+# Back-compat convenience targets (the pattern rule builds each .elf).
 uidemo: build/uidemo.elf
 	@echo "uidemo OK"
 
@@ -403,7 +382,7 @@ $(DISK):
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf build/uidemo.elf build/wmdemo.elf build/v4demo.elf build/clockw.elf build/home.elf build/libembk.so
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf $(EMUI_APPS) build/libembk.so
 	python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
@@ -727,11 +706,19 @@ showcase-v2:
 	$(BUILD)/showcase_v2 $(BUILD)/v2_dark.ppm  dark
 	$(BUILD)/showcase_v2 $(BUILD)/v4_light.ppm light v4
 	$(BUILD)/showcase_v2 $(BUILD)/v4_dark.ppm  dark  v4
+	$(BUILD)/showcase_v2 $(BUILD)/v6_light.ppm light 6
+	$(BUILD)/showcase_v2 $(BUILD)/v6_dark.ppm  dark  6
+	$(BUILD)/showcase_v2 $(BUILD)/v7_light.ppm light 7
+	$(BUILD)/showcase_v2 $(BUILD)/v7_dark.ppm  dark  7
 	python3 -c "from PIL import Image; \
 	  Image.open('$(BUILD)/v2_light.ppm').save('$(BUILD)/v2_light.png'); \
 	  Image.open('$(BUILD)/v2_dark.ppm').save('$(BUILD)/v2_dark.png'); \
 	  Image.open('$(BUILD)/v4_light.ppm').save('$(BUILD)/v4_light.png'); \
 	  Image.open('$(BUILD)/v4_dark.ppm').save('$(BUILD)/v4_dark.png'); \
+	  Image.open('$(BUILD)/v6_light.ppm').save('$(BUILD)/v6_light.png'); \
+	  Image.open('$(BUILD)/v6_dark.ppm').save('$(BUILD)/v6_dark.png'); \
+	  Image.open('$(BUILD)/v7_light.ppm').save('$(BUILD)/v7_light.png'); \
+	  Image.open('$(BUILD)/v7_dark.ppm').save('$(BUILD)/v7_dark.png'); \
 	  print('wrote v2_{light,dark}.png + v4_{light,dark}.png')"
 
 clean:

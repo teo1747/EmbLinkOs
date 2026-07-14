@@ -7,8 +7,12 @@ path can validate against — the same role mkfs.vfat played for FAT. The image 
 deliberately small but exercises the WHOLE format:
 
     - a primary superblock at byte 65536 (and a backup at the last block)
-    - a single metadata LEAF node (level 0) that is also the tree root
-    - inside that leaf, as key-sorted items:
+    - a metadata B-tree rooted at block 17: a single LEAF node (level 0) when
+      the items fit in one 4 KiB block, else a level-1 internal root over as
+      many leaves as the items need (build_btree auto-splits). The default boot
+      image now holds enough files -- the userland ELFs, libembk.so, a real
+      font -- to need multiple leaves.
+    - inside the leaf/leaves, as key-sorted items:
         * the root directory's inode             {OBJID_ROOT, INODE, 0}
         * the root directory's entries           {OBJID_ROOT, DIR_ENTRY, hash}
           (one item per name hash; names that COLLIDE on the hash share one item
@@ -23,19 +27,22 @@ The default image holds regular files plus one symlink in the root directory:
     wgyehkb.txt  } these two share the SAME CRC32C name hash (0xC38842AB), so
     illoeuw.txt  } they land in ONE dir-entry item as a collision chain.
     hello.lnk    — a symlink object whose payload stores "hello.txt"
+    plus the userland ELFs / libembk.so / font.ttf when those are built.
 
-Everything fits in a single leaf, so we need no internal nodes yet — the
-smallest image that still tests the superblock, node header, leaf layout,
-field-wise key ordering, collision chaining, and every item type.
+This still tests the superblock, node header, leaf layout, field-wise key
+ordering, collision chaining, and every item type — and now, once the app set
+is packed in, also the multi-leaf + internal-node descent path.
 
 Block map (4 KiB blocks):
     block 16     : primary superblock (byte offset 65536)
-    block 17     : the metadata leaf (tree root)
-    block 18..   : file data blocks (contiguous per file)
+    block 17     : the B-tree root (a leaf if it all fits, else a level-1 node)
+    block 18..   : the remaining leaves (multi-leaf case), then file data blocks
     last block   : backup superblock
 """
 
 import sys
+import os
+import glob
 import struct
 import time
 import uuid as uuidlib
@@ -197,182 +204,42 @@ def make_image(path: str, size_bytes: int = 4 * 1024 * 1024):
 
     # --- fixed block assignments ---
     SB_BLOCK     = L.SUPERBLOCK_OFFSET // bs    # 65536/4096 = block 16
-    LEAF_BLOCK   = SB_BLOCK + 1                 # block 17: metadata leaf (root)
-    DATA_BLOCK   = SB_BLOCK + 2                 # block 18: first file's data
+    LEAF_BLOCK   = SB_BLOCK + 1                 # block 17: B-tree root
     BACKUP_BLOCK = total_blocks - 1            # last block: backup superblock
 
-    with open("build/init.elf", "rb") as f:
-        init_elf_data = f.read()
+    # AUTO-DISCOVER the userland: init.elf + fixtures + every build/*.elf +
+    # libembk.so + the font. Adding a new app needs no edit here (see
+    # discover_userland_objects).
+    objects = discover_userland_objects()
 
-    # The newlib demo program (user/hello.elf) -- a real libc-linked ELF, put
-    # on the image so `run /hello.elf` / the newlib selftest can exercise the
-    # user/syscalls.c retargeting layer end-to-end. Optional: only baked in if
-    # it has been built (make user/hello.elf), so a plain mkfs run without it
-    # still produces a valid image.
-    try:
-        with open("build/hello.elf", "rb") as f:
-            hello_elf_data = f.read()
-    except FileNotFoundError:
-        hello_elf_data = None
+    # --- build the metadata B-tree (auto multi-leaf) ---
+    # Root lives at META_START (the block right after the superblock); file data
+    # follows every metadata block. How many metadata blocks the tree needs
+    # depends only on item sizes, NOT on where data blocks land -- an extent's
+    # disk_block is a fixed-width field, so shifting the data region never
+    # changes leaf packing. So: build once with a provisional data start to
+    # learn the metadata-block count, place data right after it, then rebuild
+    # for real (the packing comes out identical, asserted below).
+    META_START = LEAF_BLOCK                        # block 17: root of the tree
+    prov_items, _, _, _ = build_root_items(objects, gen, data_start=META_START + 1)
+    _, _, _, n_meta = build_btree(prov_items, gen, META_START)
 
-    # uidemo.elf -- the live EmbLink UI app (ring-3 toolkit -> surface -> screen).
-    # Optional, same as hello.elf.
-    try:
-        with open("build/uidemo.elf", "rb") as f:
-            uidemo_elf_data = f.read()
-    except FileNotFoundError:
-        uidemo_elf_data = None
+    data_start = META_START + n_meta
+    items, data_blocks, file_layouts, _ = build_root_items(objects, gen, data_start)
+    root_block, root_csum, meta_blocks, n_meta2 = build_btree(items, gen, META_START)
+    assert n_meta2 == n_meta, "metadata block count changed between passes"
 
-    # v4demo.elf -- the EmUI V4 reference app (chromeless window, app-owned
-    # chrome). Optional, same as uidemo.elf.
-    try:
-        with open("build/v4demo.elf", "rb") as f:
-            v4demo_elf_data = f.read()
-    except FileNotFoundError:
-        v4demo_elf_data = None
-
-    # clockw.elf -- the clock desktop widget (EmUI V5). Optional.
-    try:
-        with open("build/clockw.elf", "rb") as f:
-            clockw_elf_data = f.read()
-    except FileNotFoundError:
-        clockw_elf_data = None
-
-    # wmdemo.elf -- the window-compositor demo (two composited windows).
-    # Optional, same as uidemo.elf.
-    try:
-        with open("build/wmdemo.elf", "rb") as f:
-            wmdemo_elf_data = f.read()
-    except FileNotFoundError:
-        wmdemo_elf_data = None
-
-    # home.elf -- the HOME launcher, spawned at boot as the desktop layer.
-    # Optional, same as uidemo.elf.
-    try:
-        with open("build/home.elf", "rb") as f:
-            home_elf_data = f.read()
-    except FileNotFoundError:
-        home_elf_data = None
-
-    # libembk.so -- the shared UI toolkit (Phase 2). The kernel's dynamic loader
-    # reads it from /libembk.so when a dynamically-linked app is spawned.
-    try:
-        with open("build/libembk.so", "rb") as f:
-            libembk_so_data = f.read()
-    except FileNotFoundError:
-        libembk_so_data = None
-
-    # font.ttf -- a real TrueType font uidemo loads at runtime from the fast
-    # EMBKFS root. Optional: skipped if the host font isn't present.
-    try:
-        with open("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "rb") as f:
-            font_ttf_data = f.read()
-    except FileNotFoundError:
-        font_ttf_data = None
-
-    # --- objects we put in the root directory ---
-    # hello.txt is an ordinary single-entry item (the regression case).
-    # wgyehkb.txt and illoeuw.txt share the SAME CRC32C name hash (0xC38842AB),
-    # so they land in ONE dir-entry item as a 2-record collision chain.
-    objects = [
-        (b"init.elf",   L.DT_REG, L.S_IFREG | 0o755,
-         init_elf_data),
-        (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
-         b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
-        # NOTE (V5): the wgyehkb/illoeuw hash-collision pair was dropped from
-        # the BOOT image -- the single-leaf builder overflowed 4KB once
-        # clockw.elf joined the app set, and the verifier explicitly tolerates
-        # their absence. make_tree_image (embkfs_tree.img) still exercises
-        # collision chains.
-        (b"hello.lnk",   L.DT_LNK, L.S_IFLNK | L.PERM_LNK,
-         b"hello.txt"),
-    ]
-    if hello_elf_data is not None:
-        objects.append((b"hello.elf", L.DT_REG, L.S_IFREG | 0o755, hello_elf_data))
-    if uidemo_elf_data is not None:
-        objects.append((b"uidemo.elf", L.DT_REG, L.S_IFREG | 0o755, uidemo_elf_data))
-    if wmdemo_elf_data is not None:
-        objects.append((b"wmdemo.elf", L.DT_REG, L.S_IFREG | 0o755, wmdemo_elf_data))
-    if v4demo_elf_data is not None:
-        objects.append((b"v4demo.elf", L.DT_REG, L.S_IFREG | 0o755, v4demo_elf_data))
-    if clockw_elf_data is not None:
-        objects.append((b"clockw.elf", L.DT_REG, L.S_IFREG | 0o755, clockw_elf_data))
-    if home_elf_data is not None:
-        objects.append((b"home.elf", L.DT_REG, L.S_IFREG | 0o755, home_elf_data))
-    if libembk_so_data is not None:
-        objects.append((b"libembk.so", L.DT_REG, L.S_IFREG | 0o755, libembk_so_data))
-    if font_ttf_data is not None:
-        objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font_ttf_data))
-
-    # --- build the leaf items (sorted by key at the end) ---
-    items = []
-
-    # root directory inode: {OBJID_ROOT, INODE, 0}
-    items.append((L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
-                  L.pack_inode(size=0, blocks=0, links=2,
-                               mode=L.S_IFDIR | L.PERM_DIR, uid=0, gid=0,
-                               atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
-                               generation=gen)))
-
-    # one object id + inode + extent per file; collect the dir
-    # entries so they can be grouped/chained by name hash afterwards.
-    dir_entries = []
-    data_blocks = []                              # (block_no, block_bytes) to write
-    file_layouts = []                             # (name, start_block, nblocks, size, csum)
-    oid = L.FIRST_USER_OBJID                      # 2
-    blk = DATA_BLOCK                              # 18
-    for name, dtype, mode, data in objects:
-        dir_entries.append((name, oid, dtype))
-
-        nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
-        data_csum = crc32c(data)
-
-        items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
-                      L.pack_inode(size=len(data), blocks=nblocks, links=1,
-                                   mode=mode, uid=0, gid=0,
-                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
-                                   generation=gen)))
-
-        # data checksum is CRC32C over the file's actual bytes (logical_size),
-        # NOT the zero padding — spec §9.3 end-to-end data integrity.
-        if nblocks > 0:
-            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
-                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
-                                        logical_size=len(data),
-                                        data_checksum=data_csum, generation=gen)))
-
-        for i, db in enumerate(build_data_blocks(data)):
-            data_blocks.append((blk + i, db))
-        file_layouts.append((name, blk, nblocks, len(data), data_csum))
-        oid += 1
-        blk += nblocks
-
-    # the directory's entries, grouped + chained by name hash
-    items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
-
-    # Sort by FIELD-WISE key order (object_id, type, offset) as INTEGERS — not by
-    # raw little-endian key bytes. Tuple comparison matches the kernel's
-    # embk_key_cmp; a memcmp of LE bytes orders large offset hashes wrong (e.g.
-    # hello.txt's 0x4A9EC2EE vs the collision chain's 0xC38842AB).
-    items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
-
-    # --- build the metadata leaf ---
-    leaf = build_leaf_block(generation=gen, block_no=LEAF_BLOCK, items=items)
-    leaf_csum = crc32c(leaf[8:])  # the leaf's checksum is over bytes [8..end]
-    embedded = struct.unpack_from("<Q", leaf, 0)[0]
-    assert embedded == leaf_csum, "leaf self-checksum mismatch in builder"
-
-    # free_blocks hint: block 0 (reserved as the null-pointer sentinel) + SB +
-    # leaf + backup (4) plus all file data blocks. Block 0 is never written
-    # but is counted used so the kernel's allocator oracle (which reserves it)
-    # agrees with this hint.
-    used = 4 + sum(nblocks for (_name, _start, nblocks, _size, _csum) in file_layouts)
+    # free_blocks hint: block 0 (reserved null-pointer sentinel) + superblock +
+    # every metadata block (root + leaves) + backup superblock, plus all file
+    # data blocks. Block 0 is never written but counted used so the kernel's
+    # allocator oracle (which reserves it) agrees with this hint.
+    used = 3 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
     free_blocks = total_blocks - used
 
     superblock = build_superblock(total_blocks=total_blocks,
                                   free_blocks=free_blocks, generation=gen,
                                   uuid16=uuidlib.uuid4().bytes,
-                                  root_block=LEAF_BLOCK, root_csum=leaf_csum)
+                                  root_block=root_block, root_csum=root_csum)
 
     # --- assemble the full image ---
     img = bytearray(size_bytes)  # all zeros
@@ -382,34 +249,32 @@ def make_image(path: str, size_bytes: int = 4 * 1024 * 1024):
         img[off:off + len(block_bytes)] = block_bytes
 
     put(SB_BLOCK, superblock)
-    put(LEAF_BLOCK, leaf)
+    for b, d in meta_blocks:            # root + leaves
+        put(b, d)
     for b, d in data_blocks:
         put(b, d)
-    put(BACKUP_BLOCK, superblock)   # backup is an identical copy
+    put(BACKUP_BLOCK, superblock)       # backup is an identical copy
 
     with open(path, "wb") as f:
         f.write(img)
 
     # --- report ---
+    n_leaves = n_meta - 1 if n_meta > 1 else 1
     print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs})")
     print(f"  superblock      : block {SB_BLOCK} (byte {SB_BLOCK*bs})")
-    print(f"  metadata leaf   : block {LEAF_BLOCK}  (checksum 0x{leaf_csum:08X}, {len(items)} items)")
+    if n_meta == 1:
+        print(f"  metadata        : single leaf at block {root_block} "
+              f"(csum 0x{root_csum:08X}, {len(items)} items)")
+    else:
+        print(f"  metadata        : level-1 root at block {root_block} "
+              f"(csum 0x{root_csum:08X}) over {n_leaves} leaves "
+              f"(blocks {META_START + 1}..{META_START + n_leaves}), {len(items)} items total")
     for name, start, nblocks, logical_size, data_csum in file_layouts:
-        if nblocks == 1:
-            where = f"block {start}"
-        else:
-            where = f"blocks {start}..{start + nblocks - 1}"
+        where = f"block {start}" if nblocks == 1 else f"blocks {start}..{start + nblocks - 1}"
         print(f"  file data       : {where}  (\"{name.decode()}\", {logical_size} bytes,"
               f" {nblocks} blocks, data csum 0x{data_csum:08X})")
     print(f"  backup superblk : block {BACKUP_BLOCK} (last block)")
     print(f"  free_blocks hint: {free_blocks}")
-    print()
-    print("  Items in the leaf (key-sorted):")
-    for key, data in items:
-        oid_, typ, off = struct.unpack(L.KEY_FMT, key)
-        tname = {L.EMBK_TYPE_INODE: "INODE", L.EMBK_TYPE_DIR_ENTRY: "DIR_ENTRY",
-                 L.EMBK_TYPE_EXTENT: "EXTENT", L.EMBK_TYPE_XATTR: "XATTR"}.get(typ, str(typ))
-        print(f"    {{obj={oid_}, type={tname:<9}, off=0x{off:08X}}}  ({len(data)} bytes data)")
 
 
 def derive_xts_keys(passphrase: bytes, salt: bytes, iterations: int):
@@ -578,6 +443,168 @@ def build_internal_block(generation, block_no, level, slots):
     return bytes(buf)
 
 
+# --- generic B-tree assembly (auto multi-leaf) -----------------------------
+# A leaf's payload budget (spec §8.3): NODE_HDR(40) then, for each item, an
+# ITEM_HDR(32) growing down + its data growing up, all inside one BLOCK_SIZE.
+# So a leaf holds items while sum(ITEM_HDR + len(data)) <= BLOCK_SIZE - NODE_HDR.
+LEAF_ITEM_BUDGET  = L.BLOCK_SIZE - L.NODE_HDR_SIZE            # 4056 bytes
+INTERNAL_SLOT_MAX = (L.BLOCK_SIZE - L.NODE_HDR_SIZE) // SLOT  # 72 leaves per internal node
+
+
+def pack_items_into_leaves(items):
+    """Greedily pack KEY-SORTED `items` into as few leaves as each fits in one
+    block. Returns a list of item-lists, one per leaf, preserving global key
+    order (so each leaf owns a contiguous key range -- exactly what an internal
+    node's per-leaf routing slots need)."""
+    leaves, cur, used = [], [], 0
+    for key, data in items:
+        cost = L.ITEM_HDR_SIZE + len(data)
+        if cost > LEAF_ITEM_BUDGET:
+            raise ValueError(f"single item too large for a leaf: {cost} > {LEAF_ITEM_BUDGET}")
+        if cur and used + cost > LEAF_ITEM_BUDGET:
+            leaves.append(cur)
+            cur, used = [], 0
+        cur.append((key, data))
+        used += cost
+    if cur:
+        leaves.append(cur)
+    return leaves
+
+
+def build_btree(items, gen, first_block, forced_leaf_splits=None):
+    """Assemble a B-tree over KEY-SORTED `items`, with the ROOT always at
+    `first_block` (so the superblock's root pointer is stable regardless of how
+    many leaves the items need):
+      - one leaf   -> `first_block` IS the level-0 leaf.
+      - many leaves -> `first_block` is a level-1 internal root; the leaves
+        follow at first_block+1, first_block+2, ...
+    This is what lets the boot image (make_image) hold an arbitrary number of
+    files without overflowing a single 4 KiB leaf -- the leaves auto-split.
+
+    `forced_leaf_splits`: pass an explicit list-of-item-lists to bypass the
+    greedy packer and force a specific leaf layout (make_tree_image uses this
+    to pin a 2-leaf split as a fixed descent-path regression fixture).
+
+    Returns (root_block, root_csum, meta_blocks, n_meta_blocks) where
+    meta_blocks is a list of (block_no, block_bytes) to write to the image."""
+    leaf_lists = forced_leaf_splits if forced_leaf_splits is not None \
+        else pack_items_into_leaves(items)
+
+    if len(leaf_lists) == 1:
+        leaf = build_leaf_block(gen, first_block, leaf_lists[0])
+        return first_block, crc32c(leaf[8:]), [(first_block, leaf)], 1
+
+    if len(leaf_lists) > INTERNAL_SLOT_MAX:
+        raise ValueError(f"{len(leaf_lists)} leaves exceed one internal node "
+                         f"({INTERNAL_SLOT_MAX} slots); a level-2 tree is not "
+                         f"implemented -- add it here if an image ever needs it")
+
+    meta_blocks, slots = [], []
+    leaf_block = first_block + 1                       # leaves live above the root
+    for il in leaf_lists:
+        leaf = build_leaf_block(gen, leaf_block, il)
+        leaf_csum = crc32c(leaf[8:])
+        meta_blocks.append((leaf_block, leaf))
+        # slot key = smallest key in that child's subtree = its first item's key
+        slots.append((il[0][0], L.pack_block_ptr(leaf_block, leaf_csum, gen)))
+        leaf_block += 1
+    root = build_internal_block(gen, first_block, level=1, slots=slots)
+    root_csum = crc32c(root[8:])
+    meta_blocks.insert(0, (first_block, root))
+    return first_block, root_csum, meta_blocks, len(meta_blocks)
+
+
+# Small on-disk fixtures always present regardless of what's been built: a
+# plain regression entry, a name-hash collision chain (wgyehkb/illoeuw share
+# CRC32C hash 0xC38842AB -> ONE dir-entry item), and a symlink.
+FIXTURE_OBJECTS = [
+    (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
+     b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
+    (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+     b"Colliding file A: wgyehkb.txt (hash 0xC38842AB, shared with illoeuw.txt).\n"),
+    (b"illoeuw.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+     b"Colliding file B: illoeuw.txt (hash 0xC38842AB, shared with wgyehkb.txt).\n"),
+    (b"hello.lnk",   L.DT_LNK, L.S_IFLNK | L.PERM_LNK, b"hello.txt"),
+]
+
+
+def _read_file(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def discover_userland_objects(build_dir="build"):
+    """Assemble the boot image's root-directory objects by DISCOVERING what's
+    been built, so adding a new EmUI app never needs a mkfs edit -- drop
+    user/bin/foo.c in, `make embkfs.img`, and foo.elf appears on the image:
+      - init.elf (required -- the freestanding selftest),
+      - the small on-disk fixtures (regression + collision chain + symlink),
+      - EVERY OTHER build/*.elf found (hello.elf + all EmUI apps, packed by
+        basename),
+      - libembk.so (the shared toolkit the dynamic loader needs), and
+      - a real DejaVu font the UI apps load at runtime,
+    each only if present. Returns a list of (name, dtype, mode, data)."""
+    init = _read_file(f"{build_dir}/init.elf")
+    if init is None:
+        raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
+    objects = [(b"init.elf", L.DT_REG, L.S_IFREG | 0o755, init)]
+    objects.extend(FIXTURE_OBJECTS)
+    for elf in sorted(glob.glob(f"{build_dir}/*.elf")):   # sorted -> deterministic image
+        name = os.path.basename(elf)
+        if name == "init.elf":
+            continue                                       # already added first
+        objects.append((name.encode(), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+    so = _read_file(f"{build_dir}/libembk.so")
+    if so is not None:
+        objects.append((b"libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
+    font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    if font is not None:
+        objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
+    return objects
+
+
+def build_root_items(objects, gen, data_start):
+    """Build the key-sorted metadata items + data-block list + file layout for a
+    root directory holding `objects` (each `(name, dtype, mode, data)`), with
+    file data laid out contiguously starting at block `data_start`. Shared by
+    make_image so its item-building and leaf-packing aren't duplicated.
+    Returns (items_sorted, data_blocks, file_layouts, dir_entries)."""
+    items = [(L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
+              L.pack_inode(size=0, blocks=0, links=2, mode=L.S_IFDIR | L.PERM_DIR,
+                           uid=0, gid=0,
+                           atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                           generation=gen))]
+    dir_entries, data_blocks, file_layouts = [], [], []
+    oid, blk = L.FIRST_USER_OBJID, data_start
+    for name, dtype, mode, data in objects:
+        dir_entries.append((name, oid, dtype))
+        nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
+        data_csum = crc32c(data)
+        items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
+                      L.pack_inode(size=len(data), blocks=nblocks, links=1, mode=mode,
+                                   uid=0, gid=0,
+                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                                   generation=gen)))
+        if nblocks > 0:
+            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
+                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
+                                        logical_size=len(data),
+                                        data_checksum=data_csum, generation=gen)))
+        for i, db in enumerate(build_data_blocks(data)):
+            data_blocks.append((blk + i, db))
+        file_layouts.append((name, blk, nblocks, len(data), data_csum))
+        oid += 1
+        blk += nblocks
+    items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
+    # FIELD-WISE integer key order (object_id, type, offset), matching the
+    # kernel's embk_key_cmp -- not a memcmp of the raw little-endian key bytes.
+    items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
+    return items, data_blocks, file_layouts, dir_entries
+
+
 def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     """Same files as make_image, but the leaf items are split across TWO leaves
     with an internal root node above them — a real 2-level B-tree that exercises
@@ -602,11 +629,12 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
          init_elf_data),
         (b"hello.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
          b"Hello from EMBKFS! This file was written by mkfs_embkfs.py.\n"),
-        # NOTE (V5): the wgyehkb/illoeuw hash-collision pair was dropped from
-        # the BOOT image -- the single-leaf builder overflowed 4KB once
-        # clockw.elf joined the app set, and the verifier explicitly tolerates
-        # their absence. make_tree_image (embkfs_tree.img) still exercises
-        # collision chains.
+        # wgyehkb.txt and illoeuw.txt share the SAME CRC32C name hash
+        # (0xC38842AB) -> one dir-entry item, a 2-record collision chain.
+        (b"wgyehkb.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"Colliding file A: wgyehkb.txt (hash 0xC38842AB, shared with illoeuw.txt).\n"),
+        (b"illoeuw.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"Colliding file B: illoeuw.txt (hash 0xC38842AB, shared with wgyehkb.txt).\n"),
         (b"hello.lnk",   L.DT_LNK, L.S_IFLNK | L.PERM_LNK,
          b"hello.txt"),
     ]
@@ -643,8 +671,12 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
     items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
 
-    # split the items across two leaves; the internal root routes between them
-    split = 5
+    # split the items across two leaves; the internal root routes between them.
+    # Half-and-half keeps both leaves non-empty regardless of how many fixtures
+    # are present (this image is deliberately a 2-level-descent regression, so
+    # it forces a split rather than relying on the auto-packer -- the files are
+    # tiny and would otherwise fit in a single leaf).
+    split = len(items) // 2
     leafA_items, leafB_items = items[:split], items[split:]
     leafA = build_leaf_block(gen, LEAFA_BLOCK, leafA_items)
     leafB = build_leaf_block(gen, LEAFB_BLOCK, leafB_items)

@@ -29,6 +29,10 @@ struct comp_window {
     int       widget;       /* 1 = DESKTOP WIDGET (EmUI V5): chromeless AND kept
                              * in a z-band above the desktop but BELOW every app
                              * window; clicks raise it only within that band. */
+    int       glass;        /* 1 = GLASS (EmUI V8): the window renders translucent
+                             * pixels; the compositor BLURS the backdrop behind it
+                             * and composites the window over it (frosted acrylic).
+                             * Implies chromeless (the app owns its own chrome). */
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
      * under TCG) still receives the click on its next win_input polls instead
@@ -64,6 +68,13 @@ static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window
 /* ---- pointer state (cursor + click-to-focus + title-bar drag) ----------- */
 #define CURSOR_W 11
 #define CURSOR_H 18
+#define GLASS_BLUR 7        /* backdrop blur radius for glass windows */
+#define GLASS_ALPHA 216     /* window opacity over the frosted backdrop (~85%) */
+#define GLOW_W 20           /* accent halo width around the focused app window */
+#define GLOW_MAX 100        /* peak glow alpha at the window edge (0-255) */
+#define GLOW_R 0x6b
+#define GLOW_G 0x74
+#define GLOW_B 0xf0         /* EmbLink indigo, a touch brighter than the accent */
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
 static uint32_t g_prev_buttons;
 static int      g_dragging;        /* a title-bar drag is in progress          */
@@ -97,7 +108,8 @@ static int32_t  g_ptr_wheel;       /* scroll delta accrued for the hovered windo
 #define DESK_BOT_G 0x10
 #define DESK_BOT_B 0x17
 
-/* Desktop background: a vertical indigo->charcoal gradient. */
+/* Desktop background: a vertical indigo->charcoal gradient (fallback if the
+ * aurora field can't be allocated). */
 static fb_color_t desktop_color(int y, int screen_h) {
     if (screen_h <= 1) screen_h = 2;
     int t = (y * 255) / (screen_h - 1);
@@ -106,6 +118,58 @@ static fb_color_t desktop_color(int y, int screen_h) {
     int g = DESK_TOP_G + ((DESK_BOT_G - DESK_TOP_G) * t) / 255;
     int b = DESK_TOP_B + ((DESK_BOT_B - DESK_TOP_B) * t) / 255;
     return FB_RGB(r, g, b);
+}
+
+/* ---- aurora desktop field ----------------------------------------------- *
+ * The signature EmbLink backdrop: soft overlapping color blobs (indigo, violet,
+ * teal, a touch of magenta) on a near-black base. Built ONCE into a full-screen
+ * buffer, then paint_region just blits the exposed sub-rect from it -- so
+ * repaints stay a memcpy, and the acrylic windows blur a colourful field (not
+ * flat dark) so the frosted glass actually glows. Falloff is integer
+ * k = s*rad^2/(rad^2 + d^2) -- no sqrt, no float (TCG-friendly). */
+static uint32_t *g_aurora;
+static int g_aurora_w, g_aurora_h;
+
+static void aurora_build(int W, int H) {
+    if (g_aurora && g_aurora_w == W && g_aurora_h == H) return;
+    if (g_aurora) { kfree(g_aurora); g_aurora = 0; g_aurora_w = g_aurora_h = 0; }
+    if (W <= 0 || H <= 0) return;
+    uint32_t *buf = (uint32_t *)kmalloc((size_t)W * H * 4);
+    if (!buf) return;
+    struct blob { int x, y, rad, r, g, b, s; } bl[] = {
+        { W*20/100, H*12/100, W*52/100,  70,  86, 226, 210 },  /* indigo,  top-left  */
+        { W*88/100, H*26/100, W*46/100, 128,  74, 206, 190 },  /* violet,  right     */
+        { W*60/100, H*94/100, W*58/100,  36, 150, 156, 175 },  /* teal,    bottom    */
+        { W* 8/100, H*96/100, W*40/100, 196,  70, 138, 120 },  /* magenta, low-left  */
+    };
+    int nb = (int)(sizeof bl / sizeof bl[0]);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int ar = 13, ag = 15, ab = 22;             /* charcoal base */
+            for (int i = 0; i < nb; i++) {
+                long dx = x - bl[i].x, dy = y - bl[i].y;
+                long d2 = dx*dx + dy*dy;
+                long rad2 = (long)bl[i].rad * bl[i].rad;
+                long k = (long)bl[i].s * rad2 / (rad2 + d2);   /* 0..s soft falloff */
+                ar += (int)(bl[i].r * k / 256);
+                ag += (int)(bl[i].g * k / 256);
+                ab += (int)(bl[i].b * k / 256);
+            }
+            /* film GRAIN: a hash-based per-pixel luminance dither (~±6) breaks up
+             * gradient banding and gives the wallpaper a subtle tactile texture. */
+            uint32_t hsh = ((uint32_t)x * 0x1f1f1f1fu) ^ ((uint32_t)y * 0x9e3779b9u);
+            hsh ^= hsh >> 15; hsh *= 0x2c1b3c6du; hsh ^= hsh >> 12;
+            int gn = (int)(hsh & 15) - 8 + (int)((hsh >> 8) & 3);   /* ~[-8,+10] */
+            gn = gn * 6 / 10;                                       /* scale to ~±5 */
+            ar += gn; ag += gn; ab += gn;
+            if (ar < 0) ar = 0; if (ag < 0) ag = 0; if (ab < 0) ab = 0;
+            if (ar > 255) ar = 255;
+            if (ag > 255) ag = 255;
+            if (ab > 255) ab = 255;
+            buf[(size_t)y*W + x] = ((uint32_t)ar << 16) | ((uint32_t)ag << 8) | (uint32_t)ab;
+        }
+    }
+    g_aurora = buf; g_aurora_w = W; g_aurora_h = H;
 }
 
 /* ---- geometry ----------------------------------------------------------- */
@@ -126,6 +190,19 @@ static void win_frame_rect(const struct comp_window *w,
 
 static int imax(int a, int b) { return a > b ? a : b; }
 static int imin(int a, int b) { return a < b ? a : b; }
+
+/* App windows (not the desktop, not widgets) get the focused-window accent glow. */
+static int win_glows(const struct comp_window *w) {
+    return w->used && !w->desktop && !w->widget;
+}
+/* The rect a repaint must cover for a window: its frame, GROWN by the glow band
+ * for glow windows so the halo is drawn / erased with the window (else it trails
+ * on move/focus-change). */
+static void win_repaint_rect(const struct comp_window *w,
+                             int *x0, int *y0, int *x1, int *y1) {
+    win_frame_rect(w, x0, y0, x1, y1);
+    if (win_glows(w)) { *x0 -= GLOW_W; *y0 -= GLOW_W; *x1 += GLOW_W; *y1 += GLOW_W; }
+}
 
 /* ---- lookup ------------------------------------------------------------- */
 
@@ -190,8 +267,18 @@ static void paint_window(struct comp_window *w, int focused,
                          int rx0, int ry0, int rx1, int ry1) {
     int fx0, fy0, fx1, fy1;
     win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
-    /* early out if the window doesn't touch the region at all */
-    if (fx1 <= rx0 || fx0 >= rx1 || fy1 <= ry0 || fy0 >= ry1) return;
+    /* early out if the window (grown by its glow band, when it has one) doesn't
+     * touch the region at all */
+    int glow = win_glows(w) && focused;
+    int px0 = fx0, py0 = fy0, px1 = fx1, py1 = fy1;
+    if (glow) { px0 -= GLOW_W; py0 -= GLOW_W; px1 += GLOW_W; py1 += GLOW_W; }
+    if (px1 <= rx0 || px0 >= rx1 || py1 <= ry0 || py0 >= ry1) return;
+
+    /* focused-window accent halo: drawn first (outside the frame), so the window
+     * content lands on top of it; clipped to the repaint region. */
+    if (glow)
+        fb_glow_rect(fx0, fy0, fx1, fy1, GLOW_W, GLOW_R, GLOW_G, GLOW_B, GLOW_MAX,
+                     rx0, ry0, rx1, ry1);
 
     int bar_h = win_titlebar_h(w);   /* 0 for the chromeless desktop window */
 
@@ -229,7 +316,23 @@ static void paint_window(struct comp_window *w, int focused,
     if (sx1 > sx0 && sy1 > sy0 && w->content) {
         int src_x = sx0 - cx0, src_y = sy0 - cy0;
         const uint32_t *src = w->content + (size_t)src_y * w->cw + src_x;
-        fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
+        if (w->glass) {
+            /* frost the already-painted backdrop (desktop + lower windows) behind
+             * this window. A glass WIDGET renders a translucent tint -> composite
+             * per-pixel so the frosted aurora shows through it; an acrylic app
+             * window renders opaque -> lay it over at a uniform translucency. */
+            fb_blur_region(sx0, sy0, sx1 - sx0, sy1 - sy0, GLASS_BLUR);
+            if (w->widget)
+                fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
+            else
+                fb_blit_uniform(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw, GLASS_ALPHA);
+        } else if (w->desktop) {
+            /* the home desktop renders a translucent scrim over a transparent bg;
+             * composite it per-pixel so the aurora shows through (opaque tiles copy) */
+            fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
+        } else {
+            fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
+        }
     }
 
     /* --- 1px border ring (not on the desktop, nor app-chromed windows) --- */
@@ -262,9 +365,14 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
 
-    /* 1) desktop background (gradient, row by row) */
-    for (int y = ry0; y < ry1; y++)
-        fb_fill_rect(rx0, y, rx1 - rx0, 1, desktop_color(y, H));
+    /* 1) desktop background: the aurora field (built once, then blitted). */
+    aurora_build(W, H);
+    if (g_aurora && g_aurora_w == W && g_aurora_h == H) {
+        fb_blit(rx0, ry0, rx1 - rx0, ry1 - ry0, g_aurora + (size_t)ry0 * W + rx0, (uint32_t)W);
+    } else {
+        for (int y = ry0; y < ry1; y++)
+            fb_fill_rect(rx0, y, rx1 - rx0, 1, desktop_color(y, H));
+    }
 
     /* 2) windows, ascending z: repeatedly find the lowest not-yet-drawn z.
      *    O(N^2) over <=8 windows -- trivially cheap and keeps the code obvious. */
@@ -311,8 +419,18 @@ static void enforce_focus(void) {
     if (nt == g_top_id) return;
     struct comp_window *old = win_by_id(g_top_id);   /* previously focused */
     g_top_id = nt;
-    if (old && old->visible) paint_titlebar(old);    /* -> muted */
-    if (top) paint_titlebar(top);                    /* -> accent */
+    /* repaint both windows' footprints (grown by the glow band) so the accent
+     * halo follows focus: the old one redraws without it, the new one with it.
+     * paint_titlebar covers the kernel-chrome case; the region repaint covers
+     * chromeless/glass app windows (whose glow lives outside their frame). */
+    if (old && old->visible) {
+        paint_titlebar(old);
+        if (win_glows(old)) { int x0, y0, x1, y1; win_repaint_rect(old, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
+    }
+    if (top) {
+        paint_titlebar(top);
+        if (win_glows(top)) { int x0, y0, x1, y1; win_repaint_rect(top, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
+    }
 }
 
 /* Release a window's pixel backing. For a shared (zero-copy) window this MUST
@@ -369,6 +487,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->desktop = 0;
     w->chromeless = 0;
     w->widget = 0;
+    w->glass = 0;
     w->pend_click = 0;
     w->content = buf;
     int n = 0;
@@ -382,7 +501,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
         g_active = 1;
         paint_region(0, 0, (int)fi->width, (int)fi->height);
     } else {
-        int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+        int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
         paint_region(fx0, fy0, fx1, fy1);
     }
     enforce_focus();   /* the new window is now front; demote the old front */
@@ -398,11 +517,12 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
  * win_present becomes damage-only. `out_client_va` receives the client mapping. */
 static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint32_t ch,
                                       int32_t x, int32_t y, const char *title,
-                                      int desktop, int chromeless, int widget,
+                                      int desktop, int chromeless, int widget, int glass,
                                       uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
     if (widget) chromeless = 1;                  /* widgets are always chromeless */
+    if (glass)  chromeless = 1;                  /* glass windows own their chrome */
     uint32_t bar = (desktop || chromeless) ? 0 : COMP_TITLEBAR_H;
     if (cw == 0 || ch == 0 || cw > fi->width || ch + bar > fi->height)
         return -EMBK_EINVAL;
@@ -455,18 +575,23 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->desktop = desktop;
     w->chromeless = chromeless;
     w->widget = widget;
+    w->glass = glass && !desktop;
     w->pend_click = 0;
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
     w->shared = 1; w->phys = phys; w->npages = npages;
     w->kview = kview; w->client_va = cva; w->client_pml4 = client->pml4_phys;
-    for (size_t i = 0; i < (size_t)cw * ch; i++) w->content[i] = 0xFF000000u;
+    /* the desktop (home) and glass WIDGETS start TRANSPARENT so the aurora shows
+     * through wherever they render nothing / a translucent tint; opaque app
+     * windows (incl. acrylic, which is composited at a uniform alpha) start black */
+    { uint32_t init_px = (desktop || (glass && widget)) ? 0x00000000u : 0xFF000000u;
+      for (size_t i = 0; i < (size_t)cw * ch; i++) w->content[i] = init_px; }
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
     w->title[n] = 0;
     uint32_t id = w->id;
     if (!g_active) { g_active = 1; paint_region(0, 0, (int)fi->width, (int)fi->height); }
-    else { int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1); paint_region(fx0, fy0, fx1, fy1); }
+    else { int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1); paint_region(fx0, fy0, fx1, fy1); }
     enforce_focus();
     spin_unlock(&g_comp_lock);
     if (out_client_va) *out_client_va = cva;
@@ -480,7 +605,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
 int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
                                      uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 0, 0, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 0, 0, 0, out_client_va);
 }
 
 /* Zero-copy floating window with NO kernel chrome: the app draws its own bar
@@ -489,7 +614,7 @@ int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32
 int64_t compositor_win_create_chromeless(struct process *client, uint32_t cw, uint32_t ch,
                                          int32_t x, int32_t y, const char *title,
                                          uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, out_client_va);
 }
 
 /* Resize a SHARED window's content to (nw,nh): allocate a fresh page backing,
@@ -546,13 +671,13 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
         for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
         kfree(phys); return -EMBK_EINVAL;
     }
-    win_frame_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
+    win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
     w->cw = nw; w->ch = nh;
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
-    win_frame_rect(w, &nx0, &ny0, &nx1, &ny1);   /* new footprint */
+    win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);   /* new footprint */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
     spin_unlock(&g_comp_lock);
 
@@ -573,8 +698,8 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
  * BELOW every app window -- an always-visible tile apps float over. */
 int64_t compositor_win_create_widget(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
-                                     uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 1, out_client_va);
+                                     int glass, uint64_t *out_client_va) {
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 1, glass, out_client_va);
 }
 
 /* Full-screen chromeless HOME/desktop window: sized to the framebuffer, pinned
@@ -585,9 +710,17 @@ int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_clie
     const fb_info_t *fi = fb_get_info();
     if (!fi) return -EMBK_ENODEV;
     int64_t id = win_create_shared_impl(client, fi->width, fi->height, 0, 0,
-                                        "", 1, 0, 0, out_client_va);
+                                        "", 1, 0, 0, 0, out_client_va);
     if (id > 0) { if (out_w) *out_w = fi->width; if (out_h) *out_h = fi->height; }
     return id;
+}
+
+/* Zero-copy GLASS window (EmUI V8): chromeless, but the compositor blurs the
+ * backdrop behind it and composites its translucent pixels over the frost. */
+int64_t compositor_win_create_glass(struct process *client, uint32_t cw, uint32_t ch,
+                                     int32_t x, int32_t y, const char *title,
+                                     uint64_t *out_client_va) {
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 1, out_client_va);
 }
 
 int compositor_win_is_shared(int pid, uint32_t id) {
@@ -629,10 +762,10 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
-    int ox0, oy0, ox1, oy1; win_frame_rect(w, &ox0, &oy0, &ox1, &oy1);
+    int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     w->x = x; w->y = y;
     w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within its own band */
-    int nx0, ny0, nx1, ny1; win_frame_rect(w, &nx0, &ny0, &nx1, &ny1);
+    int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
     /* repaint the union of old and new footprints in one region */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
     enforce_focus();   /* moving raises to front; demote whoever was front */
@@ -644,7 +777,7 @@ int64_t compositor_win_destroy(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
-    int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+    int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
     win_free_backing(w);                       /* frees copy buf OR unmaps+frees shared pages */
     w->used = 0; w->visible = 0;
     if (id == g_top_id) g_top_id = 0;          /* force focus recompute below */
@@ -718,13 +851,13 @@ void compositor_pointer_tick(void) {
                 kprintf("compositor: close btn -> hide win %u, kill pid %d\n", (unsigned)w->id, w->pid);   /* DIAG */
                 w->visible = 0;
                 if (w->id == g_top_id) g_top_id = 0;
-                int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+                int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */
             } else {
                 w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within band */
                 raised = 1;
-                int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+                int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 if (y < w->y + win_titlebar_h(w)) {   /* grabbed the title bar */
                     g_dragging = 1; g_drag_id = w->id;
@@ -741,9 +874,9 @@ void compositor_pointer_tick(void) {
         if (w) {
             int nx = x - g_drag_dx, ny = y - g_drag_dy;
             if (nx != w->x || ny != w->y) {
-                int ox0, oy0, ox1, oy1; win_frame_rect(w, &ox0, &oy0, &ox1, &oy1);
+                int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
                 w->x = nx; w->y = ny;
-                int nx0, ny0, nx1, ny1; win_frame_rect(w, &nx0, &ny0, &nx1, &ny1);
+                int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
                 DIRTY(ox0, oy0, ox1, oy1);
                 DIRTY(nx0, ny0, nx1, ny1);
             }

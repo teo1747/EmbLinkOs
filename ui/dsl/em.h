@@ -74,6 +74,8 @@ typedef struct {
     int   shadow;                        /* 0 none, 1 sm, 2 md, 3 lg */
     float opacity;                       /* 0 -> treated as 1 */
     int   clip;                          /* clip children to bounds */
+    int   glass;                         /* frosted backdrop-blur material */
+    float blur;                          /* glass blur radius (0 -> theme default) */
 
     /* text */
     EmFont font;
@@ -120,6 +122,11 @@ const EmTokens *em_tokens_(void);
 #define HStack(...) EM_SCOPE_(em_hstack_((EmProps){__VA_ARGS__}), em_end_())
 #define ZStack(...) EM_SCOPE_(em_zstack_((EmProps){__VA_ARGS__}), em_end_())
 #define Card(...)   EM_SCOPE_(em_card_((EmProps){__VA_ARGS__}),  em_end_())
+/* Glass: a frosted panel -- blurs whatever is behind it (backdrop blur),
+ * tinted with the theme surface + a hint of the EmbLink accent, and finished
+ * with a light edge highlight for depth. Equivalent to any container with
+ * `.glass = 1` (optionally `.blur = <radius>`). Use for chrome, menus, sheets. */
+#define Glass(...)  EM_SCOPE_(em_glass_((EmProps){__VA_ARGS__}),  em_end_())
 #define Screen(...) EM_SCOPE_(em_screen_((EmProps){__VA_ARGS__}),em_end_())
 #define Section(title, ...) EM_SCOPE_(em_section_((title), (EmProps){__VA_ARGS__}), em_end_())
 #define ScrollView(bind, height, ...) EM_SCOPE_(em_scroll_((bind), (height), (EmProps){__VA_ARGS__}), em_scroll_end_())
@@ -128,6 +135,7 @@ void em_vstack_(EmProps p);
 void em_hstack_(EmProps p);
 void em_zstack_(EmProps p);
 void em_card_(EmProps p);
+void em_glass_(EmProps p);
 void em_screen_(EmProps p);
 void em_section_(const char *title, EmProps p);
 void em_scroll_(float *scroll_y, float viewport_h, EmProps p);
@@ -257,6 +265,15 @@ void em_windowbar_end_(void);
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */
+/* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the
+ * WindowBar; the user PULLS it -- the window fades + slides toward the drag and
+ * closes once pulled past the threshold (springs back if released early), the
+ * same drag-to-commit shape as the resize corner grip. The EM_APPLICATION
+ * runtime handles the actual teardown (via em_window_take_close). */
+#define CloseGrip()  em_close_grip()
+bool em_close_grip(void);
+int  em_window_take_close(void);       /* 1 the frame the close gesture committed */
+int  em_window_pulling(void);          /* 1 while a close pull is animating (fade/slide) */
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
 
@@ -264,6 +281,7 @@ void em_window_bind(int win, int32_t x, int32_t y);
  * corner handle whose drag, ON RELEASE, records a size delta the runtime
  * collects with em_window_take_resize and applies via embk_win_resize. */
 void em_window_set_resizable(int on);
+void em_window_set_glass(int on);   /* Window() renders a translucent tint for glass */
 int  em_window_take_resize(int *dw, int *dh);   /* 1 if a resize is pending */
 
 /* --- new components ----------------------------------------------------- */
@@ -321,8 +339,84 @@ void em_split_end_(void);
 void em_sidebar_(EmProps p);
 void em_content_(EmProps p);
 
-/* Structural-change epoch: bumps when a V4 component restructures the tree
- * (dropdown open/close, toast raise/expiry, disclosure toggle, tab switch).
+/* ======================================================================= */
+/* EmUI V6 -- menus (menu bar, dropdown menus, context menus)               */
+/* ======================================================================= *
+ * A proper desktop menu system, built on the modal-overlay layer (so menus
+ * float above content, and a click anywhere else closes them). One menu is
+ * open at a time.
+ *
+ *   MenuBar {
+ *       Menu("File") {
+ *           if (MenuItem("New").shortcut("Ctrl+N").clicked()) new_doc();
+ *           MenuSeparator();
+ *           if (MenuItem("Quit").clicked()) quit();
+ *       }
+ *       Menu("Edit") { ... }
+ *   }
+ *
+ *   // right-click anywhere -> a context menu at the pointer:
+ *   static bool ctx; static float cx, cy;
+ *   if (RightClicked(&cx, &cy)) ctx = true;
+ *   ContextMenu(&ctx, cx, cy) { if (MenuItem("Copy").clicked()) copy(); }
+ */
+
+/* MenuBar: a horizontal strip of Menu buttons (put it at the top of a Window). */
+#define MenuBar(...)  EM_SCOPE_(em_menubar_((EmProps){__VA_ARGS__}), em_menubar_end_())
+void em_menubar_(EmProps p);
+void em_menubar_end_(void);
+
+/* Menu: a labeled button in the bar; its brace scope holds the MenuItems, shown
+ * as a floating popover anchored below the button when open (click to toggle). */
+#define Menu(label, ...)  EM_SCOPE_(em_menu_((label), (EmProps){__VA_ARGS__}), em_menu_end_())
+void em_menu_(const char *label, EmProps p);
+void em_menu_end_(void);
+
+/* MenuItem: one row; returns true the frame it's clicked (which also closes the
+ * open menu). MenuItemK adds a right-aligned shortcut hint ("Ctrl+S"). */
+bool em_menu_item(const char *label, const char *shortcut);
+#define MenuItem(label)       em_menu_item((label), 0)
+#define MenuItemK(label, sc)  em_menu_item((label), (sc))
+void em_menu_separator(void);
+#define MenuSeparator()  em_menu_separator()
+
+/* Right-click detection: returns 1 (once) on a right-press this frame, with the
+ * press position written to out_x and out_y (window-content coords). Drive from
+ * app's pointer state -- em_app_run does this automatically. */
+int  em_right_clicked(float *out_x, float *out_y);
+#define RightClicked(px, py)  em_right_clicked((px), (py))
+
+/* ContextMenu: a popover anchored at (x,y) while *open; its scope holds
+ * MenuItems. Clicking an item or outside closes it (clears *open). */
+#define ContextMenu(open, x, y, ...) \
+    EM_SCOPE_(em_context_menu_((open), (x), (y), (EmProps){__VA_ARGS__}), em_context_menu_end_())
+void em_context_menu_(bool *open, float x, float y, EmProps p);
+void em_context_menu_end_(void);
+
+/* Runtime plumbing: the app loop feeds raw right-button state here (em_app_run
+ * does it). A press EDGE of the right button becomes one em_right_clicked(). */
+void em_feed_right_button(float x, float y, bool down);
+
+/* ======================================================================= */
+/* EmUI V7 -- multi-line text editing                                       */
+/* ======================================================================= *
+ * TextEditor: an editable multi-line text area. `buf`/`cap` own the text (a
+ * NUL-terminated C string the app keeps), `cursor` is a byte offset into it the
+ * app persists across frames, `height` is the visible height (it scrolls when
+ * the text is taller). Handles typing, Enter (newline), Backspace, Delete, Tab,
+ * and cursor movement via the arrow / Home / End keys (which the kernel
+ * keyboard driver delivers as the EMBK_KEY_* private codes). Returns true while
+ * focused. Click to focus.
+ *
+ *   static char  doc[4096] = "Hello\nEmbLink.";
+ *   static int   cur = 0;
+ *   TextEditor(doc, sizeof doc, &cur, 240);
+ */
+bool em_text_editor(char *buf, size_t cap, int *cursor, float height);
+#define TextEditor(buf, cap, cursor, height) em_text_editor((buf), (cap), (cursor), (height))
+
+/* Structural-change epoch: bumps when a V4/V6 component restructures the tree
+ * (dropdown/menu open/close, toast raise/expiry, disclosure toggle, tab switch).
  * An app's loop compares it across frames and forces a full repaint on change. */
 int em_ui_epoch(void);
 
@@ -345,6 +439,10 @@ int em_ui_epoch(void);
 typedef enum { ThemeAuto = 0, Light, Dark } EmTheme;
 typedef enum { ChromeKernel = 0, Chromeless } EmChrome;
 typedef enum { FixedSize = 0, Resizable } EmResize;
+/* Window material. Acrylic = a frosted GLASS window: the compositor blurs the
+ * desktop behind it and composites the window's translucent pixels over it, so
+ * the title bar and gaps show the wallpaper frosted (implies Chromeless). */
+typedef enum { MaterialSolid = 0, Acrylic } EmMaterial;
 
 typedef struct {
     const char *title;
@@ -353,6 +451,7 @@ typedef struct {
     EmChrome    chrome;          /* Chromeless -> the view draws Window/WindowBar */
     EmResize    resize;          /* Resizable -> Window() shows a corner grip;
                                   * dragging it resizes the OS window (V5) */
+    EmMaterial  material;        /* Acrylic -> frosted glass window (V8) */
     void      (*view)(void);     /* the whole UI, rebuilt only when needed */
     const char *font;            /* resource path; default "/font.ttf" */
     int         pace_ms;         /* loop pace while active; default 10 */
@@ -371,6 +470,7 @@ typedef struct {
     struct { int w, h; } size;
     struct { int x, y; } pos;
     EmTheme     theme;
+    EmMaterial  material;        /* Acrylic -> frosted glass widget (V8) */
     void      (*view)(void);
     int         refresh_ms;      /* periodic rebuild; 0 = input/animation only */
     const char *font;

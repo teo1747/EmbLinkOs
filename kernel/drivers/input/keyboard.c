@@ -59,22 +59,45 @@ static int buffer_pop(char *c) {
 }
 
 
-static void keyboard_handler(void) {
-    // Read scancode from keyboard data port
-    uint8_t scancode = inb(KBD_DATA_PORT);
-    
+/* Extended (0xE0-prefixed) navigation keys, delivered to userspace as private
+ * single-byte control codes the UI toolkit's text editor interprets (see
+ * EMBK_KEY_* in user/lib/embk.h -- kept in lockstep). Arrows/Home/End/Delete
+ * so a text field can move its cursor without an escape-sequence protocol. */
+#define EK_LEFT  0x11
+#define EK_RIGHT 0x12
+#define EK_UP    0x13
+#define EK_DOWN  0x14
+#define EK_HOME  0x02
+#define EK_END   0x05
+#define EK_DEL   0x7F
 
-    // Check if key release (high bit set) - ignore releases
-    if (scancode & 0x80) {
+static void keyboard_handler(void) {
+    uint8_t scancode = inb(KBD_DATA_PORT);
+    static int extended = 0;   /* the previous byte was the 0xE0 prefix */
+
+    if (scancode == 0xE0) { extended = 1; return; }   /* prefix: the next byte is an extended key */
+
+    if (scancode & 0x80) { extended = 0; return; }    /* key release: ignore (and clear prefix) */
+
+    if (extended) {
+        extended = 0;
+        char c = 0;
+        switch (scancode) {
+            case 0x4B: c = EK_LEFT;  break;
+            case 0x4D: c = EK_RIGHT; break;
+            case 0x48: c = EK_UP;    break;
+            case 0x50: c = EK_DOWN;  break;
+            case 0x47: c = EK_HOME;  break;
+            case 0x4F: c = EK_END;   break;
+            case 0x53: c = EK_DEL;   break;
+            default: break;
+        }
+        if (c) buffer_push(c);
         return;
     }
 
-    // Translate scancode to ASCII character
     char ascii = scan_to_ascii[scancode];
-    if (ascii) {
-        buffer_push(ascii);
-       
-    }
+    if (ascii) buffer_push(ascii);
 }
 
 

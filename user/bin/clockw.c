@@ -27,7 +27,7 @@ static void ClockView(void) {
     if (g_spark_n < 12) g_spark[g_spark_n++] = (float)((ms / 250) % 9) + 1.0f;
     else { for (int i = 0; i < 11; i++) g_spark[i] = g_spark[i + 1]; g_spark[11] = (float)((ms / 250) % 9) + 1.0f; }
 
-    Window("Clock") {
+    Window("Clock", .glass = 1, .corner = 16) {   /* translucent glass tint + edge highlight */
         VStack(.spacing = 2, .padding = 12, .align = Leading) {
             Text(t1).title();
             Text(t2).caption().tertiary();
@@ -41,6 +41,7 @@ EM_WIDGET {
     .size       = { 190, 108 },
     .pos        = { 24, 24 },
     .theme      = Dark,
+    .material   = Acrylic,       /* frosted glass widget over the aurora */
     .refresh_ms = 1000,
     .view       = ClockView,
 };

@@ -70,11 +70,11 @@ static void home_ui(void) {
                 HStack(.spacing = 16) {
                     tile("UI Demo",  "/uidemo.elf");
                     tile("Windows",  "/wmdemo.elf");
-                    tile("Terminal", NULL);
+                    tile("Menus",    "/v6demo.elf");
                 }
                 HStack(.spacing = 16) {
                     tile("V4 Demo",  "/v4demo.elf");
-                    tile("Editor",   NULL);
+                    tile("Editor",   "/v7demo.elf");
                     tile("About",    NULL);
                 }
             }

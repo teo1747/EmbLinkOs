@@ -536,26 +536,54 @@ follows are known gaps and rough edges, not missing features.
   race a read against that cache's replace/free path. Worth a per-volume
   lock at the `embk_vfs` bridge before apps start doing more concurrent
   filesystem I/O than they do today.
-- [ ] **`mkfs_embkfs.py`'s single-leaf image builder overflows past ~7 packed
-  files.** Adding `clockw.elf` to the default boot image already required
-  dropping the `wgyehkb.txt`/`illoeuw.txt` hash-collision-chain test
-  fixtures from `make_image`/`make_tree_image` (the verifier tolerates their
-  absence, but collision-chain coverage on freshly generated images is
-  currently untested). The generated superblock never *needs* everything in
-  one B-tree leaf — a real fix is multi-leaf image generation in the
-  builder, not further fixture removal, if more apps get added.
-- [ ] **Overlay/modal (`ui_overlay_begin/end`, `ui_dialog_begin/end` in
-  `ui/kit`) is built and host-tested but was flagged unstable in live
-  interaction** during the V2/V3 toolkit work and deferred rather than
-  root-caused. Re-verify live before building new features on top of it
-  (`Overlay`/`Dialog` in `ui/dsl/em.h` wrap the same kit primitives).
-- [ ] **Adding a new app requires three manual registration points**
-  (a Makefile build rule, the `embkfs.img`/`embkfs_tree.img` dependency
-  line, and an entry in `mkfs_embkfs.py`'s object list — see
-  `docs/EMUI_GUIDE.md#wiring-your-app-into-the-boot-image`). Mechanical and
-  documented, but a real papercut for anyone adding apps often; a small
-  Makefile/mkfs helper that discovers `user/bin/*.c` automatically would
-  remove it.
+- [x] ~~**`mkfs_embkfs.py`'s single-leaf image builder overflows past ~7
+  packed files.**~~ — done: `build_btree()` (with `pack_items_into_leaves()`)
+  greedily packs metadata items into as many level-0 leaves as they need and
+  adds a level-1 internal root above them when there's more than one leaf; the
+  root stays at block 17 so the superblock pointer is stable. `make_image`
+  auto-splits (a two-pass build learns the metadata-block count, then places
+  the data region after it — leaf packing is invariant to data-block
+  placement since an extent's `disk_block` is fixed-width). The
+  `wgyehkb.txt`/`illoeuw.txt` collision-chain fixtures are restored to both
+  images. Verified: the oracle passes, and the kernel MOUNTS + DESCENDS the
+  level-1 tree live (`root node OK level 1 (internal) nritems 2`), lists all
+  13 files, resolves the collision chain, and launches an app read entirely
+  through the 2-level tree — no exceptions. `make_tree_image` keeps its
+  deliberate forced 2-leaf split as a fixed descent regression. *(Remaining
+  headroom: one internal node holds ~72 leaf slots; a level-2 tree isn't
+  implemented and `build_btree` raises if an image ever exceeds that — far
+  off at current app counts.)*
+- [x] ~~**Overlay/modal flagged unstable in live interaction.**~~ —
+  root-caused and fixed. The "modal doesn't render / half-drawn scrim" was
+  NOT a hang or a tree/layout bug (it renders correctly on the host, and the
+  live dirty-rect union was already the full window). The scrim is a
+  **full-window semi-transparent solid** (`a=0.55`), and `cpu_draw_rect`'s
+  fast interior path was **opaque-only** (`a >= 0.999`) — so every one of the
+  ~425k scrim pixels took the per-pixel float `blend_over`. Under TCG that's
+  the documented "float-per-pixel = poison": one modal frame took ~25s, so
+  screenshots caught it mid-render (scrim covering only the top rows, dialog
+  not reached yet). Fix: a **constant-alpha integer-LUT fast path** in
+  `cpu_backend.c` (`out = round(dst*(1-a)) + round(src*a)`, carry-safe, four
+  256-entry LUTs) — benefits EVERY translucent solid, not just the scrim.
+  Result: first modal frame ~3s render (~8x faster), renders cleanly.
+  Verified with an always-open-modal `EM_APPLICATION` app (retained runtime)
+  live — dialog + scrim correct, no corruption, no exceptions; host render
+  pixel-identical, all 6 UI suites pass. Also fixed alongside: the retained
+  runtime (`em_app.c`) now includes `em_overlay_active()` in its build gate,
+  so a modal in an `EM_APPLICATION`/`EM_WIDGET` app keeps building frames
+  while it's up (needed for the scrim-dismiss debounce `g_ov_frames >= 3` to
+  advance, and for any modal animation).
+- [x] ~~**Adding a new app requires three manual registration points.**~~ —
+  done: the build system now auto-discovers apps. A Makefile pattern rule
+  (`build/%.elf` over `$(EMUI_APPS) := $(wildcard user/bin/*.c)` minus the
+  special-linked `init.c`/`hello.c`) builds any `user/bin/*.c` as a
+  dynamically-linked EmUI app, and `mkfs_embkfs.py`'s
+  `discover_userland_objects()` globs `build/*.elf` and packs them all.
+  Adding an app is now just "drop `user/bin/foo.c` in, `make embkfs.img`" —
+  verified by dropping a throwaway `probeapp.c` and watching it compile,
+  link, and land on the image with zero build-file edits. *(Minor residual:
+  deleting an app's `.c` leaves a stale `build/*.elf` that keeps getting
+  packed until `make clean` — adding is free, removing needs the clean.)*
 - [ ] **No real TTY.** The framebuffer console is output-only (no
   scrollback, no line editing); a text shell (see Architecture roadmap)
   needs this built first.

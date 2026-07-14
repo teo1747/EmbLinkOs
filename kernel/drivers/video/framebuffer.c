@@ -412,6 +412,158 @@ void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
     fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
 }
 
+// PREMULTIPLIED per-pixel source-over: dst = src + dst*(255-a)/255 (src channels
+// already scaled by a). Opaque (a==255) copies, a==0 skips. The compositor uses
+// this to lay the DESKTOP window (home, which renders a translucent scrim over a
+// transparent background) onto the aurora, so the aurora shows through it.
+void fb_blit_over(int32_t x, int32_t y, int32_t w, int32_t h,
+                  const uint32_t *argb, uint32_t stride) {
+    int32_t cx = x, cy = y, cw = w, ch = h;
+    if (!fb_clip(&cx, &cy, &cw, &ch)) return;
+    const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    for (int32_t j = 0; j < ch; j++) {
+        uint8_t *p = row;
+        for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
+            uint32_t s = src[i], a = s >> 24;
+            if (a == 0) continue;
+            if (a == 255) { fb_store(p, fb_pack(s & 0x00FFFFFFu)); continue; }
+            uint32_t inv = 255 - a;
+            fb_color_t d = fb_unpack(fb_load(p));
+            uint32_t r = ((s >> 16) & 0xFF) + (((d >> 16) & 0xFF) * inv) / 255;
+            uint32_t g = ((s >>  8) & 0xFF) + (((d >>  8) & 0xFF) * inv) / 255;
+            uint32_t b = ( s        & 0xFF) + (( d        & 0xFF) * inv) / 255;
+            if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+            fb_store(p, fb_pack(FB_RGB(r, g, b)));
+        }
+        src += stride;
+        row += fb.pitch;
+    }
+    fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+}
+
+// Blit a rectangle with a UNIFORM window alpha over the destination:
+// dst = (src*alpha + dst*(255-alpha))/255. The compositor uses this to lay a
+// GLASS window (rendered opaque by the app) over an already-blurred backdrop,
+// so the whole window -- title bar and content gaps -- shows the frosted
+// desktop through it. alpha>=255 degenerates to a plain copy.
+void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
+                     const uint32_t *argb, uint32_t stride, uint32_t alpha) {
+    if (alpha >= 255) { fb_blit(x, y, w, h, argb, stride); return; }
+    int32_t cx = x, cy = y, cw = w, ch = h;
+    if (!fb_clip(&cx, &cy, &cw, &ch)) return;
+    uint32_t inv = 255 - alpha;
+    const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    for (int32_t j = 0; j < ch; j++) {
+        uint8_t *p = row;
+        for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
+            uint32_t s = src[i];
+            fb_color_t d = fb_unpack(fb_load(p));
+            uint32_t r = (((s >> 16) & 0xFF) * alpha + ((d >> 16) & 0xFF) * inv) / 255;
+            uint32_t g = (((s >>  8) & 0xFF) * alpha + ((d >>  8) & 0xFF) * inv) / 255;
+            uint32_t b = (( s        & 0xFF) * alpha + ( d        & 0xFF) * inv) / 255;
+            fb_store(p, fb_pack(FB_RGB(r, g, b)));
+        }
+        src += stride;
+        row += fb.pitch;
+    }
+    fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+}
+
+// In-place separable box blur of an fb_draw region (the backdrop behind a glass
+// window). Two passes (H then V) with a rolling per-channel sum ~= a small
+// Gaussian. Clamped-edge sampling. Silently no-ops if scratch can't be had.
+void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) {
+    if (radius < 1) return;
+    int32_t cx = x, cy = y, cw = w, ch = h;
+    if (!fb_clip(&cx, &cy, &cw, &ch)) return;
+    if (cw <= 1 || ch <= 1) return;
+    uint32_t *a = (uint32_t *)kmalloc((size_t)cw * ch * 4);
+    if (!a) return;
+    uint32_t *b = (uint32_t *)kmalloc((size_t)cw * ch * 4);
+    if (!b) { kfree(a); return; }
+    for (int32_t j = 0; j < ch; j++) {
+        uint8_t *p = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j));
+        for (int32_t i = 0; i < cw; i++, p += fb_bypp) a[j * cw + i] = fb_unpack(fb_load(p)) & 0xFFFFFFu;
+    }
+    int32_t win = 2 * radius + 1;
+    for (int32_t j = 0; j < ch; j++) {                 /* horizontal a -> b */
+        uint32_t *ra = &a[j * cw], *rb = &b[j * cw];
+        int32_t sr = 0, sg = 0, sb = 0;
+        for (int32_t k = -radius; k <= radius; k++) {
+            uint32_t v = ra[k < 0 ? 0 : (k >= cw ? cw - 1 : k)];
+            sr += (v >> 16) & 0xFF; sg += (v >> 8) & 0xFF; sb += v & 0xFF;
+        }
+        for (int32_t i = 0; i < cw; i++) {
+            rb[i] = FB_RGB(sr / win, sg / win, sb / win);
+            int32_t o = i - radius, n = i + radius + 1;
+            uint32_t vo = ra[o < 0 ? 0 : o], vn = ra[n >= cw ? cw - 1 : n];
+            sr += ((vn >> 16) & 0xFF) - ((vo >> 16) & 0xFF);
+            sg += ((vn >>  8) & 0xFF) - ((vo >>  8) & 0xFF);
+            sb += ( vn        & 0xFF) - ( vo        & 0xFF);
+        }
+    }
+    for (int32_t i = 0; i < cw; i++) {                 /* vertical b -> a */
+        int32_t sr = 0, sg = 0, sb = 0;
+        for (int32_t k = -radius; k <= radius; k++) {
+            uint32_t v = b[(k < 0 ? 0 : (k >= ch ? ch - 1 : k)) * cw + i];
+            sr += (v >> 16) & 0xFF; sg += (v >> 8) & 0xFF; sb += v & 0xFF;
+        }
+        for (int32_t j = 0; j < ch; j++) {
+            a[j * cw + i] = FB_RGB(sr / win, sg / win, sb / win);
+            int32_t o = j - radius, n = j + radius + 1;
+            uint32_t vo = b[(o < 0 ? 0 : o) * cw + i], vn = b[(n >= ch ? ch - 1 : n) * cw + i];
+            sr += ((vn >> 16) & 0xFF) - ((vo >> 16) & 0xFF);
+            sg += ((vn >>  8) & 0xFF) - ((vo >>  8) & 0xFF);
+            sb += ( vn        & 0xFF) - ( vo        & 0xFF);
+        }
+    }
+    for (int32_t j = 0; j < ch; j++) {
+        uint8_t *p = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j));
+        for (int32_t i = 0; i < cw; i++, p += fb_bypp) fb_store(p, fb_pack(a[j * cw + i]));
+    }
+    fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+    kfree(b); kfree(a);
+}
+
+// Soft accent GLOW around the OUTSIDE of a rect [fx0,fy0)-(fx1,fy1): a band of
+// width `gw` whose alpha falls off quadratically with distance from the edge,
+// blended over the framebuffer. Clipped to the given rect (the caller's repaint
+// region) and the screen. Used for the focused-window halo.
+void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw,
+                  uint8_t cr, uint8_t cg, uint8_t cb, uint8_t max_a,
+                  int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (gw <= 0 || max_a == 0) return;
+    int32_t bx0 = fx0 - gw, by0 = fy0 - gw, bx1 = fx1 + gw, by1 = fy1 + gw;
+    if (bx0 < clx0) bx0 = clx0; if (by0 < cly0) by0 = cly0;
+    if (bx1 > clx1) bx1 = clx1; if (by1 > cly1) by1 = cly1;
+    if (bx0 < 0) bx0 = 0; if (by0 < 0) by0 = 0;
+    if (bx1 > (int32_t)fb.width)  bx1 = (int32_t)fb.width;
+    if (by1 > (int32_t)fb.height) by1 = (int32_t)fb.height;
+    int32_t gw2 = gw * gw;
+    for (int32_t y = by0; y < by1; y++) {
+        uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
+        for (int32_t x = bx0; x < bx1; x++, row += fb_bypp) {
+            if (x >= fx0 && x < fx1 && y >= fy0 && y < fy1) continue;  /* window covers */
+            int32_t dx = x < fx0 ? fx0 - x : (x >= fx1 ? x - (fx1 - 1) : 0);
+            int32_t dy = y < fy0 ? fy0 - y : (y >= fy1 ? y - (fy1 - 1) : 0);
+            int32_t d = dx > dy ? dx : dy;
+            if (d >= gw) continue;
+            int32_t t = gw - d;
+            uint32_t ea = (uint32_t)max_a * (uint32_t)(t * t) / (uint32_t)gw2;
+            if (!ea) continue;
+            uint32_t inv = 255 - ea;
+            fb_color_t d0 = fb_unpack(fb_load(row));
+            uint32_t r = ((uint32_t)cr * ea + ((d0 >> 16) & 0xFF) * inv) / 255;
+            uint32_t g = ((uint32_t)cg * ea + ((d0 >>  8) & 0xFF) * inv) / 255;
+            uint32_t b = ((uint32_t)cb * ea + ( d0        & 0xFF) * inv) / 255;
+            fb_store(row, fb_pack(FB_RGB(r, g, b)));
+        }
+    }
+    fb_mark_dirty((uint32_t)bx0, (uint32_t)by0, (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+}
+
 void fb_copy_rect(int32_t dst_x, int32_t dst_y,
                   int32_t src_x, int32_t src_y, int32_t w, int32_t h) {
     // Clip both rectangles by the same amount so they stay congruent.

@@ -183,12 +183,103 @@ static void v4app(void) {
     }
 }
 
+/* V6 gallery: a menu bar + an open context-menu popover (rendered statically
+ * via a forced-open ContextMenu, so a still frame shows the menu system). */
+static void v6app(void) {
+    static bool ctx = true;   /* forced open for the static render */
+    Window("EmUI V6 - Menus") {
+        MenuBar() {
+            Menu("File") {}
+            Menu("Edit") {}
+            Menu("View") {}
+            Menu("Help") {}
+        }
+        VStack(.padding = 24, .spacing = 8) {
+            Text("Right-click anywhere for a context menu.").secondary();
+            Text("Menus float above content and dismiss on outside-click.").caption().tertiary();
+        }
+        ContextMenu(&ctx, 120, 150) {
+            if (MenuItemK("New",  "Ctrl+N")) {}
+            if (MenuItemK("Open", "Ctrl+O")) {}
+            MenuSeparator();
+            if (MenuItemK("Save", "Ctrl+S")) {}
+            if (MenuItem("Save As...")) {}
+            MenuSeparator();
+            if (MenuItem("Preferences")) {}
+            if (MenuItemK("Quit", "Ctrl+Q")) {}
+        }
+    }
+}
+
+/* V7 gallery: a multi-line text editor with content, shown in a window. */
+static void v7app(void) {
+    static char doc[2048] =
+        "EmUI V7 - multi-line text editor\n"
+        "\n"
+        "Type to insert, Enter for a newline,\n"
+        "Backspace / Delete to remove.\n"
+        "Arrow keys, Home and End move the cursor.\n"
+        "The view auto-scrolls to keep the caret visible.";
+    static int cur = 0;
+    Window("EmUI V7 - Editor") {
+        VStack(.padding = 20, .spacing = 12, .align = Fill) {
+            Text("Notes").heading();
+            TextEditor(doc, sizeof doc, &cur, 260);
+            HStack(.spacing = 10) {
+                Spacer();
+                Text("multi-line, arrow-key cursor").caption().tertiary();
+            }
+        }
+    }
+}
+
+/* Glass gallery: a frosted panel floating over rich, colorful content, so the
+ * backdrop blur + tint + edge highlight are all visible ("g" as argv[3]). */
+static void gapp(void) {
+    static const float wave[] = { 3, 6, 4, 9, 7, 11, 8, 12, 9, 13 };
+    static const float bars[] = { 5, 8, 4, 9, 6, 7 };
+    Screen(.padding = 0) {
+        /* busy, high-frequency background (color blocks + text + charts) so the
+         * blur behind the glass is actually visible, not just translucency. */
+        VStack(.align = Fill, .spacing = 0, .grow = 1) {
+            HStack(.align = Fill, .spacing = 0, .grow = 1) {
+                VStack(.background = (Color){0.18f,0.26f,0.82f,1}, .grow = 1, .padding = 18, .align = Leading) {
+                    Text("EmbLink OS").title(); Text("frosted glass").caption(); }
+                VStack(.background = (Color){0.74f,0.24f,0.52f,1}, .grow = 1, .padding = 18, .align = Leading) {
+                    Text("Depth").title(); AreaChart(wave, 10, .height = 76); }
+            }
+            HStack(.align = Fill, .spacing = 0, .grow = 1) {
+                VStack(.background = (Color){0.12f,0.52f,0.52f,1}, .grow = 1, .padding = 18, .align = Leading) {
+                    Text("Blur").heading(); Chart(bars, 6, .height = 72); }
+                VStack(.background = (Color){0.86f,0.54f,0.18f,1}, .grow = 1, .padding = 18, .align = Leading) {
+                    Text("Material").heading(); Text("backdrop + tint + edge").caption(); }
+            }
+        }
+    }
+    /* the frosted glass panel, floated over the color field via the overlay
+     * primitive (a Dialog with .glass = 1), so it blurs what is behind it */
+    Overlay() {
+        Dialog(.glass = 1, .width = 360, .padding = 24, .spacing = 12) {
+            Text("Glass").title();
+            Text("Frosted backdrop blur, EmbLink tint, edge highlight.")
+                .caption().secondary();
+            AreaChart(wave, 10, .height = 84);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
     bool dark = (argc > 2 && argv[2][0] == 'd');
     bool v4   = (argc > 3 && argv[3][0] == 'v');
+    bool v6   = (argc > 3 && argv[3][0] == '6');
+    bool v7   = (argc > 3 && argv[3][0] == '7');
+    bool gl   = (argc > 3 && argv[3][0] == 'g');
     if (v4) { W = 660; H = 900; }
+    if (v6) { W = 560; H = 420; }
+    if (v7) { W = 560; H = 420; }
+    if (gl) { W = 620; H = 460; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -205,7 +296,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;

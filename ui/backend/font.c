@@ -657,10 +657,37 @@ static int utf8_decode(const char *s, uint32_t *cp) {
     *cp = 0xFFFD; return 1;   /* invalid byte -> replacement, advance one */
 }
 
+/* Gamma (approx 2.0) blend tables, built once. The glyph blend mixes in LINEAR
+ * light: out = sqrt(src^2*eff + dst^2*inv). Done literally that was 3 dst
+ * squarings + 3 sqrtf PER TEXT PIXEL -- and in the freestanding build sqrtf is
+ * an 8-iteration Newton loop (24 float divides/pixel just to de-gamma). Text
+ * covers most of the screen, so this dominated glyph cost under TCG. Instead:
+ *   G_LIN[d]   = (d/255)^2                    -- linearise a dst byte (no square)
+ *   G_DELIN[k] = round(sqrt(k/4096)*255)      -- de-linearise (no sqrt)
+ * The blend arg is a convex mix of two [0,1] values so it stays in [0,1]; the
+ * 12-bit de-gamma table quantises to <=1/255, visually identical. */
+#define G_DELIN_BITS 12
+#define G_DELIN_N    (1 << G_DELIN_BITS)   /* 4096 */
+static float   g_lin[256];
+static uint8_t g_delin[G_DELIN_N + 1];
+static int     g_gamma_ready;
+static void gamma_tables_init(void) {
+    if (g_gamma_ready) return;
+    for (int d = 0; d < 256; d++) { float x = d / 255.0f; g_lin[d] = x * x; }
+    for (int k = 0; k <= G_DELIN_N; k++) {
+        int v = (int)(sqrtf((float)k / (float)G_DELIN_N) * 255.0f + 0.5f);
+        g_delin[k] = (uint8_t)(v > 255 ? 255 : v);
+    }
+    g_gamma_ready = 1;
+}
+
 /* premultiplied-BGRA pixel over-blend, gated by the backend clip/dirty. */
 static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
                                  struct glyph_atlas *atlas, int ax, int ay, int aw, int ah,
                                  struct color color, float opacity) {
+    if (!g_gamma_ready) gamma_tables_init();
+    /* src linear-light channels are constant for the whole glyph */
+    float sr2 = color.r * color.r, sg2 = color.g * color.g, sb2 = color.b * color.b;
     for (int yy = 0; yy < ah; yy++) {
         int py = dy + yy;
         if (py < 0 || py >= (int)rt->height) continue;
@@ -674,21 +701,16 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
             uint32_t d = row[px];
             int db = d & 255, dg = (d>>8)&255, dr = (d>>16)&255, da = (d>>24)&255;
             float inv = 1.0f - eff;
-            /* gamma-correct (approx gamma 2.0) blend: mix in LINEAR light, not
-             * raw sRGB, so antialiased text edges stay crisp instead of muddy.
-             * Linearise by squaring, blend, de-linearise with sqrt. */
-            float dlr = dr/255.0f, dlg = dg/255.0f, dlb = db/255.0f;
-            float sr = color.r, sg = color.g, sb = color.b;
-            float or_ = sr*sr*eff + dlr*dlr*inv;
-            float og_ = sg*sg*eff + dlg*dlg*inv;
-            float ob_ = sb*sb*eff + dlb*dlb*inv;
-            int nr = (int)(sqrtf(or_) * 255.0f + 0.5f);
-            int ng = (int)(sqrtf(og_) * 255.0f + 0.5f);
-            int nb = (int)(sqrtf(ob_) * 255.0f + 0.5f);
+            /* linear-light blend via tables: linearise dst (g_lin), mix, then
+             * de-linearise (g_delin) -- no per-pixel square or sqrt. */
+            float ar = sr2*eff + g_lin[dr]*inv;
+            float ag = sg2*eff + g_lin[dg]*inv;
+            float ab = sb2*eff + g_lin[db]*inv;
+            int kr = (int)(ar * (float)G_DELIN_N); if (kr > G_DELIN_N) kr = G_DELIN_N; if (kr < 0) kr = 0;
+            int kg = (int)(ag * (float)G_DELIN_N); if (kg > G_DELIN_N) kg = G_DELIN_N; if (kg < 0) kg = 0;
+            int kb = (int)(ab * (float)G_DELIN_N); if (kb > G_DELIN_N) kb = G_DELIN_N; if (kb < 0) kb = 0;
+            int nr = g_delin[kr], ng = g_delin[kg], nb = g_delin[kb];
             int na = (int)(eff * 255.0f + da * inv + 0.5f);
-            if (nb>255) nb=255;
-            if (ng>255) ng=255;
-            if (nr>255) nr=255;
             if (na>255) na=255;
             row[px] = ((uint32_t)na<<24)|((uint32_t)nr<<16)|((uint32_t)ng<<8)|(uint32_t)nb;
         }
