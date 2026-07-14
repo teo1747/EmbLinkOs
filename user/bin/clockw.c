@@ -41,7 +41,6 @@ EM_WIDGET {
     .size       = { 190, 108 },
     .pos        = { 24, 24 },
     .theme      = Dark,
-    .material   = Acrylic,       /* frosted glass widget over the aurora */
     .refresh_ms = 1000,
     .view       = ClockView,
 };

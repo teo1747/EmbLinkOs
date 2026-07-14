@@ -859,6 +859,32 @@ void process_handle_free(struct process *owner, int handle) {
     owner->handles[handle].pid = 0;
 }
 
+/* Reclaim handle slots that name children which have ALREADY EXITED -- zombies
+ * the owner spawned and never wait()'d. The leak from spawn-and-forget is
+ * DOUBLE (a handle slot here AND the child's zombie PCB slot), so for each dead
+ * handle we collect+reap the zombie (process_wait takes its non-blocking path
+ * for an already-exited child: it either reaps it from our zombie list or, if
+ * it's already gone, returns -ECHILD -- it can only block on a LIVE child, which
+ * process_alive() rules out first) and then free the handle. LIVE children are
+ * left untouched. Returns how many slots were reclaimed.
+ *
+ * `owner` must be current_process (process_wait reaps from current's zombie
+ * list); that's the only caller (sys_spawn reclaiming its own dead children so
+ * a full table doesn't force it to KILL the child it just created). */
+int process_handle_reap_dead(struct process *owner) {
+    int reclaimed = 0;
+    for (int i = 0; i < PROC_HANDLE_MAX; i++) {
+        if (!owner->handles[i].used) continue;
+        uint32_t pid = owner->handles[i].pid;
+        if (process_alive(pid)) continue;     /* still running -- keep its handle */
+        process_wait(pid);                    /* non-blocking here: collect+reap the zombie */
+        owner->handles[i].used = false;
+        owner->handles[i].pid = 0;
+        reclaimed++;
+    }
+    return reclaimed;
+}
+
 /* Shared by sys_exit and the kthread selftests below: mark the current
  * thread a zombie and hand off to the scheduler. If nothing else is
  * runnable, schedule() returns here.

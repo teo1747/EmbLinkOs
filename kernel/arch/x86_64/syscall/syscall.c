@@ -352,8 +352,21 @@ static int64_t sys_spawn(struct regs *r) {
     
     int handle = process_handle_alloc(current_process, (uint32_t)pid);
     if (handle < 0) {
-        process_kill((uint32_t)pid);   // orphaned child, no handle to name it
-        return handle;   // -errno from process_handle_alloc()
+        /* Table full -- almost always because the caller spawned children and
+         * never wait()'d the dead ones, leaking a handle slot each. Reclaim any
+         * handles that name already-exited children (and reap those zombies),
+         * then retry, so a leak-filled table doesn't force us to KILL the valid
+         * child we just created. */
+        if (process_handle_reap_dead(current_process) > 0) {
+            handle = process_handle_alloc(current_process, (uint32_t)pid);
+        }
+    }
+    if (handle < 0) {
+        /* Genuinely at capacity -- every handle names a still-LIVE child, so
+         * there's no slot to name this one and (with no init-reaper for
+         * orphans) leaving it unnamed would leak it. Kill it and report EMFILE. */
+        process_kill((uint32_t)pid);
+        return handle;   // -EMBK_EMFILE
     }
     return handle;
 }

@@ -4,9 +4,17 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
+#include "drivers/video/console.h"    /* console fd write: console_putchar */
+#include "include/types.h"
 #include <stdint.h>
 
 
+
+struct process;
+/* struct fd_entry + enum fd_backing live in fd.h (struct process embeds the
+ * fds[] table, so the layout must be public). struct fd_ops is fd.c-private --
+ * fd.h only forward-declares it since fd_entry just holds a pointer. */
 
 /* Boot-time fd table: used only while current_process is NULL (early boot,
  * before any real process exists -- e.g. `test fd`/`test ring3` selftests
@@ -30,10 +38,29 @@ void vfs_fd_init(void)
     struct fd_entry *fds = fd_table();
     for (int i = 0; i < FD_MAX_OPEN; i++) {
         fds[i].used = false;
-        fds[i].pos = 0;
+        fds[i].backing = FD_BACKING_NONE;
+        fds[i].ops = NULL;
         fds[i].flags = 0;
+        fds[i].u.file.pos = 0;
     }
 }
+
+/* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
+ * Adding a fourth backing later touches this table, not four switch statements. 
+ * Signatures deliberately MATCH the existing vfs_fd_* out-param style.
+ * (out_read/out_written/out_offset) rather than returning ssize_t -- so the
+ * vnode arm is a straight move of the code that's already there and already
+ * correct, not a rewrite. */
+ struct fd_ops {
+    int (*read)(struct fd_entry *e, void *buf, size_t count, size_t *out_read);
+    int (*write)(struct fd_entry *e, const void *buf, size_t count, size_t *out_written);
+    int (*seek)(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset);
+    int (*fstat)(struct fd_entry *e, struct vfs_stat *out);
+};
+
+/* the vnode-backed dispatch table (defined below, near its handlers);
+ * forward-declared so the open paths can point new fds at it. */
+static const struct fd_ops vnode_fd_ops;
 
 /* Map an fd to its live table entry (in the CALLING process's own table). */
 static struct fd_entry *fd_lookup(int fd)
@@ -194,15 +221,17 @@ int vfs_open(const char *path, int flags, uint32_t mode)
     }
 
     fds[fd - FD_BASE].used = true;
-    fds[fd - FD_BASE].vn = vn;
-    fds[fd - FD_BASE].pos = 0;
+    fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
+    fds[fd - FD_BASE].ops = &vnode_fd_ops;
+    fds[fd - FD_BASE].u.file.vn = vn;
+    fds[fd - FD_BASE].u.file.pos = 0;
     fds[fd - FD_BASE].flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            fds[fd - FD_BASE].pos = st.size;
+            fds[fd - FD_BASE].u.file.pos = st.size;
     }
 
     return fd;
@@ -217,20 +246,10 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read) {
     if (!buf || !out_read)
         return -EMBK_EINVAL;
 
-    if (!fd_readable(e->flags))
-        return -EMBK_EBADF;
-
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->read)
+    if (!e->ops || !e->ops->read)
         return -EMBK_ENOSYS;
 
-    size_t bytes_read = 0;
-    int err = e->vn.mnt->ops->read(&e->vn, e->pos, buf, len, &bytes_read);
-    if (err)
-        return err;
-
-    e->pos += bytes_read;
-    *out_read = bytes_read;
-    return EMBK_OK;
+    return e->ops->read(e, buf, len, out_read);
 }
 
 
@@ -242,28 +261,10 @@ int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written) {
     if ((!buf && len) || !out_written)
         return -EMBK_EINVAL;
 
-    if (!fd_writable(e->flags))
-        return -EMBK_EBADF;
-
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->write)
+    if (!e->ops || !e->ops->write)
         return -EMBK_ENOSYS;
 
-    if ((e->flags & O_APPEND) && e->vn.mnt->ops->stat) {
-        struct vfs_stat st;
-        int s = e->vn.mnt->ops->stat(&e->vn, &st);
-        if (s)
-            return s;
-        e->pos = st.size;
-    }
-
-    size_t bytes_written = 0;
-    int err = e->vn.mnt->ops->write(&e->vn, e->pos, buf, len, &bytes_written);
-    if (err)
-        return err;
-
-    e->pos += bytes_written;
-    *out_written = bytes_written;
-    return EMBK_OK;
+    return e->ops->write(e, buf, len, out_written);
 }
 
 
@@ -276,40 +277,10 @@ int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset)
     if (!out_offset)
         return -EMBK_EINVAL;
 
-    uint64_t new_pos = 0;
-    switch (whence) {
-        case 0:
-            if (delta < 0)
-                return -EMBK_EINVAL;
-            new_pos = (uint64_t)delta;
-            break;
-        case 1: {
-            int rc = fd_seek_compute(e->pos, delta, &new_pos);
-            if (rc)
-                return rc;
-            break;
-        }
-        case 2: {
-            if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->stat)
-                return -EMBK_ENOSYS;
+    if (!e->ops || !e->ops->seek)
+        return -EMBK_ENOSYS;
 
-            struct vfs_stat st;
-            int err = e->vn.mnt->ops->stat(&e->vn, &st);
-            if (err)
-                return err;
-
-            int rc = fd_seek_compute(st.size, delta, &new_pos);
-            if (rc)
-                return rc;
-            break;
-        }
-        default:
-            return -EMBK_EINVAL;
-    }
-
-    e->pos = new_pos;
-    *out_offset = new_pos;
-    return EMBK_OK;
+    return e->ops->seek(e, delta, whence, out_offset);
 }
 
 int vfs_close(int fd)
@@ -319,15 +290,18 @@ int vfs_close(int fd)
         return -EMBK_EBADF;
 
     int rc = EMBK_OK;
-    if (e->vn.mnt && e->vn.mnt->ops && e->vn.mnt->ops->obj_put)
-        rc = e->vn.mnt->ops->obj_put(e->vn.mnt, e->vn.ino);
+    if (e->backing == FD_BACKING_VNODE &&
+        e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
+        rc = e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
 
     e->used = false;
-    e->pos = 0;
+    e->backing = FD_BACKING_NONE;
+    e->ops = NULL;
     e->flags = 0;
-    e->vn.mnt = NULL;
-    e->vn.ino = 0;
-    e->vn.type = VFS_DT_UNKNOWN;
+    e->u.file.pos = 0;
+    e->u.file.vn.mnt = NULL;
+    e->u.file.vn.ino = 0;
+    e->u.file.vn.type = VFS_DT_UNKNOWN;
     return rc;
 }
 
@@ -338,10 +312,10 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         return -EMBK_EBADF;
     if (!out)
         return -EMBK_EINVAL;
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->stat)
+    if (!e->ops || !e->ops->fstat)
         return -EMBK_ENOSYS;
 
-    return e->vn.mnt->ops->stat(&e->vn, out);
+    return e->ops->fstat(e, out);
 }
 
 /* Parallel to vfs_open(), but for an explicit, not-yet-running
@@ -398,19 +372,154 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     }
 
     e->used = true;
-    e->vn = vn;
-    e->pos = 0;
+    e->backing = FD_BACKING_VNODE;
+    e->ops = &vnode_fd_ops;
+    e->u.file.vn = vn;
+    e->u.file.pos = 0;
     e->flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            e->pos = st.size;
+            e->u.file.pos = st.size;
     }
 
     return EMBK_OK;
  }
+
+static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
+    if (!fd_readable(e->flags))
+        return -EMBK_EBADF;
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->read)
+        return -EMBK_ENOSYS;
+
+    size_t bytes_read = 0;
+    int err = e->u.file.vn.mnt->ops->read(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_read);
+    if (err)
+        return err;
+
+    e->u.file.pos += bytes_read;
+    *out_read = bytes_read;
+    return EMBK_OK;
+}
+
+static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
+    if (!fd_writable(e->flags))
+        return -EMBK_EBADF;
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->write)
+        return -EMBK_ENOSYS;
+
+    size_t bytes_written = 0;
+    int err = e->u.file.vn.mnt->ops->write(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_written);
+    if (err)
+        return err;
+
+    e->u.file.pos += bytes_written;
+    *out_written = bytes_written;
+    return EMBK_OK;
+}
+
+static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+
+    struct vfs_stat st;
+    int err = e->u.file.vn.mnt->ops->stat(&e->u.file.vn, &st);
+    if (err)
+        return err;
+
+    uint64_t base;
+    switch (whence) {
+        case 0: base = 0; break; // SEEK_SET
+        case 1: base = e->u.file.pos; break; // SEEK_CUR
+        case 2: base = st.size; break; // SEEK_END
+        default: return -EMBK_EINVAL;
+    }
+
+    uint64_t new_pos;
+    err = fd_seek_compute(base, delta, &new_pos);
+    if (err)
+        return err;
+
+    e->u.file.pos = new_pos;
+    *out_offset = new_pos;
+    return EMBK_OK;
+}
+
+
+static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+
+    return e->u.file.vn.mnt->ops->stat(&e->u.file.vn, out);
+}
+
+
+static const struct fd_ops vnode_fd_ops = {
+    .read = vnode_fd_read,
+    .write = vnode_fd_write,
+    .seek = vnode_fd_seek,
+    .fstat = vnode_fd_fstat,
+};
+
+
+static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
+    (void)e; 
+    if(len == 0) {
+        *out_read = 0;
+        return EMBK_OK;
+    }
+
+    /* Blocks for the FIRST char (a read() on a tty must not return 0 just 
+     * because nobody has typed yet -- 0 means EOF), then drains whatever else
+     * is already buffered without blocking again. That's line-ish behavior
+     * without a line discipline; real canonical mode (echo, backspace
+     * handling, line buffering) is a named gap, not built here. */
+    char *cbuf = (char *)buf;
+    cbuf[0] = keyboard_getchar_blocking();
+    size_t n = 1;
+    while (n < len && keyboard_has_char()) {
+        cbuf[n++] = keyboard_getchar();         // buffer is non-empty, won't spin
+    }
+    *out_read = n;
+    return EMBK_OK;
+}
+
+static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
+    (void)e; 
+
+    const char *cbuf = (const char *)buf;
+    for (size_t i = 0; i < len; i++) {
+        console_putchar(cbuf[i]);
+    }
+    *out_written = len;
+    return EMBK_OK;
+}
+
+static int console_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
+    (void)e; (void)delta; (void)whence; (void)out_offset;
+    return -EMBK_ESPIPE; /* errno.h literally anticipates this : "illegal seek" */
+}
+
+static int console_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e; 
+    
+    /* A character device. Incidentally this is what finally  makes newlib's 
+     * _isatty/_fstat stubs HONEST -- they currently claim chardev with no
+     * object backing the claim. */
+
+    out->size = 0; /* size is meaningless for a console */
+    out->type = VFS_DT_CHAR;
+    return EMBK_OK;
+}
+
+static const struct fd_ops console_fd_ops = {
+    .read = console_fd_read,
+    .write = console_fd_write,
+    .seek = console_fd_seek,
+    .fstat = console_fd_fstat,
+};
 
 int vfs_fd_run_selftests(void)
 {

@@ -29,6 +29,20 @@ void serial_write_char(char c) {
     outb(SERIAL_PORT, c);
 }
 
+/* --- input (POLLED; the UART's receive IRQ is left disabled in serial_init,
+ * so callers must poll -- e.g. the kernel debug console in main.c's loop). --- */
+
+// 1 iff a received byte is waiting (LSR bit 0, Data Ready), else 0.
+int serial_has_char(void) {
+    return inb(SERIAL_PORT + 5) & 0x01;
+}
+
+// Read one received byte from the RBR. Caller must have checked serial_has_char()
+// first (same contract as keyboard_has_char()/keyboard_getchar()).
+char serial_read_char(void) {
+    return (char)inb(SERIAL_PORT);
+}
+
 
 void serial_write_string(const char *str) {
     while (*str) {

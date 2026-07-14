@@ -38,11 +38,24 @@ struct process;
 #define FD_BASE 3
 #define FD_MAX_OPEN 64
 
+/* What backs an open fd. The per-backing behaviour is a struct fd_ops table
+ * (defined in fd.c); fd_entry only holds a pointer to it. */
+enum fd_backing {
+    FD_BACKING_NONE = 0,      /**< free / not backed */
+    FD_BACKING_VNODE,         /**< a VFS file */
+    FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
+};
+struct fd_ops;   /* opaque here; fd_entry needs only a pointer, defined in fd.c */
+
 struct fd_entry {
     bool used;
-    struct vnode vn;
-    uint64_t pos;
+    enum fd_backing backing;    /**< selects which fd_ops table applies */
+    const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
     int flags;
+    union {
+        struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
+        /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
+    } u;
 };
 
 void vfs_fd_init(void);

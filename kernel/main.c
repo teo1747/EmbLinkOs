@@ -550,9 +550,15 @@ void kernel_main(void) {
             kprintf("\nhome: failed to launch /home.elf: %s\n", embk_strerror(hpid));
         else
             kprintf("\nhome: launched /home.elf as pid %d\n", hpid);
+        /* The desktop now owns the framebuffer -- stop the text console from
+         * drawing on it. All kernel logging + the serial debug console below
+         * stay on COM1 and never paint over the userspace UI. */
+        console_set_fb_enabled(false);
     }
 
-    // Main loop: keyboard echo + tick heartbeat + process control shell
+    // Main loop (boot CPU): pump the polled drivers (legacy USB + the window
+    // compositor's pointer) and service a serial-only kernel debug console.
+    // The interactive keyboard + screen belong to userspace.
     uint64_t last = 0;
     char cmd_buf[128];
     uint32_t cmd_len = 0;
@@ -567,21 +573,28 @@ void kernel_main(void) {
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
-        // USB HID input now arrives via the xHCI interrupt (see xhci_enable_irq),
-        // which wakes us from the hlt below and injects keys into the keyboard buffer.
-        if (!keyboard_is_grabbed() && keyboard_has_char()) {
-            char c = keyboard_getchar();
-            kprintf("%c", c);
-
+        // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
+        // to userspace now (the launcher, and the shell that reads fd 0); the
+        // kernel keeps a SERIAL-ONLY console so selftests + state inspection stay
+        // reachable when userspace is wedged -- and, crucially, it never touches
+        // the keyboard buffer a userspace reader owns, so there's no contention.
+        // Polled (the UART RX IRQ is left disabled); the ~100Hz timer wakes the
+        // hlt below, giving debug-console-grade latency. Drain the FIFO per pass.
+        while (serial_has_char()) {
+            char c = serial_read_char();
             if (c == '\r' || c == '\n') {
+                serial_write_char('\n');
                 cmd_buf[cmd_len] = '\0';
                 kernel_handle_line_command(cmd_buf);
                 cmd_len = 0;
             } else if ((c == '\b' || c == 127) && cmd_len > 0) {
                 cmd_len--;
+                serial_write_string("\b \b");   // erase the char on the terminal
             } else if (c >= 32 && c <= 126) {
-                if (cmd_len + 1 < sizeof cmd_buf)
+                if (cmd_len + 1 < sizeof cmd_buf) {
                     cmd_buf[cmd_len++] = c;
+                    serial_write_char(c);        // echo so the remote terminal shows input
+                }
             }
         }
 

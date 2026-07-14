@@ -548,6 +548,78 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* sys_spawn's handle-table SELF-HEAL (process_handle_reap_dead). A parent
+     * that spawns children and never wait()s the dead ones leaks a handle slot
+     * each; when the table fills, the OLD behaviour made sys_spawn KILL the
+     * child it had just created. The fix reclaims the handles that name
+     * already-EXITED children (reaping those zombies) and retries -- while
+     * leaving a still-LIVE child's handle untouched. This proves both halves:
+     * a table full of dead-child handles frees up, and a live child is spared. */
+    if (strcmp(cmd, "test handle reap") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test handle reap: VFS not registered (need /init.elf)\n");
+            return 1;
+        }
+        struct process *me = current_process;
+        int ok = 1;
+
+        /* (1) a LONG-LIVED child ("spin" loops forever); leak its handle. */
+        char *aspin[] = { "/init.elf", "spin", NULL };
+        int spin_pid = process_create("/init.elf", aspin, 2, NULL, 0);
+        int h_spin = spin_pid >= 0 ? process_handle_alloc(me, (uint32_t)spin_pid) : -1;
+        if (spin_pid < 0 || h_spin < 0) {
+            kprintf("\n[cmd] test handle reap: setup FAIL (spin spawn %d handle %d)\n", spin_pid, h_spin);
+            return 1;
+        }
+
+        /* (2) fill the REST of the table with QUICK-EXIT children; leak them all
+         * (never wait()'d) so the table ends up full of soon-to-be-dead handles. */
+        uint32_t leaked[PROC_HANDLE_MAX];
+        int n_leak = 0;
+        for (;;) {
+            char *aleak[] = { "/init.elf", "leak", NULL };
+            int p = process_create("/init.elf", aleak, 2, NULL, 0);
+            if (p < 0) { ok = 0; break; }
+            int h = process_handle_alloc(me, (uint32_t)p);
+            if (h < 0) { process_kill((uint32_t)p); process_wait((uint32_t)p); break; }  /* table full */
+            leaked[n_leak++] = (uint32_t)p;
+        }
+
+        /* (3) yield until every quick child has actually EXITED (become a zombie
+         * we never reaped) -- schedule() lets them run even on a single core. */
+        for (int i = 0; i < n_leak; i++)
+            for (int y = 0; y < 20000 && process_alive(leaked[i]); y++) schedule();
+
+        /* (4) table is now FULL of DEAD-child handles: an alloc must fail. */
+        int h_full = process_handle_alloc(me, 0xDEADu);
+        if (h_full >= 0) { ok = 0; process_handle_free(me, h_full); }
+
+        /* (5) reap_dead() reclaims the dead ones (>= the n_leak we made) and
+         * MUST spare the still-live spin child's handle. */
+        int reclaimed = process_handle_reap_dead(me);
+        if (reclaimed < n_leak) ok = 0;
+        uint32_t chk;
+        int spin_ok = (process_handle_resolve(me, h_spin, &chk) == 0 && chk == (uint32_t)spin_pid
+                       && process_alive((uint32_t)spin_pid));
+        if (!spin_ok) ok = 0;
+
+        /* (6) the self-heal freed room: an alloc now succeeds where (4) failed. */
+        int h_after = process_handle_alloc(me, 0xBEEFu);
+        if (h_after < 0) ok = 0; else process_handle_free(me, h_after);
+
+        /* cleanup: kill+reap the spin child, drop its handle. */
+        process_kill((uint32_t)spin_pid);
+        process_wait((uint32_t)spin_pid);
+        process_handle_free(me, h_spin);
+
+        kprintf("\n[cmd] test handle reap: filled %d dead handles; alloc-when-full %s; "
+                "reclaimed %d; live child spared %s; realloc %s -> %s\n",
+                n_leak, h_full < 0 ? "rejected" : "WRONGLY-OK",
+                reclaimed, spin_ok ? "yes" : "NO",
+                h_after >= 0 ? "ok" : "FAIL", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* EmbLink UI Piece 1: cross-address-space shared surfaces. Spawns
      * /init.elf's "surface-parent" role, which runs S2/S3 (ownership +
      * starvation) in-process and S1 (a child inherits the surface and reads a

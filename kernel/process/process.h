@@ -81,7 +81,13 @@ enum process_state {
  * process that holds it -- sys_spawn returns one, sys_wait/sys_kill take
  * one, and it's translated to the real pid through this table so a ring-3
  * process can only name a process it was actually handed a handle to. */
-#define PROC_HANDLE_MAX 16
+/* Headroom for how many children a process can hold handles to at once. A
+ * spawn-and-forget parent (one that never wait()s its dead children) leaks a
+ * slot per dead child; process_handle_reap_dead() reclaims those on pressure so
+ * a full table self-heals instead of sys_spawn having to kill its new child --
+ * this cap is therefore the limit on simultaneously-LIVE children, not a leak
+ * ceiling. 32 gives a launcher comfortable headroom (256 B/process). */
+#define PROC_HANDLE_MAX 32
 struct proc_handle {
     uint32_t pid;
     bool used;
@@ -664,6 +670,11 @@ int process_handle_alloc(struct process *owner, uint32_t pid);
 int process_handle_resolve(struct process *owner, int handle, uint32_t *out_pid);
 /** Free `handle` in `owner`'s table (idempotent -- freeing an already-free or out-of-range handle is a silent no-op). */
 void process_handle_free(struct process *owner, int handle);
+/** Reclaim handle slots naming already-exited children (reaping those zombies);
+ *  leaves live children alone. Returns the count reclaimed. `owner` must be
+ *  current_process. Lets a full handle table self-heal instead of forcing a
+ *  spawn to kill its new child. */
+int process_handle_reap_dead(struct process *owner);
 /** @} */
 
 /* current_thread is the REAL per-core field (kernel/cpu/percpu.h's struct

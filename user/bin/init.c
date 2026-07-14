@@ -804,6 +804,11 @@ void _start(long argc, char **argv)
         /* EmbLink UI Piece 2 protocol scenarios; argv[2] selects which. */
         if (embk_streq(argv[1], "ui-proto") && argc >= 3) ui_proto_role(argv[2]);
 
+        /* Long-lived child for the handle-reap selftest: never exits on its own
+         * (the test kills it). Lets the test prove process_handle_reap_dead()
+         * reclaims DEAD children while leaving a LIVE one's handle alone. */
+        if (embk_streq(argv[1], "spin")) { for (;;) embk_sleep_ms(1000); }
+
         /* Default spawned-child role (spawn_test echo): exit HERE, never fall
          * through into the suite (would recursively spawn forever). */
         embk_write(3, argv[1], embk_strlen(argv[1]));   /* fd 3: parent-redirected */

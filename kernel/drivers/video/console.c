@@ -15,6 +15,11 @@ static uint32_t rows = 0;   // total number of rows
 static uint8_t fg_r = 255, fg_g = 255, fg_b = 255;  // white
 static uint8_t bg_r = 0, bg_g = 0, bg_b = 0;        // black
 static bool g_console_ready = false;
+/* Whether the text console still draws to the FRAMEBUFFER. Serial output is
+ * unconditional; this only gates the on-screen half. Turned off once the
+ * compositor/desktop owns the framebuffer, so kernel logging + the serial
+ * debug console never paint over the userspace UI (they stay on COM1). */
+static bool g_console_fb_enabled = true;
 
 // Cached Framebuffer info pointer
 static const fb_info_t *fb_info = 0;
@@ -38,6 +43,14 @@ void console_init(void) {
 bool console_is_ready(void)
 {
     return g_console_ready;
+}
+
+/* Enable/disable the on-screen (framebuffer) half of the console. Serial output
+ * is unaffected. Called with false once the compositor/desktop takes over the
+ * framebuffer so kernel text no longer paints over the userspace UI. */
+void console_set_fb_enabled(bool on)
+{
+    g_console_fb_enabled = on;
 }
 
 void console_set_color(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2) {
@@ -67,6 +80,12 @@ void console_putchar(char c) {
 
     // Always write to serial first - keeps debug log intact
     serial_write_char(c);
+
+    // Once the desktop owns the framebuffer, stop drawing here (serial keeps
+    // the full log). This is what keeps kprintf + the serial debug console off
+    // the userspace screen.
+    if (!g_console_fb_enabled)
+        return;
 
     // Handle special characters
     switch (c) {

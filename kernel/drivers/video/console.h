@@ -28,6 +28,11 @@ void console_clear(void);
 // True once console_init completed and framebuffer-backed writes are safe.
 bool console_is_ready(void);
 
+// Enable/disable the ON-SCREEN half of the console (serial output is unaffected).
+// Turned off once the desktop owns the framebuffer so kernel text / the serial
+// debug console never paint over the userspace UI.
+void console_set_fb_enabled(bool on);
+
 
 
 #endif /* _CONSOLE_H_ */
