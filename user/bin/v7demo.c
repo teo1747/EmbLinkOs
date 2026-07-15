@@ -45,7 +45,6 @@ EM_APPLICATION {
     .size     = { 560, 460 },
     .theme    = Dark,
     .chrome   = Chromeless,
-    .material = Acrylic,       /* frosted glass window: the compositor frosts the desktop behind it */
     .resize   = Resizable,
     .view     = app,
 };

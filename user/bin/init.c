@@ -804,6 +804,22 @@ void _start(long argc, char **argv)
         /* EmbLink UI Piece 2 protocol scenarios; argv[2] selects which. */
         if (embk_streq(argv[1], "ui-proto") && argc >= 3) ui_proto_role(argv[2]);
 
+        /* Long-lived child for the handle-reap selftest: never exits on its own
+         * (the test kills it). Lets the test prove process_handle_reap_dead()
+         * reclaims DEAD children while leaving a LIVE one's handle alone. */
+        if (embk_streq(argv[1], "spin")) { for (;;) embk_sleep_ms(1000); }
+
+        /* Pipe-EOF selftest writer: fd 1 was INSTALL_OBJ-redirected to a pipe
+         * write end by the spawning test. Write a known 5-byte tag through the
+         * ORDINARY write path (sys_write -> vfs_fd_write -> pipe_fd_write) and
+         * exit -- the parent asserts the bytes arrive, that EOF does NOT
+         * happen while it still holds its own write-end handle, and that our
+         * exit's reap loop dropped THIS fd's reference. */
+        if (embk_streq(argv[1], "pipewrite")) {
+            embk_write(1, "hi-42", 5);
+            embk_exit(0);
+        }
+
         /* Default spawned-child role (spawn_test echo): exit HERE, never fall
          * through into the suite (would recursively spawn forever). */
         embk_write(3, argv[1], embk_strlen(argv[1]));   /* fd 3: parent-redirected */

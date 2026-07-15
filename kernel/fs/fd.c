@@ -4,9 +4,20 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
+#include "drivers/video/console.h"    /* console fd write: console_putchar */
+#include "ipc/pipe.h"                 /* pipe fd backing: pipe_read/write + ref/unref */
+#include "kworker/kworker.h"          /* vnode close_locked: defer obj_put off the lock */
+#include "include/types.h"
 #include <stdint.h>
+#include <string.h>
 
 
+
+struct process;
+/* struct fd_entry + enum fd_backing live in fd.h (struct process embeds the
+ * fds[] table, so the layout must be public). struct fd_ops is fd.c-private --
+ * fd.h only forward-declares it since fd_entry just holds a pointer. */
 
 /* Boot-time fd table: used only while current_process is NULL (early boot,
  * before any real process exists -- e.g. `test fd`/`test ring3` selftests
@@ -30,10 +41,18 @@ void vfs_fd_init(void)
     struct fd_entry *fds = fd_table();
     for (int i = 0; i < FD_MAX_OPEN; i++) {
         fds[i].used = false;
-        fds[i].pos = 0;
+        fds[i].backing = FD_BACKING_NONE;
+        fds[i].ops = NULL;
         fds[i].flags = 0;
+        fds[i].u.file.pos = 0;
     }
 }
+
+
+/* the per-backing dispatch tables (defined below, near their handlers);
+ * forward-declared so the open + stdio-init paths can point new fds at them. */
+static const struct fd_ops vnode_fd_ops;
+static const struct fd_ops console_fd_ops;
 
 /* Map an fd to its live table entry (in the CALLING process's own table). */
 static struct fd_entry *fd_lookup(int fd)
@@ -143,6 +162,38 @@ static int fd_seek_compute(uint64_t base, int64_t delta, uint64_t *out)
     return EMBK_OK;
 }
 
+/* Populate a new process's stdio (fds 0/1/2): inherit each from the spawning
+ * parent via the per-backing inherit op, or default to the console when there's
+ * no parent / no inheritable entry. Called from process_create() BEFORE file
+ * actions, so a spawn redirect can override an inherited slot. */
+void fds_init_stdio(struct process *proc) {
+    struct fd_entry *parent_fds = current_thread ? current_process->fds : NULL;
+
+    for (int i = 0; i < FD_STDIO_MAX; i++) {
+        struct fd_entry *dst = &proc->fds[i];
+        if (parent_fds && parent_fds[i].used && parent_fds[i].ops
+             && parent_fds[i].ops->inherit) {
+            if (parent_fds[i].ops->inherit(dst, &parent_fds[i]) == EMBK_OK)
+                continue;
+            /* Inheritance refused (today: any VNODE --see vnode_fd_inherit).
+             * Leaves the slot unset; the child gets EBADF on that fd, which
+             * is loud and traceable, rather than silently-shared cursor. */
+            memset(dst, 0, sizeof(*dst));
+            continue;
+        }
+
+        /* No parent (the kernel spawned us -- `home`\init, where
+         * current_thread is NULL and the boot context's g_boot_fds has no
+         * stdio), or the parent's own slot is empty. Defaults to the console,
+         * so the very first userland process has working stdio and the
+         * inheritance chain has something to propagate. */
+        dst->used = true;
+        dst->backing = FD_BACKING_CONSOLE;
+        dst->ops = &console_fd_ops;
+        dst->flags = (i == 0) ? O_RDONLY : O_WRONLY;  /* stdin vs stdout/stderr */
+        memset(&dst->u, 0, sizeof(dst->u));
+    }
+}
 
 int vfs_open(const char *path, int flags, uint32_t mode)
 {
@@ -194,15 +245,17 @@ int vfs_open(const char *path, int flags, uint32_t mode)
     }
 
     fds[fd - FD_BASE].used = true;
-    fds[fd - FD_BASE].vn = vn;
-    fds[fd - FD_BASE].pos = 0;
+    fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
+    fds[fd - FD_BASE].ops = &vnode_fd_ops;
+    fds[fd - FD_BASE].u.file.vn = vn;
+    fds[fd - FD_BASE].u.file.pos = 0;
     fds[fd - FD_BASE].flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            fds[fd - FD_BASE].pos = st.size;
+            fds[fd - FD_BASE].u.file.pos = st.size;
     }
 
     return fd;
@@ -217,20 +270,10 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read) {
     if (!buf || !out_read)
         return -EMBK_EINVAL;
 
-    if (!fd_readable(e->flags))
-        return -EMBK_EBADF;
-
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->read)
+    if (!e->ops || !e->ops->read)
         return -EMBK_ENOSYS;
 
-    size_t bytes_read = 0;
-    int err = e->vn.mnt->ops->read(&e->vn, e->pos, buf, len, &bytes_read);
-    if (err)
-        return err;
-
-    e->pos += bytes_read;
-    *out_read = bytes_read;
-    return EMBK_OK;
+    return e->ops->read(e, buf, len, out_read);
 }
 
 
@@ -242,28 +285,10 @@ int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written) {
     if ((!buf && len) || !out_written)
         return -EMBK_EINVAL;
 
-    if (!fd_writable(e->flags))
-        return -EMBK_EBADF;
-
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->write)
+    if (!e->ops || !e->ops->write)
         return -EMBK_ENOSYS;
 
-    if ((e->flags & O_APPEND) && e->vn.mnt->ops->stat) {
-        struct vfs_stat st;
-        int s = e->vn.mnt->ops->stat(&e->vn, &st);
-        if (s)
-            return s;
-        e->pos = st.size;
-    }
-
-    size_t bytes_written = 0;
-    int err = e->vn.mnt->ops->write(&e->vn, e->pos, buf, len, &bytes_written);
-    if (err)
-        return err;
-
-    e->pos += bytes_written;
-    *out_written = bytes_written;
-    return EMBK_OK;
+    return e->ops->write(e, buf, len, out_written);
 }
 
 
@@ -276,40 +301,27 @@ int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset)
     if (!out_offset)
         return -EMBK_EINVAL;
 
-    uint64_t new_pos = 0;
-    switch (whence) {
-        case 0:
-            if (delta < 0)
-                return -EMBK_EINVAL;
-            new_pos = (uint64_t)delta;
-            break;
-        case 1: {
-            int rc = fd_seek_compute(e->pos, delta, &new_pos);
-            if (rc)
-                return rc;
-            break;
-        }
-        case 2: {
-            if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->stat)
-                return -EMBK_ENOSYS;
+    if (!e->ops || !e->ops->seek)
+        return -EMBK_ENOSYS;
 
-            struct vfs_stat st;
-            int err = e->vn.mnt->ops->stat(&e->vn, &st);
-            if (err)
-                return err;
+    return e->ops->seek(e, delta, whence, out_offset);
+}
 
-            int rc = fd_seek_compute(st.size, delta, &new_pos);
-            if (rc)
-                return rc;
-            break;
-        }
-        default:
-            return -EMBK_EINVAL;
-    }
+int vfs_fd_inherit(int fd, struct fd_entry *dst)
+{
 
-    e->pos = new_pos;
-    *out_offset = new_pos;
-    return EMBK_OK;
+
+        struct fd_entry *src = fd_lookup(fd);
+    if (!src)
+        return -EMBK_EBADF;
+
+    if (!dst)
+        return -EMBK_EINVAL;
+
+    if (!src->ops || !src->ops->inherit)
+        return -EMBK_ENOSYS;
+
+    return src->ops->inherit(dst, src);
 }
 
 int vfs_close(int fd)
@@ -318,17 +330,12 @@ int vfs_close(int fd)
     if (!e)
         return -EMBK_EBADF;
 
-    int rc = EMBK_OK;
-    if (e->vn.mnt && e->vn.mnt->ops && e->vn.mnt->ops->obj_put)
-        rc = e->vn.mnt->ops->obj_put(e->vn.mnt, e->vn.ino);
+    if (!e->ops || !e->ops->close)
+        return -EMBK_ENOSYS;
 
-    e->used = false;
-    e->pos = 0;
-    e->flags = 0;
-    e->vn.mnt = NULL;
-    e->vn.ino = 0;
-    e->vn.type = VFS_DT_UNKNOWN;
-    return rc;
+    e->ops->close(e);
+    memset(e, 0, sizeof(*e));
+    return EMBK_OK;
 }
 
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
@@ -338,10 +345,10 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         return -EMBK_EBADF;
     if (!out)
         return -EMBK_EINVAL;
-    if (!e->vn.mnt || !e->vn.mnt->ops || !e->vn.mnt->ops->stat)
+    if (!e->ops || !e->ops->fstat)
         return -EMBK_ENOSYS;
 
-    return e->vn.mnt->ops->stat(&e->vn, out);
+    return e->ops->fstat(e, out);
 }
 
 /* Parallel to vfs_open(), but for an explicit, not-yet-running
@@ -388,29 +395,288 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     }
 
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
-    if (e->used)
-        return -EMBK_EBUSY;
+    if (e->used && e->ops && e->ops->close)
+        e->ops->close(e);
 
-    if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
-        err = vn.mnt->ops->obj_get(vn.mnt, vn.ino);
-        if (err)
-            return err;
-    }
+    memset(e, 0, sizeof(*e));
 
     e->used = true;
-    e->vn = vn;
-    e->pos = 0;
+    e->backing = FD_BACKING_VNODE;
+    e->ops = &vnode_fd_ops;
+    e->u.file.vn = vn;
+    e->u.file.pos = 0;
     e->flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            e->pos = st.size;
+            e->u.file.pos = st.size;
     }
 
-    return EMBK_OK;
+    return target_fd;
  }
+
+static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
+    if (!fd_readable(e->flags))
+        return -EMBK_EBADF;
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->read)
+        return -EMBK_ENOSYS;
+
+    size_t bytes_read = 0;
+    int err = e->u.file.vn.mnt->ops->read(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_read);
+    if (err)
+        return err;
+
+    e->u.file.pos += bytes_read;
+    *out_read = bytes_read;
+    return EMBK_OK;
+}
+
+static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
+    if (!fd_writable(e->flags))
+        return -EMBK_EBADF;
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->write)
+        return -EMBK_ENOSYS;
+
+    size_t bytes_written = 0;
+    int err = e->u.file.vn.mnt->ops->write(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_written);
+    if (err)
+        return err;
+
+    e->u.file.pos += bytes_written;
+    *out_written = bytes_written;
+    return EMBK_OK;
+}
+
+static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+
+    struct vfs_stat st;
+    int err = e->u.file.vn.mnt->ops->stat(&e->u.file.vn, &st);
+    if (err)
+        return err;
+
+    uint64_t base;
+    switch (whence) {
+        case 0: base = 0; break; // SEEK_SET
+        case 1: base = e->u.file.pos; break; // SEEK_CUR
+        case 2: base = st.size; break; // SEEK_END
+        default: return -EMBK_EINVAL;
+    }
+
+    uint64_t new_pos;
+    err = fd_seek_compute(base, delta, &new_pos);
+    if (err)
+        return err;
+
+    e->u.file.pos = new_pos;
+    *out_offset = new_pos;
+    return EMBK_OK;
+}
+
+
+static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+
+    return e->u.file.vn.mnt->ops->stat(&e->u.file.vn, out);
+}
+
+
+static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    (void)dst; (void)src;
+    /* Deliberately NOT "obj_get + struct copy". That would fix the LIFETIME
+     * bug (refcount) while leaving the CURSOR bug: the child would get an
+     * independent u.file.pos onto the same object -- neither POSIX (which
+     * shares the offset through a shared open-file-description) nor a fresh
+     * open. It's an accidental third thing, and it corrupts silently.
+     *
+     * Nothing can put a vnode in fds 0/1/2 today, so this cannot fire. When
+     * something eventually redirects a child's stdout to a FILE, it will
+     * fail LOUDLY here rather than quietly sharing a cursor -- and that's
+     * the moment to build the real shared open-file-description (the gap
+     * already tracked in TODO.md), not before. */
+    return -EMBK_ENOSYS;
+}
+
+
+static void vnode_fd_close(struct fd_entry *e) {
+    if (e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
+        (void)e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
+}
+
+static void vnode_fd_close_locked(struct fd_entry *e) {
+    /* Cannot obj_put here: last-close reads the on-disk link count and may
+     * destroy the object (block reclamation + metadata writes) -- real disk
+     * I/O, disqualifying under g_sched_lock. Defer to the kworker, which
+     * obj_puts from a normal schedulable thread holding nothing. This CLOSES
+     * the pre-existing exit-time vnode refcount leak. */
+    kworker_defer_obj_put_locked(e->u.file.vn);
+}
+
+static const struct fd_ops vnode_fd_ops = {
+    .read  = vnode_fd_read,
+    .write = vnode_fd_write,
+    .seek  = vnode_fd_seek,
+    .fstat = vnode_fd_fstat,
+    .inherit = vnode_fd_inherit,
+    .close = vnode_fd_close,
+    .close_locked = vnode_fd_close_locked,
+};
+
+
+
+
+
+static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
+    (void)e; 
+    if(len == 0) {
+        *out_read = 0;
+        return EMBK_OK;
+    }
+
+    /* Blocks for the FIRST char (a read() on a tty must not return 0 just 
+     * because nobody has typed yet -- 0 means EOF), then drains whatever else
+     * is already buffered without blocking again. That's line-ish behavior
+     * without a line discipline; real canonical mode (echo, backspace
+     * handling, line buffering) is a named gap, not built here. */
+    char *cbuf = (char *)buf;
+    cbuf[0] = keyboard_getchar_blocking();
+    size_t n = 1;
+    while (n < len && keyboard_has_char()) {
+        cbuf[n++] = keyboard_getchar();         // buffer is non-empty, won't spin
+    }
+    *out_read = n;
+    return EMBK_OK;
+}
+
+static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
+    (void)e; 
+
+    const char *cbuf = (const char *)buf;
+    for (size_t i = 0; i < len; i++) {
+        console_putchar(cbuf[i]);
+    }
+    *out_written = len;
+    return EMBK_OK;
+}
+
+static int console_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
+    (void)e; (void)delta; (void)whence; (void)out_offset;
+    return -EMBK_ESPIPE; /* errno.h literally anticipates this : "illegal seek" */
+}
+
+static int console_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e; 
+    
+    /* A character device. Incidentally this is what finally  makes newlib's 
+     * _isatty/_fstat stubs HONEST -- they currently claim chardev with no
+     * object backing the claim. */
+
+    out->size = 0; /* size is meaningless for a console */
+    out->type = VFS_DT_CHAR;
+    return EMBK_OK;
+}
+
+static int console_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    (void)dst; (void)src;
+    
+    *dst = *src; /* shallow copy is fine -- console fds are process-global, not per-process */
+    return EMBK_OK;
+}
+
+static void console_fd_close(struct fd_entry *e) {
+    (void)e; 
+    /* Console fds are process-global, not per-process. Closing them is
+     * meaningless -- the console remains open for everyone. */
+}
+
+static const struct fd_ops console_fd_ops = {
+    .read = console_fd_read,
+    .write = console_fd_write,
+    .seek = console_fd_seek,
+    .fstat = console_fd_fstat,
+    .inherit = console_fd_inherit,
+    .close = console_fd_close,
+    .close_locked = NULL,
+};
+
+static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
+    if (e->u.pipe.side != 0) return -EMBK_EBADF;    /* direction enforced at the
+                                                      * op, per the one-kind design */
+    return pipe_read(e->u.pipe.p, buf, len, out);
+}
+static int pipe_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
+    if (e->u.pipe.side != 1) return -EMBK_EBADF;
+    return pipe_write(e->u.pipe.p, buf, len, out);
+}
+static int pipe_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
+    (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
+}
+static int pipe_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e; out->size = 0; out->type = VFS_DT_FIFO; return EMBK_OK;
+    /* FIFO keeps isatty(fd) correctly FALSE when stdio is a pipe -- the
+     * mirror-image favor of the console's VFS_DT_CHAR making it true */
+}
+static int pipe_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    *dst = *src;
+    sched_lock();
+    pipe_ref_locked(dst->u.pipe.p, dst->u.pipe.side);   /* a copy IS a new
+                                                          * reference -- the exact
+                                                          * under-ref trap the
+                                                          * blanket-memcpy had */
+    sched_unlock();
+    return EMBK_OK;
+}
+static void pipe_fd_close(struct fd_entry *e) {
+    sched_lock(); pipe_unref_locked(e->u.pipe.p, e->u.pipe.side); sched_unlock();
+}
+static void pipe_fd_close_locked(struct fd_entry *e) {
+    pipe_unref_locked(e->u.pipe.p, e->u.pipe.side);
+}
+
+static const struct fd_ops pipe_fd_ops = {
+    .read = pipe_fd_read, .write = pipe_fd_write, .seek = pipe_fd_seek,
+    .fstat = pipe_fd_fstat, .inherit = pipe_fd_inherit,
+    .close = pipe_fd_close, .close_locked = pipe_fd_close_locked,
+};
+
+/* See fd.h. Mirrors fd_open_into's close-then-install redirect idiom: the
+ * child's stdio slot was pre-populated by fds_init_stdio (a console, or an
+ * inherited entry) -- installing onto it is a REDIRECT, so the old entry is
+ * released through its own ops first (console: no-op; an inherited pipe
+ * would be properly unref'd rather than leaked). Runs UNLOCKED (spawn's
+ * file-actions loop, ordinary syscall context), hence ops->close, and the
+ * self-contained sched_lock around the ref bump. */
+int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
+{
+    if (!target || !p || (side != 0 && side != 1))
+        return -EMBK_EINVAL;
+    if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EBADF;
+
+    struct fd_entry *e = &target->fds[target_fd - FD_BASE];
+    if (e->used && e->ops && e->ops->close)
+        e->ops->close(e);
+    memset(e, 0, sizeof(*e));
+
+    e->used = true;
+    e->backing = FD_BACKING_PIPE;
+    e->ops = &pipe_fd_ops;
+    e->flags = (side == 0) ? O_RDONLY : O_WRONLY;
+    e->u.pipe.p = p;
+    e->u.pipe.side = side;
+
+    sched_lock();
+    pipe_ref_locked(p, side);   /* the child is a NEW reference to this end --
+                                 * bump before it ever runs, so its close can't
+                                 * drop the count below the parent's own hold */
+    sched_unlock();
+    return EMBK_OK;
+}
+
 
 int vfs_fd_run_selftests(void)
 {

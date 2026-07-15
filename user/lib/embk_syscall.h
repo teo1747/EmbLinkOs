@@ -65,6 +65,8 @@
 #define EMBK_SYS_sleep_ms     46
 #define EMBK_SYS_proc_alive   47
 #define EMBK_SYS_win_resize   48
+#define EMBK_SYS_pipe         49
+#define EMBK_SYS_handle_close 50
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

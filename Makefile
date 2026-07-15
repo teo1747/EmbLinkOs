@@ -108,6 +108,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/ipc/handle.c \
              kernel/ipc/channel.c \
              kernel/ipc/endpoint.c \
+             kernel/ipc/pipe.c \
+             kernel/kworker/kworker.c \
              kernel/gfx/surface.c \
              kernel/gfx/compositor.c \
              kernel/lib/kstring.c \

@@ -22,4 +22,9 @@ void keyboard_set_grab(int grab, uint32_t pid);
 int  keyboard_is_grabbed(void);
 void keyboard_release_grab_pid(uint32_t pid);
 
+/* Blocking read that YIELDS (wait-queue backed) rather than halting the CPU.
+ * Use this from any context where a scheduler exists; keyboard_getchar()'s
+ * hlt-spin is only correct pre-scheduler. */
+char keyboard_getchar_blocking(void);
+
 #endif /* __KEYBOARD__H__ */

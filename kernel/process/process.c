@@ -3,6 +3,7 @@
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
+#include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
@@ -318,6 +319,22 @@ static void process_reap_slot(struct process *proc) {
      * no frame free) keeps vmm_destroy_address_space's "free every user-half
      * frame" walk from freeing shared memory another process still maps. */
     obj_handles_release_all(proc);
+
+    /* Release every fd the dying process still holds -- the memset below wipes
+     * the table WITHOUT dispatching any close, which (before this loop) leaked
+     * the reference behind each fd: a vnode's on-disk open-refcount, or a pipe
+     * end whose reader would then wait forever for an EOF that never comes.
+     * Runs with g_sched_lock HELD (structural invariant of every reap path) --
+     * hence close_locked, never close: a self-locking close here would
+     * re-enter the non-reentrant spinlock. Backings whose teardown can block
+     * (vnode: obj_put may hit disk) defer the real work to the kworker instead
+     * of doing it under the lock. */
+    for (int i = 0; i < FD_MAX_OPEN; i++) {
+        struct fd_entry *e = &proc->fds[i];
+        if (e->used && e->ops && e->ops->close_locked) {
+            e->ops->close_locked(e);
+        }
+    }
 
     /* Reclaim compositor windows BEFORE the address space is destroyed: a shared
      * (zero-copy) window's pixel pages are mapped in this process's user half but
@@ -859,6 +876,32 @@ void process_handle_free(struct process *owner, int handle) {
     owner->handles[handle].pid = 0;
 }
 
+/* Reclaim handle slots that name children which have ALREADY EXITED -- zombies
+ * the owner spawned and never wait()'d. The leak from spawn-and-forget is
+ * DOUBLE (a handle slot here AND the child's zombie PCB slot), so for each dead
+ * handle we collect+reap the zombie (process_wait takes its non-blocking path
+ * for an already-exited child: it either reaps it from our zombie list or, if
+ * it's already gone, returns -ECHILD -- it can only block on a LIVE child, which
+ * process_alive() rules out first) and then free the handle. LIVE children are
+ * left untouched. Returns how many slots were reclaimed.
+ *
+ * `owner` must be current_process (process_wait reaps from current's zombie
+ * list); that's the only caller (sys_spawn reclaiming its own dead children so
+ * a full table doesn't force it to KILL the child it just created). */
+int process_handle_reap_dead(struct process *owner) {
+    int reclaimed = 0;
+    for (int i = 0; i < PROC_HANDLE_MAX; i++) {
+        if (!owner->handles[i].used) continue;
+        uint32_t pid = owner->handles[i].pid;
+        if (process_alive(pid)) continue;     /* still running -- keep its handle */
+        process_wait(pid);                    /* non-blocking here: collect+reap the zombie */
+        owner->handles[i].used = false;
+        owner->handles[i].pid = 0;
+        reclaimed++;
+    }
+    return reclaimed;
+}
+
 /* Shared by sys_exit and the kthread selftests below: mark the current
  * thread a zombie and hand off to the scheduler. If nothing else is
  * runnable, schedule() returns here.
@@ -951,6 +994,8 @@ int process_create(const char *path, char *const argv[], int argc,
         return rc;  // ELF load failed
     }
 
+    fds_init_stdio(proc);
+
     /* 2.5. Apply file_actions -- give the child its fds before it ever runs.
      * proc->fds[] is guaranteed empty here (see fd_open_into()'s comment),
      * so there's nothing to close/overwrite first. */
@@ -993,6 +1038,52 @@ int process_create(const char *path, char *const argv[], int argc,
                 vmm_destroy_address_space(pml4);
                 proc->pid = 0;
                 return dh;
+            }
+        } else if (act->kind == SPAWN_ACTION_INSTALL_OBJ) {
+            /* Install a byte-stream obj-handle the PARENT holds as a plain fd
+             * in the CHILD -- the pipe->stdio bridge (sys_pipe returns
+             * obj-handles; this turns one into the child's fd 0/1). Resolved
+             * against current_process's own table: a process can only install
+             * what it already holds a handle to -- the confused-deputy
+             * closure, unchanged. Any failure fails the WHOLE spawn: a caller
+             * that asked for a specific fd and silently didn't get it is
+             * worse than spawn failing outright (same policy as ACTION_OPEN). */
+            if (!current_thread) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            if (act->src_obj_handle < 0 || act->src_obj_handle >= OBJ_HANDLE_MAX) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EBADF;
+            }
+            struct obj_handle *oh = &current_process->obj_handles[act->src_obj_handle];
+            if (!oh->used) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EBADF;
+            }
+            int irc;
+            if (oh->kind == HANDLE_KIND_PIPE) {
+                /* COPY semantics: fd_install_pipe bumps the end's refcount for
+                 * the child; the parent keeps its handle and must release it
+                 * separately -- which is exactly Unix ("close your copy of the
+                 * write end or the reader never sees EOF"). Exit-time
+                 * accounting balances: the parent's handle drops via
+                 * obj_handles_release_all, the child's fd via the reap loop. */
+                struct pipe_end *pe = (struct pipe_end *)oh->obj;
+                irc = fd_install_pipe(proc, act->target_fd, pe->p, pe->side);
+            } else {
+                /* Only byte-stream-capable objects can back an fd -- a SURFACE
+                 * has no read/write meaning; reject rather than install
+                 * something whose fd ops don't exist. */
+                irc = -EMBK_EINVAL;
+            }
+            if (irc < 0) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return irc;
             }
         } else {
             vmm_destroy_address_space(pml4);

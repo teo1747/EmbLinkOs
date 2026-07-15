@@ -46,6 +46,8 @@
 #include "fs/epfs.h"
 #include "selftests.h"
 
+#include "kworker/kworker.h"
+
 #include "process/process.h"
 
 
@@ -538,6 +540,8 @@ void kernel_main(void) {
         }
     }
 
+    kworker_init();
+
     // Land the user in the graphical HOME launcher: a ring-3 app that takes the
     // whole screen as the compositor's desktop layer and launches other apps
     // (see user/bin/home.c). It runs as an ordinary round-robin sibling of this
@@ -545,6 +549,15 @@ void kernel_main(void) {
     // USB, and the serial/keyboard REPL stays available as a debug console.
     {
         char *hargv[] = { (char *)"/home.elf", NULL };
+        /* The desktop is about to own the framebuffer -- disable the text
+         * console's on-screen half BEFORE home becomes a schedulable sibling.
+         * Ordering matters: process_create() makes home RUNNABLE, and userspace
+         * stdout/stderr (fd 1/2) now route through console_putchar. If the fb
+         * were still enabled here, a timer preemption in the gap between spawn
+         * and this call could let home's first write() paint over the boot
+         * screen. Disabling first closes that window. All kernel logging + the
+         * serial debug console below stay on COM1 and never touch the fb. */
+        console_set_fb_enabled(false);
         int hpid = process_create("/home.elf", hargv, 1, NULL, 0);
         if (hpid < 0)
             kprintf("\nhome: failed to launch /home.elf: %s\n", embk_strerror(hpid));
@@ -552,7 +565,9 @@ void kernel_main(void) {
             kprintf("\nhome: launched /home.elf as pid %d\n", hpid);
     }
 
-    // Main loop: keyboard echo + tick heartbeat + process control shell
+    // Main loop (boot CPU): pump the polled drivers (legacy USB + the window
+    // compositor's pointer) and service a serial-only kernel debug console.
+    // The interactive keyboard + screen belong to userspace.
     uint64_t last = 0;
     char cmd_buf[128];
     uint32_t cmd_len = 0;
@@ -567,21 +582,28 @@ void kernel_main(void) {
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
-        // USB HID input now arrives via the xHCI interrupt (see xhci_enable_irq),
-        // which wakes us from the hlt below and injects keys into the keyboard buffer.
-        if (!keyboard_is_grabbed() && keyboard_has_char()) {
-            char c = keyboard_getchar();
-            kprintf("%c", c);
-
+        // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
+        // to userspace now (the launcher, and the shell that reads fd 0); the
+        // kernel keeps a SERIAL-ONLY console so selftests + state inspection stay
+        // reachable when userspace is wedged -- and, crucially, it never touches
+        // the keyboard buffer a userspace reader owns, so there's no contention.
+        // Polled (the UART RX IRQ is left disabled); the ~100Hz timer wakes the
+        // hlt below, giving debug-console-grade latency. Drain the FIFO per pass.
+        while (serial_has_char()) {
+            char c = serial_read_char();
             if (c == '\r' || c == '\n') {
+                serial_write_char('\n');
                 cmd_buf[cmd_len] = '\0';
                 kernel_handle_line_command(cmd_buf);
                 cmd_len = 0;
             } else if ((c == '\b' || c == 127) && cmd_len > 0) {
                 cmd_len--;
+                serial_write_string("\b \b");   // erase the char on the terminal
             } else if (c >= 32 && c <= 126) {
-                if (cmd_len + 1 < sizeof cmd_buf)
+                if (cmd_len + 1 < sizeof cmd_buf) {
                     cmd_buf[cmd_len++] = c;
+                    serial_write_char(c);        // echo so the remote terminal shows input
+                }
             }
         }
 

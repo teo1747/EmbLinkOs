@@ -3,6 +3,8 @@
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/syscall/usercopy.h"
 #include "drivers/char/serial.h"
+#include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
+#include "ipc/pipe.h"          /* sys_pipe: pipe_create */
 #include "drivers/timer/rtc.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
@@ -62,24 +64,12 @@ static int64_t sys_write(struct regs *r) {
         }
 
         size_t advanced;
-        if (fd == 1 || fd == 2) {
-            /* stdout (1) AND stderr (2) both go to the serial console -- newlib
-             * writes diagnostics to fd 2, and without routing it here every
-             * stderr write would fall through to vfs_fd_write(2, ...) and fail
-             * (fd 2 < FD_BASE). No separate error stream to split them onto
-             * yet; both land on the same console. */
-            for (size_t i = 0; i < n; i++) {
-                serial_write_char(chunk[i]);
-            }
-            advanced = n;   // serial writes always take the whole chunk
-        } else {
-            size_t written = 0;
-            int rc = vfs_fd_write(fd, chunk, n, &written);
-            if (rc != EMBK_OK) {
-                return done > 0 ? (int64_t)done : rc;
-            }
-            advanced = written;
+        size_t written = 0;
+        int rc = vfs_fd_write(fd, chunk, n, &written);
+        if (rc != EMBK_OK) {
+            return done > 0 ? (int64_t)done : rc;
         }
+        advanced = written;
 
         done += advanced;
         if (advanced < n) {
@@ -99,7 +89,7 @@ static int64_t sys_read(struct regs *r) {
     char *buf = (char *)r->rsi;
     size_t len = (size_t)r->rdx;
 
-    if (fd == 0 || fd == 1 || fd == 2) {
+    if ( fd == 1 || fd == 2) {
         return -EMBK_EINVAL;   // no stdio-fd read support yet
     }
 
@@ -159,6 +149,47 @@ static int64_t sys_open(struct regs *r) {
 static int64_t sys_close(struct regs *r) {
     int fd = (int)r->rdi;
     return vfs_close(fd);
+}
+
+/* pipe(out[2]) -> 0, or -errno. Writes {read_handle, write_handle} -- typed
+ * OBJ-HANDLES (the capability table sys_spawn's INSTALL action consumes),
+ * NOT fds. The caller turns one into an fd by installing it, or hands it to
+ * a child at spawn. On a copy_to_user fault both handles are released via
+ * the kind dispatch (which drops the pipe refs), so a bad pointer can't leak
+ * a pipe. */
+static int64_t sys_pipe(struct regs *r) {
+    uint64_t user_out = r->rdi;    /* int[2]: {read_handle, write_handle} */
+    int handles[2];
+    int rc = pipe_create(&handles[0], &handles[1]);
+    if (rc != EMBK_OK) {
+        return rc;
+    }
+    if (copy_to_user((void *)user_out, handles, sizeof handles) != EMBK_OK) {
+        obj_handle_free(current_process, handles[0]);   /* dispatch drops the refs */
+        obj_handle_free(current_process, handles[1]);
+        return -EMBK_EFAULT;
+    }
+    return 0;
+}
+
+/* handle_close(h) -> 0, or -errno. Release ONE obj-handle through the
+ * generic kind dispatch (obj_handle_free): a pipe end is unref'd (the
+ * reader sees EOF when the last writer drops), a channel end closed +
+ * peer woken, a surface unmapped + unref'd. This is the pipeline dance's
+ * missing fourth step: after installing pipe ends into children via
+ * INSTALL_OBJ (COPY semantics), the parent MUST drop its own handles or
+ * its retained write end keeps n_writers > 0 forever -- the classic
+ * "close your copy of the write end or the reader never sees EOF". */
+static int64_t sys_handle_close(struct regs *r) {
+    int h = (int)r->rdi;
+    if (h < 0 || h >= OBJ_HANDLE_MAX) {
+        return -EMBK_EBADF;
+    }
+    if (!current_process->obj_handles[h].used) {
+        return -EMBK_EBADF;
+    }
+    obj_handle_free(current_process, h);
+    return 0;
 }
 
 /* lseek(fd, offset, whence) -> new absolute offset, or -errno.
@@ -352,8 +383,21 @@ static int64_t sys_spawn(struct regs *r) {
     
     int handle = process_handle_alloc(current_process, (uint32_t)pid);
     if (handle < 0) {
-        process_kill((uint32_t)pid);   // orphaned child, no handle to name it
-        return handle;   // -errno from process_handle_alloc()
+        /* Table full -- almost always because the caller spawned children and
+         * never wait()'d the dead ones, leaking a handle slot each. Reclaim any
+         * handles that name already-exited children (and reap those zombies),
+         * then retry, so a leak-filled table doesn't force us to KILL the valid
+         * child we just created. */
+        if (process_handle_reap_dead(current_process) > 0) {
+            handle = process_handle_alloc(current_process, (uint32_t)pid);
+        }
+    }
+    if (handle < 0) {
+        /* Genuinely at capacity -- every handle names a still-LIVE child, so
+         * there's no slot to name this one and (with no init-reaper for
+         * orphans) leaving it unnamed would leak it. Kill it and report EMFILE. */
+        process_kill((uint32_t)pid);
+        return handle;   // -EMBK_EMFILE
     }
     return handle;
 }
@@ -1026,6 +1070,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_sleep_ms     46
 #define SYS_proc_alive   47
 #define SYS_win_resize   48
+#define SYS_pipe         49
+#define SYS_handle_close 50
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1077,6 +1123,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_sleep_ms]     = sys_sleep_ms,
     [SYS_proc_alive]   = sys_proc_alive,
     [SYS_win_resize]   = sys_win_resize,
+    [SYS_pipe]         = sys_pipe,
+    [SYS_handle_close] = sys_handle_close,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

@@ -28,6 +28,12 @@
                             * EmbLink UI Piece 1 Layer B) -- not a byte stream,
                             * never opened via the fd layer. Only epfs (mounted
                             * at /run) ever produces one of these. */
+#define VFS_DT_CHAR     5   /* character device (the console/tty backing fd 0-2);
+                            * makes newlib's _fstat/_isatty honest. */
+#define VFS_DT_FIFO     6   /* a pipe end (kernel/ipc/pipe.c) -- keeps isatty(fd)
+                            * correctly FALSE when stdio is redirected to a pipe,
+                            * the mirror image of VFS_DT_CHAR's favor above. */
+
 
 struct vfs_mount;   /* forward: one mounted filesystem instance      */
 struct vfs_ops;     /* forward: the per-filesystem operation table    */
