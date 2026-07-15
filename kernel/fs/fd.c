@@ -643,6 +643,40 @@ static const struct fd_ops pipe_fd_ops = {
     .close = pipe_fd_close, .close_locked = pipe_fd_close_locked,
 };
 
+/* See fd.h. Mirrors fd_open_into's close-then-install redirect idiom: the
+ * child's stdio slot was pre-populated by fds_init_stdio (a console, or an
+ * inherited entry) -- installing onto it is a REDIRECT, so the old entry is
+ * released through its own ops first (console: no-op; an inherited pipe
+ * would be properly unref'd rather than leaked). Runs UNLOCKED (spawn's
+ * file-actions loop, ordinary syscall context), hence ops->close, and the
+ * self-contained sched_lock around the ref bump. */
+int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
+{
+    if (!target || !p || (side != 0 && side != 1))
+        return -EMBK_EINVAL;
+    if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EBADF;
+
+    struct fd_entry *e = &target->fds[target_fd - FD_BASE];
+    if (e->used && e->ops && e->ops->close)
+        e->ops->close(e);
+    memset(e, 0, sizeof(*e));
+
+    e->used = true;
+    e->backing = FD_BACKING_PIPE;
+    e->ops = &pipe_fd_ops;
+    e->flags = (side == 0) ? O_RDONLY : O_WRONLY;
+    e->u.pipe.p = p;
+    e->u.pipe.side = side;
+
+    sched_lock();
+    pipe_ref_locked(p, side);   /* the child is a NEW reference to this end --
+                                 * bump before it ever runs, so its close can't
+                                 * drop the count below the parent's own hold */
+    sched_unlock();
+    return EMBK_OK;
+}
+
 
 int vfs_fd_run_selftests(void)
 {

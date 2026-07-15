@@ -5,11 +5,8 @@
 #include "include/errno.h"
 #include "include/kstring.h"
 
-struct pipe_end {           /* what an obj-handle's ->obj actually points at */
-    struct pipe *p;
-    int side;                /* 0 = read end, 1 = write end */
-    bool used;
-};
+/* struct pipe_end now lives in pipe.h (the INSTALL_OBJ spawn action needs
+ * .p/.side); struct pipe itself stays private here. */
 
 struct pipe {
     uint8_t  buf[PIPE_BUF_SIZE];
@@ -137,6 +134,18 @@ int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written)
     sched_unlock();
     *out_written = n;    /* may be < len: partial write, caller loops */
     return EMBK_OK;
+}
+
+/* Live-pipe count, for the EOF selftest's leak assertion (mirrors
+ * channel_live_count): after every reference is dropped the count must
+ * return to its baseline, proving free-at-zero actually fired. */
+uint32_t pipe_live_count(void) {
+    uint32_t n = 0;
+    sched_lock();
+    for (int i = 0; i < PIPE_MAX; i++)
+        if (g_pipes[i].used) n++;
+    sched_unlock();
+    return n;
 }
 
 void pipe_release_for_handle_locked(void *obj_end) {

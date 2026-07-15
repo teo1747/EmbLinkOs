@@ -116,6 +116,13 @@ int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
 
+/* Install one end of a pipe onto target_fd in `target` -- the fd-layer half
+ * of the INSTALL_OBJ spawn action (pipe_fd_ops is private to fd.c, so the
+ * install lives here, not in process.c). COPY semantics: the new fd is a NEW
+ * reference (ref bumped under the lock); the parent's obj-handle stays alive
+ * and must be released separately for EOF. side: 0=read, 1=write. */
+int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+
 /* Give a new process its stdin/stdout/stderr (fds 0/1/2): inherit from the
  * spawning parent per-backing, or default to the console. process_create()
  * calls this BEFORE applying file actions. */

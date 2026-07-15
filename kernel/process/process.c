@@ -3,6 +3,7 @@
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
+#include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
@@ -1037,6 +1038,52 @@ int process_create(const char *path, char *const argv[], int argc,
                 vmm_destroy_address_space(pml4);
                 proc->pid = 0;
                 return dh;
+            }
+        } else if (act->kind == SPAWN_ACTION_INSTALL_OBJ) {
+            /* Install a byte-stream obj-handle the PARENT holds as a plain fd
+             * in the CHILD -- the pipe->stdio bridge (sys_pipe returns
+             * obj-handles; this turns one into the child's fd 0/1). Resolved
+             * against current_process's own table: a process can only install
+             * what it already holds a handle to -- the confused-deputy
+             * closure, unchanged. Any failure fails the WHOLE spawn: a caller
+             * that asked for a specific fd and silently didn't get it is
+             * worse than spawn failing outright (same policy as ACTION_OPEN). */
+            if (!current_thread) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            if (act->src_obj_handle < 0 || act->src_obj_handle >= OBJ_HANDLE_MAX) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EBADF;
+            }
+            struct obj_handle *oh = &current_process->obj_handles[act->src_obj_handle];
+            if (!oh->used) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EBADF;
+            }
+            int irc;
+            if (oh->kind == HANDLE_KIND_PIPE) {
+                /* COPY semantics: fd_install_pipe bumps the end's refcount for
+                 * the child; the parent keeps its handle and must release it
+                 * separately -- which is exactly Unix ("close your copy of the
+                 * write end or the reader never sees EOF"). Exit-time
+                 * accounting balances: the parent's handle drops via
+                 * obj_handles_release_all, the child's fd via the reap loop. */
+                struct pipe_end *pe = (struct pipe_end *)oh->obj;
+                irc = fd_install_pipe(proc, act->target_fd, pe->p, pe->side);
+            } else {
+                /* Only byte-stream-capable objects can back an fd -- a SURFACE
+                 * has no read/write meaning; reject rather than install
+                 * something whose fd ops don't exist. */
+                irc = -EMBK_EINVAL;
+            }
+            if (irc < 0) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return irc;
             }
         } else {
             vmm_destroy_address_space(pml4);

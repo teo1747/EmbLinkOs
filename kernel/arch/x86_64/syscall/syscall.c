@@ -172,6 +172,26 @@ static int64_t sys_pipe(struct regs *r) {
     return 0;
 }
 
+/* handle_close(h) -> 0, or -errno. Release ONE obj-handle through the
+ * generic kind dispatch (obj_handle_free): a pipe end is unref'd (the
+ * reader sees EOF when the last writer drops), a channel end closed +
+ * peer woken, a surface unmapped + unref'd. This is the pipeline dance's
+ * missing fourth step: after installing pipe ends into children via
+ * INSTALL_OBJ (COPY semantics), the parent MUST drop its own handles or
+ * its retained write end keeps n_writers > 0 forever -- the classic
+ * "close your copy of the write end or the reader never sees EOF". */
+static int64_t sys_handle_close(struct regs *r) {
+    int h = (int)r->rdi;
+    if (h < 0 || h >= OBJ_HANDLE_MAX) {
+        return -EMBK_EBADF;
+    }
+    if (!current_process->obj_handles[h].used) {
+        return -EMBK_EBADF;
+    }
+    obj_handle_free(current_process, h);
+    return 0;
+}
+
 /* lseek(fd, offset, whence) -> new absolute offset, or -errno.
  * whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END (vfs_fd_seek's existing
  * numeric convention -- no libc yet to define the usual named constants
@@ -1051,6 +1071,7 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_proc_alive   47
 #define SYS_win_resize   48
 #define SYS_pipe         49
+#define SYS_handle_close 50
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1103,6 +1124,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_proc_alive]   = sys_proc_alive,
     [SYS_win_resize]   = sys_win_resize,
     [SYS_pipe]         = sys_pipe,
+    [SYS_handle_close] = sys_handle_close,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

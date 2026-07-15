@@ -58,16 +58,26 @@
 /* from_user of one of these matches byte-for-byte.                        */
 /* ==================================================================== */
 
-/* One spawn() file action: currently only "open PATH onto TARGET_FD in the
- * child before it runs" (EMBK_SPAWN_ACTION_OPEN). Mirrors the kernel's
- * struct spawn_file_action (kernel/process/spawn.h). */
-#define EMBK_SPAWN_ACTION_OPEN 1
+/* One spawn() file action: "open PATH onto TARGET_FD in the child before it
+ * runs" (EMBK_SPAWN_ACTION_OPEN), or "install the pipe end behind
+ * SRC_OBJ_HANDLE as the child's TARGET_FD" (EMBK_SPAWN_ACTION_INSTALL_OBJ --
+ * the pipe->stdio bridge for shell pipelines). Mirrors the kernel's
+ * struct spawn_file_action (kernel/process/spawn.h) FIELD-FOR-FIELD: the
+ * kernel copies this struct raw, so the two must grow together (and every
+ * action-passing app rebuilt when they do). */
+#define EMBK_SPAWN_ACTION_OPEN        1
+#define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
 struct embk_spawn_file_action {
-    unsigned char kind;         /* EMBK_SPAWN_ACTION_OPEN */
-    int           target_fd;    /* fd the opened file lands on in the child */
-    char          path[256];    /* NUL-terminated path to open */
-    int           flags;        /* EMBK_O_* */
-    unsigned int  mode;         /* creation mode if EMBK_O_CREAT */
+    unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
+    int           target_fd;    /* fd this action populates in the child */
+    char          path[256];    /* OPEN: NUL-terminated path */
+    int           flags;        /* OPEN: EMBK_O_* */
+    unsigned int  mode;         /* OPEN: creation mode if EMBK_O_CREAT */
+    int           src_obj_handle; /* INSTALL_OBJ: pipe-end handle in the
+                                   * PARENT's table (from embk_pipe). COPY
+                                   * semantics: the parent keeps its handle
+                                   * and must embk_close_handle() it, or the
+                                   * reader never sees EOF. */
 };
 
 /* One directory entry from embk_readdir() (kernel struct sys_dirent). */
@@ -100,6 +110,18 @@ static inline int64_t embk_open(const char *path, int flags, unsigned mode) {
 }
 static inline int64_t embk_close(int fd) {
     return embk_syscall1(EMBK_SYS_close, fd);
+}
+/* Create a pipe. Writes {read_handle, write_handle} -- typed OBJ-HANDLES for
+ * spawn's INSTALL_OBJ action, NOT fds (you cannot embk_read/embk_write them
+ * directly; install one as a child's fd 0/1, or into your own fd table). */
+static inline int embk_pipe(int out_handles[2]) {
+    return (int)embk_syscall1(EMBK_SYS_pipe, (int64_t)(intptr_t)out_handles);
+}
+/* Release an obj-handle (pipe end, channel end, surface) via the kernel's
+ * generic kind dispatch. For pipes this is what delivers EOF: after
+ * installing ends into children, close YOUR copies or the reader hangs. */
+static inline int embk_close_handle(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_handle_close, handle);
 }
 static inline int64_t embk_lseek(int fd, int64_t offset, int whence) {
     return embk_syscall3(EMBK_SYS_lseek, fd, offset, whence);

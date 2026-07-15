@@ -22,10 +22,30 @@
 #include "gfx/surface.h"
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
+#include "ipc/pipe.h"
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
 static bool g_vfs_ready = false;
+
+/* --- `test pipe` helper: a kthread that does ONE blocking 1-byte pipe read.
+ * The EOF test's central assertion is "a reader BLOCKS while any write end
+ * is still open, and wakes with 0 only when the last one drops" -- you can't
+ * assert 'blocks' from the thread doing the blocking, so a helper thread
+ * reads while the test watches these flags. Statics (not stack) because the
+ * kthread outlives the enclosing scope's frame guarantees. */
+static struct pipe *volatile s_pipe_eof_p;
+static volatile int    s_pipe_eof_done;
+static volatile size_t s_pipe_eof_got;
+static void pipe_eof_reader_kthread(void)
+{
+    char b[4];
+    size_t got = 99;
+    (void)pipe_read(s_pipe_eof_p, b, 1, &got);
+    s_pipe_eof_got  = got;
+    s_pipe_eof_done = 1;
+    process_exit_self(0);
+}
 
 void selftests_init(struct fat32_volume *fat_vol, bool fat_ready)
 {
@@ -279,6 +299,7 @@ static void selftests_print_commands(void)
     kprintf("  test crypto all\n");
     kprintf("  test ring3\n");
     kprintf("  test ring3 threads\n");
+    kprintf("  test pipe\n");
     kprintf("  test surface\n");
     kprintf("  test channel\n");
     kprintf("  test compositor\n");
@@ -617,6 +638,103 @@ int selftests_handle_command(const char *cmd)
                 n_leak, h_full < 0 ? "rejected" : "WRONGLY-OK",
                 reclaimed, spin_ok ? "yes" : "NO",
                 h_after >= 0 ? "ok" : "FAIL", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* Pipe EOF, end-to-end: sys_pipe -> INSTALL_OBJ spawn action -> exit-time
+     * reap loop -> handle_close EOF. The full shell-pipeline dance:
+     *   (1) make a pipe; hold BOTH end handles;
+     *   (2) spawn a child whose fd 1 IS the write end (INSTALL_OBJ); it writes
+     *       5 bytes through the ordinary sys_write path and exits; read them
+     *       back through OUR read-end fd;
+     *   (3) reap the child (its fd-1 write ref drops in the REAP LOOP, not at
+     *       exit) -- a reader must then BLOCK, not EOF, because our own
+     *       write-end handle is still open (n_writers==1: the classic
+     *       "parent forgot to close its copy" state);
+     *   (4) drop our write-end handle -> the blocked reader wakes with 0;
+     *   (5) drop every remaining ref -> the pipe slot itself is reclaimed. */
+    if (strcmp(cmd, "test pipe") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test pipe: VFS not registered (need /init.elf)\n");
+            return 1;
+        }
+        struct process *me = current_process;
+        int ok = 1;
+        uint32_t live0 = pipe_live_count();
+
+        /* (1) create; both ends land as obj-handles in OUR table. */
+        int rh = -1, wh = -1;
+        if (pipe_create(&rh, &wh) != EMBK_OK) {
+            kprintf("\n[cmd] test pipe: setup FAIL (pipe_create)\n");
+            return 1;
+        }
+        struct pipe_end *pe_r = obj_handle_resolve(me, rh, HANDLE_KIND_PIPE);
+        if (!pe_r || fd_install_pipe(me, 9, pe_r->p, 0) != EMBK_OK) {
+            kprintf("\n[cmd] test pipe: setup FAIL (resolve/install read end)\n");
+            obj_handle_free(me, rh); obj_handle_free(me, wh);
+            return 1;
+        }
+        s_pipe_eof_p = pe_r->p;
+
+        /* (2) writer child: INSTALL_OBJ wh -> child fd 1; then read its tag
+         * back through our fd 9 (blocking read paces us to the child). */
+        struct spawn_file_action act;
+        memset(&act, 0, sizeof act);
+        act.kind = SPAWN_ACTION_INSTALL_OBJ;
+        act.target_fd = 1;
+        act.src_obj_handle = wh;
+        char *aw[] = { "/init.elf", "pipewrite", NULL };
+        int wpid = process_create("/init.elf", aw, 2, &act, 1);
+        if (wpid < 0) {
+            kprintf("\n[cmd] test pipe: setup FAIL (spawn %d)\n", wpid);
+            vfs_close(9); obj_handle_free(me, rh); obj_handle_free(me, wh);
+            return 1;
+        }
+        char buf[8];
+        size_t total = 0;
+        while (total < 5) {
+            size_t got = 0;
+            if (vfs_fd_read(9, buf + total, 5 - total, &got) != EMBK_OK || got == 0) break;
+            total += got;
+        }
+        int bytes_ok = (total == 5 && memcmp(buf, "hi-42", 5) == 0);
+        if (!bytes_ok) ok = 0;
+
+        /* (3) reap the child; then a 1-byte reader must BLOCK (no EOF).
+         * Yield counts are deliberately MODEST: schedule() here is a full
+         * cooperative hand-off, and with home + the clock widget rendering
+         * under TCG a rotation back to this thread costs milliseconds --
+         * 20000 unconditional yields looked like a hang (measured: the shell
+         * stayed READY but starved for ~17s+). 300 rotations is already
+         * hundreds of chances for the reader to (wrongly) complete. */
+        process_wait((uint32_t)wpid);
+        s_pipe_eof_done = 0;
+        s_pipe_eof_got = 99;
+        if (!process_create_kthread(pipe_eof_reader_kthread, NULL)) ok = 0;
+        for (int y = 0; y < 300; y++) schedule();
+        int blocked_ok = (s_pipe_eof_done == 0);
+        if (!blocked_ok) ok = 0;
+
+        /* (4) drop OUR write end -> n_writers 0 -> reader wakes with EOF.
+         * Early-exit on success; the cap only bounds the FAIL case. */
+        obj_handle_free(me, wh);
+        for (int y = 0; y < 3000 && !s_pipe_eof_done; y++) schedule();
+        int eof_ok = (s_pipe_eof_done && s_pipe_eof_got == 0);
+        if (!eof_ok) ok = 0;
+
+        /* (5) drop the remaining read refs (fd 9 + handle): slot reclaimed. */
+        vfs_close(9);
+        obj_handle_free(me, rh);
+        int freed_ok = (pipe_live_count() == live0);
+        if (!freed_ok) ok = 0;
+
+        kprintf("\n[cmd] test pipe: bytes %s; blocks-while-parent-holds %s; "
+                "EOF-after-close %s; slot freed %s -> %s\n",
+                bytes_ok ? "ok" : "FAIL",
+                blocked_ok ? "yes" : "NO(early EOF)",
+                eof_ok ? "ok" : "FAIL",
+                freed_ok ? "yes" : "NO",
+                ok ? "OK" : "FAIL");
         return 1;
     }
 
