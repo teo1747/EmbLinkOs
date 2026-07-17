@@ -52,6 +52,9 @@
 #define EMBK_SEEK_CUR   1
 #define EMBK_SEEK_END   2
 
+#define EMBK_TTY_COOKED 0
+#define EMBK_TTY_RAW    1
+
 /* ==================================================================== */
 /* Types shared with the kernel by value (hand-synced -- no shared kernel  */
 /* header). Same compiler + default layout on both sides, so a copy_to/    */
@@ -782,6 +785,12 @@ static inline int embk_streq(const char *a, const char *b) {
 /* Convenience: write a NUL-terminated string to an fd. */
 static inline int64_t embk_puts(int fd, const char *s) {
     return embk_write(fd, s, embk_strlen(s));
+}
+
+/* TTY mode: 0 = cooked (line-buffered, echo), 1 = raw (unbuffered, no echo).
+ * Returns the previous mode (0/1) or -EMBK_* on error. */
+static inline int embk_tty_mode(int mode) {
+    return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
 }
 
 #endif /* __EMBK_H__ */

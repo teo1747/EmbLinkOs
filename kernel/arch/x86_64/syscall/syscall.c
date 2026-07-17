@@ -13,6 +13,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "tty/tty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
@@ -1447,6 +1448,13 @@ static int64_t sys_chan_connect(struct regs *r) {
     return endpoint_connect(current_process, path);
 }
 
+static int64_t sys_tty_mode(struct regs *r) {
+    int mode = (int)r->rdi;
+    if (mode < 0 || mode > 2) return -EMBK_EINVAL;
+    tty_set_mode(mode);
+    return 0;
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -1516,6 +1524,7 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_chmod        64
 #define SYS_key_event_poll 65
 #define SYS_key_mods       66
+#define SYS_tty_mode       67
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1585,6 +1594,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_chmod]        = sys_chmod,
     [SYS_key_event_poll] = sys_key_event_poll,
     [SYS_key_mods]       = sys_key_mods,
+    [SYS_tty_mode]       = sys_tty_mode,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

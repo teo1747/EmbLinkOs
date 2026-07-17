@@ -63,6 +63,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/elf.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
+			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \

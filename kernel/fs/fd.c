@@ -4,6 +4,7 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "tty/tty.h"
 #include "process/ksync.h"            /* per-process fd-table mutex (fdlock/fdunlock) */
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
@@ -748,28 +749,7 @@ static const struct fd_ops vnode_fd_ops = {
 
 static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
     (void)e; 
-    if(len == 0) {
-        *out_read = 0;
-        return EMBK_OK;
-    }
-
-    /* Blocks for the FIRST char (a read() on a tty must not return 0 just 
-     * because nobody has typed yet -- 0 means EOF), then drains whatever else
-     * is already buffered without blocking again. That's line-ish behavior
-     * without a line discipline; real canonical mode (echo, backspace
-     * handling, line buffering) is a named gap, not built here. */
-    char *cbuf = (char *)buf;
-    /* Cancellation-aware (docs/INTERRUPTION.md): a console read blocked for input
-     * must wake with -ECANCELED when this process is cancelled -- otherwise a
-     * program sitting at a prompt could never be ^C'd. */
-    int rc = keyboard_getchar_blocking_cancelable(&cbuf[0]);
-    if (rc != EMBK_OK) return rc;
-    size_t n = 1;
-    while (n < len && keyboard_has_char()) {
-        cbuf[n++] = keyboard_getchar();         // buffer is non-empty, won't spin
-    }
-    *out_read = n;
-    return EMBK_OK;
+    return tty_read(buf, len, out_read);  // line discipline
 }
 
 static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {

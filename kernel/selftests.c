@@ -13,6 +13,7 @@
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
+#include "tty/tty.h"
 #include "drivers/input/keyboard.h"
 #include "process/ksync.h"
 #include "mm/kheap.h"
@@ -344,6 +345,7 @@ static void selftests_print_commands(void)
     kprintf("  test thread exit\n");
     kprintf("  test usb\n");
     kprintf("  test gpu\n");
+    kprintf("  test tty\n");
 }
 
 static void run_embkfs_all(void)
@@ -1919,6 +1921,12 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = fat32_vfs_test_mkdir_unlink();
         kprintf("\n[cmd] test fat32 vfs: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test tty") == 0) {
+        int rc = tty_run_selftests();
+        kprintf("\n[cmd] test tty: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 
