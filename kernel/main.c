@@ -49,6 +49,7 @@
 #include "kworker/kworker.h"
 
 #include "process/process.h"
+#include "tty/tty.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
