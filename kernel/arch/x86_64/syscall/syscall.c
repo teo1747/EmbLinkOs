@@ -1,5 +1,6 @@
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/idt.h"
+#include "arch/x86_64/cpu/fsbase.h"    /* fsbase_set() -- sys_set_fs_base */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/syscall/usercopy.h"
 #include "drivers/char/serial.h"
@@ -24,10 +25,16 @@
 #include "fs/vfs.h"
 #include <stdint.h>
 
-// Bounce-buffer chunk size shared by every syscall that streams a user
-// buffer through a bounded kernel stack buffer (write/read). Arbitrary but
-// small enough to be cheap on the kernel stack.
-#define SYSCALL_IO_CHUNK 256
+// Heap bounce buffer bounds for sys_read/sys_write. _MAX is the real throughput
+// lever: chunk size IS throughput, because storage costs ~2.7 ms PER DEVICE
+// REQUEST (ATA setup + a serial busy-wait for the DMA IRQ) rather than per byte.
+// 64 KB keeps one allocation per syscall small while cutting fd->vfs->fs trips
+// (and the B-tree descents under them) ~32x versus the old 2 KB stack array.
+// _MIN is the on-stack fallback used only when kmalloc fails -- correctness must
+// not depend on the allocator, so a read under memory pressure still completes,
+// just slowly. Keep _MIN small: it is a KERNEL STACK array (KSTACK_SIZE 16 KiB).
+#define SYSCALL_IO_CHUNK_MAX (64u * 1024u)
+#define SYSCALL_IO_CHUNK_MIN 2048
 // Max path length copy_string_from_user() will accept for open()/stat().
 #define SYSCALL_PATH_MAX 256
 
@@ -52,22 +59,35 @@ static int64_t sys_write(struct regs *r) {
     const char *buf = (const char *)r->rsi;
     size_t len = (size_t)r->rdx;
 
-    char chunk[SYSCALL_IO_CHUNK];
+    /* Heap bounce buffer, one allocation per call -- same reasoning as sys_read:
+     * the chunk size is the throughput lever, and the kernel stack could never
+     * afford a big one. Falls back to a small stack chunk if kmalloc fails. */
+    char fallback[SYSCALL_IO_CHUNK_MIN];
+    size_t cap = len < SYSCALL_IO_CHUNK_MAX ? len : SYSCALL_IO_CHUNK_MAX;
+    char *chunk = cap ? (char *)kmalloc(cap) : NULL;
+    if (!chunk) {
+        chunk = fallback;
+        cap = sizeof fallback;
+    }
+
+    int64_t ret;
     size_t done = 0;
     while (done < len) {
         size_t n = len - done;
-        if (n > sizeof(chunk)) {
-            n = sizeof(chunk);
+        if (n > cap) {
+            n = cap;
         }
         if (copy_from_user(chunk, buf + done, n) != EMBK_OK) {
-            return done > 0 ? (int64_t)done : -EMBK_EFAULT;
+            ret = done > 0 ? (int64_t)done : -EMBK_EFAULT;
+            goto out;
         }
 
         size_t advanced;
         size_t written = 0;
         int rc = vfs_fd_write(fd, chunk, n, &written);
         if (rc != EMBK_OK) {
-            return done > 0 ? (int64_t)done : rc;
+            ret = done > 0 ? (int64_t)done : rc;
+            goto out;
         }
         advanced = written;
 
@@ -76,7 +96,13 @@ static int64_t sys_write(struct regs *r) {
             break;   // short write (fd path only); stop rather than looping forever
         }
     }
-    return (int64_t)done;
+    ret = (int64_t)done;
+out:
+    /* Single exit: no path may leak the buffer. Only the heap one is freed. */
+    if (chunk != fallback) {
+        kfree(chunk);
+    }
+    return ret;
 }
 
 /* read(fd, buf, len) -> bytes read, via the fd/VFS layer. No fd 0 (stdin)
@@ -93,17 +119,51 @@ static int64_t sys_read(struct regs *r) {
         return -EMBK_EINVAL;   // no stdio-fd read support yet
     }
 
-    char chunk[SYSCALL_IO_CHUNK];
+    /* Bounce buffer on the HEAP, one allocation for the whole call.
+     *
+     * It used to be `char chunk[SYSCALL_IO_CHUNK]` on the kernel stack, which
+     * capped the chunk at 2 KB (KSTACK_SIZE is only 16 KiB) -- and the chunk
+     * size IS the throughput: each chunk is a full fd->vfs->fs trip, and the
+     * storage cost is ~2.7 ms PER DEVICE REQUEST (ATA setup + a serial busy-wait
+     * for the DMA IRQ), not per byte. Small chunks meant ~250 KB/s no matter that
+     * the transfer itself is DMA. Off the stack, the chunk can be 64 KB: ~32x
+     * fewer trips, and ~32x fewer B-tree descents in the fs beneath.
+     *
+     * kmalloc failure is NOT fatal: fall back to a small stack chunk so reads
+     * still work under memory pressure, just slowly. `cap` is sized to the
+     * request, so a 100-byte read doesn't allocate 64 KB. */
+    char fallback[SYSCALL_IO_CHUNK_MIN];
+    size_t cap = len < SYSCALL_IO_CHUNK_MAX ? len : SYSCALL_IO_CHUNK_MAX;
+    char *chunk = cap ? (char *)kmalloc(cap) : NULL;
+    if (!chunk) {
+        chunk = fallback;
+        cap = sizeof fallback;
+    }
+
+    int64_t ret;
     size_t done = 0;
     while (done < len) {
         size_t n = len - done;
-        if (n > sizeof(chunk)) {
-            n = sizeof(chunk);
+        if (n > cap) {
+            n = cap;
         }
+        /* Validate the destination BEFORE anything is consumed. The rewind
+         * below is only possible on a SEEKABLE fd -- a pipe returns ESPIPE,
+         * so bytes taken out of its ring can never be put back, and a
+         * copy_to_user failure there destroys them permanently (observed:
+         * "corrupt structured output" -- a half-delivered wire frame).
+         * Checking first turns that data-loss window into a clean EFAULT
+         * that consumes nothing. */
+        if (!access_ok(buf + done, n)) {
+            ret = done > 0 ? (int64_t)done : -EMBK_EFAULT;
+            goto out;
+        }
+
         size_t got = 0;
         int rc = vfs_fd_read(fd, chunk, n, &got);
         if (rc != EMBK_OK) {
-            return done > 0 ? (int64_t)done : rc;
+            ret = done > 0 ? (int64_t)done : rc;
+            goto out;
         }
         if (got > 0 && copy_to_user(buf + done, chunk, got) != EMBK_OK) {
             /* The fs already consumed `got` bytes (vfs_fd_read advanced the
@@ -111,21 +171,33 @@ static int64_t sys_read(struct regs *r) {
              * WITHOUT rewinding silently dropped this chunk -- the next read
              * continued past it (observed: font.ttf arriving k*256 bytes
              * short with varying content under -smp 4, -> textless UI).
-             * Rewind so a retrying caller sees every byte exactly once. */
+             * Rewind so a retrying caller sees every byte exactly once --
+             * and if the fd CAN'T rewind (a pipe: ESPIPE), say so instead of
+             * ignoring the failure and silently eating the bytes. */
             uint64_t np = 0;
-            vfs_fd_seek(fd, -(int64_t)got, 1 /* SEEK_CUR */, &np);
-            kprintf("sys_read: copy_to_user FAULT pid=%u dst=0x%llx off_done=%llu (rewound %llu)\n",
+            int srr = vfs_fd_seek(fd, -(int64_t)got, 1 /* SEEK_CUR */, &np);
+            kprintf("sys_read: copy_to_user FAULT pid=%u dst=0x%llx off_done=%llu (%s %llu)\n",
                     current_thread ? (unsigned)current_process->pid : 0u,
                     (unsigned long long)(uintptr_t)(buf + done),
-                    (unsigned long long)done, (unsigned long long)got);
-            return done > 0 ? (int64_t)done : -EMBK_EFAULT;
+                    (unsigned long long)done,
+                    srr == EMBK_OK ? "rewound" : "UNSEEKABLE -- LOST",
+                    (unsigned long long)got);
+            ret = done > 0 ? (int64_t)done : -EMBK_EFAULT;
+            goto out;
         }
         done += got;
         if (got < n) {
             break;   // short read: EOF (or similar) -- stop here
         }
     }
-    return (int64_t)done;
+    ret = (int64_t)done;
+out:
+    /* Single exit so no path can leak the buffer. `fallback` is on the stack --
+     * only free the heap one. */
+    if (chunk != fallback) {
+        kfree(chunk);
+    }
+    return ret;
 }
 
 /* open(path, flags, mode) -> fd, or -errno. `path` is copied in through a
@@ -192,6 +264,182 @@ static int64_t sys_handle_close(struct regs *r) {
     return 0;
 }
 
+/* fd_install_obj(handle, target_fd) -> target_fd, or -errno. Install an
+ * obj-handle the CALLER holds into its OWN fd table -- the self-install
+ * half of the INSTALL_OBJ spawn action. The shell needs this for its own
+ * end of a pipeline: it holds the READ handle of the last stage's output
+ * and must turn it into an fd it can read(). COPY semantics, same as the
+ * spawn action: the handle stays alive; close it separately. Only
+ * byte-stream kinds are installable (a surface has no read/write meaning). */
+static int64_t sys_fd_install_obj(struct regs *r) {
+    int h         = (int)r->rdi;
+    int target_fd = (int)r->rsi;
+    if (h < 0 || h >= OBJ_HANDLE_MAX) {
+        return -EMBK_EBADF;
+    }
+    struct obj_handle *oh = &current_process->obj_handles[h];
+    if (!oh->used) {
+        return -EMBK_EBADF;
+    }
+    if (oh->kind != HANDLE_KIND_PIPE) {
+        return -EMBK_EINVAL;
+    }
+    struct pipe_end *pe = (struct pipe_end *)oh->obj;
+    int rc = fd_install_pipe(current_process, target_fd, pe->p, pe->side);
+    if (rc != EMBK_OK) {
+        return rc;
+    }
+    return target_fd;
+}
+
+/* fd_avail(fd) -> bytes readable WITHOUT blocking (0 = nothing yet, NOT
+ * EOF), or -errno. A pipe answers its buffered count; the console answers
+ * whether a key is waiting. What lets the terminal poll the shell's output
+ * pipe from its render loop instead of parking a thread in read(). */
+static int64_t sys_fd_avail(struct regs *r) {
+    int fd = (int)r->rdi;
+    return vfs_fd_avail(fd);
+}
+
+/* unlink(path) -> 0 or -errno. The shell's `rm`. */
+static int64_t sys_unlink(struct regs *r) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)r->rdi, sizeof(path));
+    if (len < 0) {
+        return len;
+    }
+    return vfs_unlink_path(path);
+}
+
+/* mkdir(path) -> 0 or -errno. The shell's `mkdir`. */
+/* rename(old, new). STRICT kernel semantics: the destination must not exist
+ * (EMBKFS refuses with -EEXIST) -- the POSIX replace-atomically veneer lives in
+ * the LIBC (unlink dest, then rename), same split as path_abs. Two path copies,
+ * one syscall: git's lockfile commit is the customer. */
+static int64_t sys_rename(struct regs *r) {
+    char oldp[SYSCALL_PATH_MAX], newp[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(oldp, (const char *)r->rdi, sizeof(oldp));
+    if (len < 0) return len;
+    len = copy_string_from_user(newp, (const char *)r->rsi, sizeof(newp));
+    if (len < 0) return len;
+    return vfs_rename_path(oldp, newp);
+}
+
+/* chmod(path, mode) -- REAL: EMBKFS inodes have always carried a mode, there
+ * was simply no road here from userspace. The fs preserves the file-TYPE bits
+ * itself, so this cannot turn a file into a directory. git init's core.filemode
+ * probe is what exposed the gap. */
+static int64_t sys_chmod(struct regs *r) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)r->rdi, sizeof(path));
+    if (len < 0) return len;
+    return vfs_chmod_path(path, (uint32_t)r->rsi);
+}
+
+/* ftruncate(fd, size) -- REAL, not a stub: the per-fs truncate op already
+ * exists (EMBKFS wires it); this only had no road from userspace. */
+static int64_t sys_ftruncate(struct regs *r) {
+    return vfs_fd_truncate((int)r->rdi, (uint64_t)r->rsi);
+}
+
+static int64_t sys_mkdir(struct regs *r) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)r->rdi, sizeof(path));
+    if (len < 0) {
+        return len;
+    }
+    return vfs_mkdir_path(path);
+}
+
+/* rmdir(path) -> 0 or -errno. EMPTY directories only (the fs enforces it --
+ * embkfs_rmdir_name refuses a non-empty target); never recursive. */
+static int64_t sys_rmdir(struct regs *r) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)r->rdi, sizeof(path));
+    if (len < 0) {
+        return len;
+    }
+    return vfs_rmdir_path(path);
+}
+
+/* set_fs_base(addr) -> 0, or -errno. Installs this thread's TLS thread pointer,
+ * i.e. what %fs's base is while it runs. crt0 calls it once, and only for a
+ * program that actually has a PT_TLS segment.
+ *
+ * SECURITY -- why the check is not optional: `addr` goes straight into
+ * IA32_FS_BASE via WRMSR, and WRMSR raises #GP on a NON-CANONICAL value while
+ * we are in RING 0. Passing this argument through unvalidated would be a
+ * one-line user-triggered kernel fault. access_ok() is precisely the right
+ * gate: it bounds the range to USER_VA_LIMIT (0x0000800000000000 -- the top of
+ * the low canonical half), rejects wraps, and walks the page tables to confirm
+ * the address is really mapped and user-accessible. A value that passes can be
+ * neither non-canonical nor a kernel address.
+ *
+ * 8 bytes because that is exactly what the ABI dereferences first: every TLS
+ * access opens with `mov %fs:0x0,%reg`, reading the TCB self-pointer AT the
+ * base. A base whose first word isn't readable is useless anyway.
+ *
+ * Aiming %fs at some other mapping in your OWN address space is NOT a privilege
+ * boundary -- ring 3 can already read all of it -- so nothing further is
+ * restricted here.
+ */
+static int64_t sys_set_fs_base(struct regs *r) {
+    uint64_t base = r->rdi;
+
+    if (!access_ok((const void *)(uintptr_t)base, 8)) {
+        return -EMBK_EFAULT;
+    }
+
+    struct thread *t = current_thread_atomic();
+    if (!t) {
+        return -EMBK_EFAULT;
+    }
+
+    /* Record it BEFORE installing it. This is the authoritative copy: if we get
+     * preempted between these two lines, schedule() reinstalls from the field on
+     * the way back in, and the MSR write below is merely redundant. Doing it the
+     * other way round would leave a window where the MSR is set but the field
+     * still says 0, and the next switch would silently clear %fs. */
+    t->fs_base = base;
+    fsbase_set(base);
+    return 0;
+}
+
+/* proc_list(out, max) -> count, or -errno. Copies up to `max` process_info
+ * snapshots into the caller's buffer -- the shell's `ps`. Read-only system
+ * introspection; the struct is mirrored FIELD-FOR-FIELD by embk.h's
+ * embk_proc_info (grow both together). */
+static int64_t sys_proc_list(struct regs *r) {
+    struct process_info *user_out = (struct process_info *)r->rdi;
+    int max = (int)r->rsi;
+    if (max <= 0 || !user_out) {
+        return -EMBK_EINVAL;
+    }
+    if (max > MAX_PROCESSES) {
+        max = MAX_PROCESSES;
+    }
+    struct process_info snap[MAX_PROCESSES];
+    int n = process_list(snap, max);
+    if (n > 0 && copy_to_user(user_out, snap, (size_t)n * sizeof(snap[0])) != EMBK_OK) {
+        return -EMBK_EFAULT;
+    }
+    return n;
+}
+
+/* proc_kill(pid) -> 0 or -errno. The shell's `kill <pid>`.
+ * DELIBERATE AMBIENT AUTHORITY: unlike SYS_kill (which takes a spawn HANDLE,
+ * capability-scoped to your own children), this names any pid -- the shell
+ * is this single-user OS's process manager and needs to kill what `ps`
+ * shows. If multi-user ever happens, this is the syscall to gate. */
+static int64_t sys_proc_kill(struct regs *r) {
+    uint32_t pid = (uint32_t)r->rdi;
+    if (!process_alive(pid)) {
+        return -EMBK_ENOENT;
+    }
+    process_kill(pid);
+    return 0;
+}
+
 /* lseek(fd, offset, whence) -> new absolute offset, or -errno.
  * whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END (vfs_fd_seek's existing
  * numeric convention -- no libc yet to define the usual named constants
@@ -222,6 +470,7 @@ static int64_t sys_stat(struct regs *r) {
     }
 
     struct vfs_stat st;
+    memset(&st, 0, sizeof(st));   /* same mtime-honesty zeroing as sys_fstat */
     int rc = vfs_stat(path, &st);
     if (rc != EMBK_OK) {
         return rc;
@@ -328,6 +577,11 @@ static int64_t sys_spawn(struct regs *r) {
     int argc = (int)r->rdx;
     const struct spawn_file_action *user_actions = (const struct spawn_file_action *)r->r10;
     int n_count = (int)r->r8;
+    /* envp: NULL-TERMINATED, not counted -- there is no seventh argument
+     * register, and it is the shape `char **environ` needs anyway. 0 means "give
+     * the child NO environment", which is this OS's default: nothing is
+     * inherited unless the parent names it (see spawn.h). */
+    const uint64_t *user_envp = (const uint64_t *)r->r9;
 
     char path[SYSCALL_PATH_MAX];
     int len = copy_string_from_user(path, user_path, sizeof(path));
@@ -376,9 +630,57 @@ static int64_t sys_spawn(struct regs *r) {
         return -EMBK_EFAULT;
     }
 
-    int pid = process_create(path, argv_kernel, argc, actions_kernel, n_count);
+    /* envp. NULL-terminated in USER space, so its length is discovered by
+     * walking it -- one pointer at a time, since we cannot know how far it is
+     * safe to read ahead. Bounded by SPAWN_ENVP_MAX.
+     *
+     * The string buffer is kmalloc'd, NOT another 1 KiB array here: this frame
+     * already carries path[256] + argv_buf[1024] + actions_kernel[~2.2 KiB], and
+     * a second 1 KiB would put it near a THIRD of the 16 KiB kernel stack before
+     * process_create_env() and elf_load() add their own frames on top. This
+     * codebase has already been bitten once by a big syscall buffer on that
+     * stack (see SYSCALL_IO_CHUNK's history in sys_read). The alloc/free window
+     * below is deliberately narrow -- two returns, both handled. */
+    uint64_t user_envp_ptrs[SPAWN_ENVP_MAX];
+    char *envp_kernel[SPAWN_ENVP_MAX];
+    char *envp_buf = NULL;
+    int envc = 0;
+    if (user_envp) {
+        for (;;) {
+            uint64_t p;
+            if (copy_from_user(&p, user_envp + envc, sizeof p) != EMBK_OK) {
+                return -EMBK_EFAULT;
+            }
+            if (!p) break;                                  /* the terminator */
+            /* -1 leaves room for the NULL process_create_env() expects. */
+            if (envc >= SPAWN_ENVP_MAX - 1) return -EMBK_E2BIG;
+            user_envp_ptrs[envc++] = p;
+        }
+
+        envp_buf = kmalloc(SPAWN_ENVP_BYTES_MAX);
+        if (!envp_buf) return -EMBK_ENOMEM;
+        size_t eused = 0;
+        for (int i = 0; i < envc; i++) {
+            int slen = copy_string_from_user(envp_buf + eused,
+                                             (const char *)user_envp_ptrs[i],
+                                             SPAWN_ENVP_BYTES_MAX - eused);
+            if (slen < 0) { kfree(envp_buf); return slen; }  /* EFAULT/ENAMETOOLONG */
+            envp_kernel[i] = envp_buf + eused;
+            eused += (size_t)slen + 1;                       /* includes the NUL */
+        }
+        envp_kernel[envc] = NULL;
+    }
+
+    /* user_envp==0 stays NULL, NOT an empty vector: "no environment" is the
+     * default and a distinct, honest answer from "an empty environment". */
+    int pid = process_create_env(path, argv_kernel, argc,
+                                 user_envp ? envp_kernel : NULL,
+                                 actions_kernel, n_count);
+    /* Safe already: process_create_env() COPIES every string into the child's
+     * own stack before returning -- that is its documented contract. */
+    if (envp_buf) kfree(envp_buf);
     if (pid < 0) {
-        return pid;   // -errno from process_create()
+        return pid;   // -errno from process_create_env()
     }
     
     int handle = process_handle_alloc(current_process, (uint32_t)pid);
@@ -441,6 +743,93 @@ static int64_t sys_kill(struct regs *r) {
     }
 
     process_kill(pid);
+    return 0;
+}
+
+/* cancel(handle) -> ask the child named by `handle` to stop. The POLITE half of
+ * stopping something; see docs/INTERRUPTION.md.
+ *
+ * HANDLE-SCOPED, exactly like sys_kill and for the same reason: you may only
+ * cancel a child YOU spawned and still hold a handle for. There is deliberately
+ * no cancel-by-pid -- that would be ambient authority over a process you were
+ * never handed, which is the property this OS refuses (and why kill(other_pid)
+ * in our libc is an honest ENOSYS).
+ *
+ * The child's blocking syscalls then fail -EMBK_ECANCELED so it can clean up and
+ * exit. It may also ignore this forever: sys_kill remains the uncatchable
+ * backstop, and deciding when to escalate is the PARENT's policy, not ours. */
+static int64_t sys_cancel(struct regs *r) {
+    int handle = (int)r->rdi;
+
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, handle, &pid);
+    if (rc != 0) {
+        return rc;   // -EMBK_EINVAL
+    }
+
+    return process_cancel(pid);
+}
+
+/* cancelled(handle_or_-1) -> 1 if cancelled, else 0.
+ *
+ *   rdi < 0  : THIS process. For a compute loop that makes no syscalls -- with
+ *              nothing injected into user control flow, a process that never
+ *              blocks would otherwise never learn. Ambient over SELF is fine
+ *              (same reasoning as sys_getpid): no confused deputy.
+ *   rdi >= 0 : a CHILD named by a spawn handle the caller holds. This is the
+ *              escalation primitive (docs/INTERRUPTION.md §4.3): a parent that
+ *              delegated ^C never sees the keystroke, so watching the child's
+ *              cancel state is the only honest way to start a grace-then-kill
+ *              clock -- otherwise "cancelled but declining" looks identical to
+ *              "healthy but slow". Handle-scoped like sys_cancel/sys_kill, and
+ *              strictly weaker than both.
+ *
+ * Reading does NOT clear it -- the flag is sticky, so cleanup code that itself
+ * blocks still sees -EMBK_ECANCELED rather than deadlocking on a cleared flag. */
+static int64_t sys_cancelled(struct regs *r) {
+    int64_t handle = (int64_t)r->rdi;
+    if (handle < 0) {
+        return current_process->cancelled ? 1 : 0;
+    }
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, (int)handle, &pid);
+    if (rc != 0) {
+        return rc;   // -EMBK_EINVAL: not a child of yours
+    }
+    return process_is_cancelled(pid);
+}
+
+/* console_interrupt_route(handle) -> route ^C to the child named by `handle`;
+ * handle < 0 clears the route. See docs/INTERRUPTION.md.
+ *
+ * A DELEGATION, not an inference. EmbLink has no "foreground process", no
+ * session and no process group: the shell holds the console, and when it runs a
+ * command it HANDS OVER the right to be interrupted -- exactly as it hands over
+ * fds via file-actions and the environment via envp. Both "obvious" alternatives
+ * were considered and fail (see the doc): "whoever holds the console" doesn't
+ * discriminate, because stdio is inherited by default and BOTH shell and child
+ * hold it; "whoever is blocked reading the console" has no target precisely when
+ * you want one, because a compute-bound child isn't reading stdin.
+ *
+ * Only a HANDLE is accepted, never a pid: you can only point ^C at a child you
+ * spawned. The slot itself is global (there is one console) and last-writer-wins
+ * -- a single-user concession of the same class as sys_proc_kill's ambient
+ * authority, and stated as such rather than dressed up. */
+static int64_t sys_console_interrupt_route(struct regs *r) {
+    int handle = (int)r->rdi;
+
+    if (handle < 0) {
+        keyboard_set_interrupt_target(0);   /* reclaim: ^C is a byte again */
+        return 0;
+    }
+
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, handle, &pid);
+    if (rc != 0) {
+        return rc;   // -EMBK_EINVAL: not a child of yours
+    }
+
+    keyboard_set_interrupt_target(pid);
     return 0;
 }
 
@@ -538,7 +927,20 @@ static int64_t sys_thread_exit(struct regs *r) {
  * or underflowing below USER_HEAP_VA_BASE). */
 static int64_t sys_sbrk(struct regs *r) {
     int64_t increment = (int64_t)r->rdi;
-    return process_sbrk(current_process, increment);
+    /* _atomic, NOT the bare `current_process` macro: this drives a real
+     * address-space mutation. With the plain macro a preempt-and-migrate
+     * between this_cpu() and the deref made process_sbrk grow ANOTHER
+     * process's heap -- mapping the pages into their pml4 and returning
+     * THEIR break to our malloc, which then wrote to memory unmapped in our
+     * address space. Observed live: shell.elf faulting in
+     * malloc_extend_top, write to heap+1.1MB (the other process's
+     * high-water mark), not-present, user-mode. See process.h. */
+    struct process *proc = current_process_atomic();
+    if (!proc) {
+        return -EMBK_ENOMEM;   /* no process context -> no heap to grow;
+                                * ENOMEM is what sbrk's contract expects */
+    }
+    return process_sbrk(proc, increment);
 }
 
 /* fstat(fd, out_stat) -> 0, or -errno. The fd-based companion to sys_stat's
@@ -557,6 +959,8 @@ static int64_t sys_fstat(struct regs *r) {
     struct vfs_stat *user_out = (struct vfs_stat *)r->rsi;
 
     struct vfs_stat st;
+    memset(&st, 0, sizeof(st));   /* fields an fs doesn't track (mtime on
+                                   * FAT32/epfs) must read 0, not stack junk */
     int rc = vfs_fd_fstat(fd, &st);
     if (rc != EMBK_OK) {
         return rc;
@@ -1072,6 +1476,20 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_win_resize   48
 #define SYS_pipe         49
 #define SYS_handle_close 50
+#define SYS_fd_install_obj 51
+#define SYS_fd_avail     52
+#define SYS_unlink       53
+#define SYS_mkdir        54
+#define SYS_proc_list    55
+#define SYS_proc_kill    56
+#define SYS_rmdir        57
+#define SYS_set_fs_base  58
+#define SYS_cancel       59
+#define SYS_cancelled    60
+#define SYS_console_interrupt_route 61
+#define SYS_rename       62
+#define SYS_ftruncate    63
+#define SYS_chmod        64
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1125,6 +1543,20 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_resize]   = sys_win_resize,
     [SYS_pipe]         = sys_pipe,
     [SYS_handle_close] = sys_handle_close,
+    [SYS_fd_install_obj] = sys_fd_install_obj,
+    [SYS_fd_avail]     = sys_fd_avail,
+    [SYS_unlink]       = sys_unlink,
+    [SYS_mkdir]        = sys_mkdir,
+    [SYS_proc_list]    = sys_proc_list,
+    [SYS_proc_kill]    = sys_proc_kill,
+    [SYS_rmdir]        = sys_rmdir,
+    [SYS_set_fs_base]  = sys_set_fs_base,
+    [SYS_cancel]       = sys_cancel,
+    [SYS_cancelled]    = sys_cancelled,
+    [SYS_console_interrupt_route] = sys_console_interrupt_route,
+    [SYS_rename]       = sys_rename,
+    [SYS_ftruncate]    = sys_ftruncate,
+    [SYS_chmod]        = sys_chmod,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

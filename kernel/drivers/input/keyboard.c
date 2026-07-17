@@ -3,6 +3,7 @@
 #include "include/io.h"
 #include "drivers/char/serial.h"
 #include "process/process.h"
+#include "include/errno.h"
 
 
 #include <stdint.h>
@@ -28,6 +29,26 @@ static const char scan_to_ascii[128] = {
     '\'','`',  0,  '\\','z', 'x', 'c', 'v', 'b', 'n',    // 0x28-0x31 (2A=LeftShift)
     'm', ',', '.', '/', 0,   '*', 0,   ' ', 0,   0,      // 0x32-0x3B (36=RightShift, 38=LeftAlt)
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x3C-0x45 (F-keys, NumLock, ScrollLock)
+    0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,      // 0x46-0x4F (keypad)
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x50-0x59
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x5A-0x63
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x64-0x6D
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x6E-0x77
+    0,   0,   0,   0,   0,   0,   0,   0,                // 0x78-0x7F
+};
+
+/* SHIFTED layer, US QWERTY. Existed as a gap until the pipeline shell made
+ * it absurd: a shell whose core operator is '|' on an OS whose keyboard
+ * could not TYPE '|' (shift produced the unshifted char -- no uppercase, no
+ * !@#$, no quotes-vs-apostrophe either). Same indexing as scan_to_ascii. */
+static const char scan_to_ascii_shift[128] = {
+    0,   0x1B, '!', '@', '#', '$', '%', '^', '&', '*',   // 0x00-0x09
+    '(', ')', '_', '+', '\b','\t','Q', 'W', 'E', 'R',    // 0x0A-0x13
+    'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0,     // 0x14-0x1D
+    'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':',    // 0x1E-0x27
+    '"', '~',  0,  '|', 'Z', 'X', 'C', 'V', 'B', 'N',    // 0x28-0x31
+    'M', '<', '>', '?', 0,   '*', 0,   ' ', 0,   0,      // 0x32-0x3B
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x3C-0x45
     0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,      // 0x46-0x4F (keypad)
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x50-0x59
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x5A-0x63
@@ -73,28 +94,29 @@ static int buffer_pop(char *c) {
 static void keyboard_deliver(char c);
 
 
-/* Extended (0xE0-prefixed) navigation keys, delivered to userspace as private
- * single-byte control codes the UI toolkit's text editor interprets (see
- * EMBK_KEY_* in user/lib/embk.h -- kept in lockstep). Arrows/Home/End/Delete
- * so a text field can move its cursor without an escape-sequence protocol. */
-#define EK_LEFT  0x11
-#define EK_RIGHT 0x12
-#define EK_UP    0x13
-#define EK_DOWN  0x14
-#define EK_HOME  0x02
-#define EK_END   0x05
-#define EK_DEL   0x7F
+/* The EK_* navigation codes now live in keyboard.h -- they are a contract
+ * shared with the USB HID driver (usb/xhci.c) and userland (EMBK_KEY_*), not
+ * a PS/2 private. Keeping them here is what left the USB path with no
+ * navigation keys at all. */
 
 static void keyboard_handler(void) {
     uint8_t scancode = inb(KBD_DATA_PORT);
-    static int extended = 0;   /* the previous byte was the 0xE0 prefix */
+    static int extended = 0;     /* the previous byte was the 0xE0 prefix */
+    static int shift_down = 0;   /* either shift key currently held */
+    static int ctrl_down  = 0;   /* either control key currently held */
 
     if (scancode == 0xE0) { extended = 1; return; }   /* prefix: the next byte is an extended key */
 
-    if (scancode & 0x80) { extended = 0; return; }    /* key release: ignore (and clear prefix) */
-
     if (extended) {
         extended = 0;
+        /* Right Ctrl arrives as 0xE0,0x1D make / 0xE0,0x9D break. Track it the
+         * same as left Ctrl so ^C works from either key. */
+        if (scancode == 0x1D) { ctrl_down = 1; return; }
+        if (scancode == 0x9D) { ctrl_down = 0; return; }
+        /* Extended keys -- an 0xE0-prefixed 0x2A/0xAA is a FAKE shift
+         * (set-1 pads them around nav keys); it must never touch the real
+         * shift state, and it falls through the switch to be ignored. */
+        if (scancode & 0x80) return;   /* extended release (incl. fake shift breaks) */
         char c = 0;
         switch (scancode) {
             case 0x4B: c = EK_LEFT;  break;
@@ -104,14 +126,35 @@ static void keyboard_handler(void) {
             case 0x47: c = EK_HOME;  break;
             case 0x4F: c = EK_END;   break;
             case 0x53: c = EK_DEL;   break;
+            case 0x49: c = EK_PGUP;  break;
+            case 0x51: c = EK_PGDN;  break;
             default: break;
         }
         if (c) keyboard_deliver(c);
         return;
     }
 
-    char ascii = scan_to_ascii[scancode];
-    if (ascii) keyboard_deliver(ascii);
+    /* Shift and Ctrl make/break -- the releases we must NOT ignore. Left Ctrl is
+     * 0x1D make / 0x9D break. (Right Ctrl is handled in the extended block above.) */
+    if (scancode == 0x2A || scancode == 0x36) { shift_down = 1; return; }
+    if (scancode == 0xAA || scancode == 0xB6) { shift_down = 0; return; }
+    if (scancode == 0x1D) { ctrl_down = 1; return; }
+    if (scancode == 0x9D) { ctrl_down = 0; return; }
+
+    if (scancode & 0x80) return;                      /* other releases: ignore */
+
+    char ascii = (shift_down ? scan_to_ascii_shift : scan_to_ascii)[scancode];
+    if (!ascii) return;
+
+    /* Ctrl + letter -> the C0 control code (Ctrl-C = 0x03, Ctrl-D = 0x04, ...).
+     * This is what actually MAKES ^C possible: without it the driver produced a
+     * plain 'c' and keyboard_deliver()'s 0x03 branch could never fire. Gate on a
+     * real letter so Ctrl+digit / Ctrl+symbol pass through unchanged rather than
+     * becoming stray control bytes. */
+    if (ctrl_down && ascii >= 'a' && ascii <= 'z') ascii = ascii & 0x1f;
+    else if (ctrl_down && ascii >= 'A' && ascii <= 'Z') ascii = ascii & 0x1f;
+
+    keyboard_deliver(ascii);
 }
 
 
@@ -147,7 +190,41 @@ int keyboard_has_char(void) {
  * cannot land while a thread holds it -- there is no self-deadlock path.
  * The critical section is deliberately tiny (one ring push + one state
  * flip); the wake only marks the thread READY, it does not switch to it. */
+/* Where ^C goes. See docs/INTERRUPTION.md.
+ *
+ * ONE slot, because there is ONE console. This is NOT an inferred "foreground
+ * process": no session, no process group, no walking a tree. A process that
+ * holds the console DELEGATES its interrupts to a child it holds a handle for
+ * (sys_console_interrupt_route), exactly as it delegates fds via file-actions
+ * and the environment via envp. 0 = nobody routed anything, and then ^C is just
+ * a byte -- a true and predictable statement about a system where no one asked
+ * to be interrupted.
+ *
+ * Single-user concession, stated plainly: the slot is global and last-writer-
+ * wins, the same class of concession as embk_proc_kill's ambient authority. */
+static volatile uint32_t g_console_int_target;   /* pid, or 0 for none */
+
+void keyboard_set_interrupt_target(uint32_t pid) { g_console_int_target = pid; }
+uint32_t keyboard_get_interrupt_target(void) { return g_console_int_target; }
+
 static void keyboard_deliver(char c) {
+    /* ^C: cancel the routed target instead of delivering a byte.
+     *
+     * DELIBERATELY BEFORE sched_lock(): process_cancel() takes g_sched_lock
+     * itself, and this runs in IRQ context -- taking it twice would self-
+     * deadlock. Safe to take it here at all only because of the standing
+     * invariant (see below): g_sched_lock is never held with interrupts on, so
+     * an IRQ cannot land while some thread holds it, and it is free right now. */
+    if (c == 0x03) {
+        uint32_t target = g_console_int_target;
+        if (target) {
+            process_cancel(target);
+            return;         /* consumed: ^C is an interruption, not input */
+        }
+        /* Nobody routed: fall through and hand ^C over as an ordinary byte
+         * rather than silently swallowing a keystroke. */
+    }
+
     sched_lock();
     buffer_push(c);   /* the kernel shell will read it */
     wait_queue_wake_one(&kbd_wait_queue);
@@ -184,8 +261,30 @@ char keyboard_getchar_blocking(void) {
     }
     buffer_pop(&c);                                          /* still locked -> atomic with the check */
     sched_unlock();
-    
+
     return c;
+}
+
+/* Like keyboard_getchar_blocking(), but honours cancellation (docs/INTERRUPTION.md).
+ * Returns EMBK_OK with *out set, or -EMBK_ECANCELED if this process was cancelled
+ * while (or before) waiting. The plain version stays for callers with no process
+ * context -- the kernel shell -- where cancellation has no meaning.
+ *
+ * Ordering matches the pipe path: a buffered key is a real result and is
+ * returned even if the process is also cancelled; only BLOCKING is refused. */
+int keyboard_getchar_blocking_cancelable(char *out) {
+    sched_lock();
+    while (buf_head == buf_tail) {
+        if (current_process && current_process->cancelled) {
+            sched_unlock();
+            return -EMBK_ECANCELED;
+        }
+        sched_block_current_locked(&kbd_wait_queue);
+        sched_lock();
+    }
+    buffer_pop(out);
+    sched_unlock();
+    return EMBK_OK;
 }
 
 // Inject a character as if it came from a keyboard press.

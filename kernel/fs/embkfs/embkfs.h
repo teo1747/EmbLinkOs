@@ -394,7 +394,80 @@ struct embkfs_volume {
     uint64_t  rcache_gen;
     uint64_t  rcache_len;
     uint8_t  *rcache_buf;
+
+    /* Single-object EXTENT-MAP cache: the collected+validated extref array of
+     * the most-recently ranged-over object. Same (oid, generation) keying as
+     * rcache above, and needed for the same reason one layer down.
+     *
+     * rcache only covers objects <= EMBKFS_RCACHE_MAX; a BIGGER file falls back
+     * to embkfs_read_object_range(), which had to count + collect + validate the
+     * whole extent map on EVERY read (two B-tree scans + a kmalloc each time).
+     * With thousands of extents that dominated, so skipping the prefix decode
+     * alone bought nothing measurable.
+     *
+     * This is deliberately the EXTENT MAP, not the data: ~32 B per extent, so a
+     * 10 MB file costs ~100 KB here versus 10 MB in rcache -- which is exactly
+     * why raising RCACHE_MAX is the wrong lever. */
+    uint64_t  ecache_oid;
+    uint64_t  ecache_gen;
+    uint32_t  ecache_n;
+    struct embk_extref *ecache_ext;
+
+    /* One byte per extent: "this extent's checksum has already been verified in
+     * this generation". THE point of it: mkfs writes ONE EXTENT PER FILE, and an
+     * extent's checksum covers the WHOLE extent -- so a partial read had to read
+     * and CRC every block of a 10 MB extent just to hand back 8 KB, making reads
+     * O(filesize) EACH. First read still verifies in full (integrity unchanged);
+     * later reads in the same generation trust that and touch only the blocks
+     * they actually need. Freed/rebuilt with ecache_ext, keyed the same way, so a
+     * write commit's generation bump forces re-verification. */
+    uint8_t  *ecache_verified;
+
+    /* Single-object INODE cache. Third and last of the (oid, generation)-keyed
+     * caches, and the one that mattered most per-read: locating an inode is a
+     * B-tree descent that READS BLOCKS, and every read did TWO of them --
+     * read_object_at's size probe plus read_object_range's own lookup. Measured:
+     * ~3 device reads per 8 KB chunk when only ONE is the actual data block.
+     * A single 128-byte struct, so it costs nothing next to rcache's megabytes. */
+    uint64_t  icache_oid;
+    uint64_t  icache_gen;
+    bool      icache_valid;
+    struct embk_inode_item icache_ino;
+
+    /* Windowed read-ahead cache. rcache is all-or-nothing: it caches the WHOLE
+     * object, so `total <= EMBKFS_RCACHE_MAX` is a cliff -- a file one byte over
+     * the cap gets NO caching at all and every read goes to the device.
+     * python314.zip (10.3 MB vs an 8 MB cap) lands just past it, which is why
+     * CPython's startup reads were served entirely from disk.
+     *
+     * This caches a fixed-size WINDOW instead, so cost is bounded for any file
+     * size -- including the multi-GB case the whole-object cache could never
+     * serve. It is also the only way past the measured floor: one device request
+     * costs ~2.7ms regardless of size, so an 8 KB read can never beat
+     * 8KB/2.7ms; reading a window ahead amortises one request over many reads.
+     * Keyed (oid, generation) like the others, plus the window offset. */
+    uint8_t  *wcache_buf;   /* EMBKFS_WCACHE_WIN bytes, or NULL when unallocated */
+    uint64_t  wcache_oid;
+    uint64_t  wcache_gen;
+    uint64_t  wcache_off;   /* window-aligned file offset of wcache_buf[0] */
+    uint64_t  wcache_len;   /* valid bytes; < WIN only when the window hits EOF */
 };
+
+/* Where EMBKFS's own block reads go, split by cause. Capping extent size made the
+ * isolated read path better (443% -> 101% amplification) but raised the WHOLE
+ * test's device reads above where they started -- more extents means more B-tree
+ * items, and both embkfs_count_extents() and embkfs_collect_extents() walk every
+ * leaf holding an object's extents, reading a node per visit. That is a STORY,
+ * and stories have been wrong six times in this rebuild; these counters decide
+ * it. See `test posix` / `test ioperf`. */
+struct embkfs_stat {
+    uint64_t node_reads;     /* embkfs_read_node calls = B-tree blocks read */
+    uint64_t prefix_calls;   /* read_object_prefix: collects extents EVERY call */
+    uint64_t ecache_hit;
+    uint64_t ecache_miss;    /* each miss = count_extents + collect_extents */
+};
+void embkfs_stat_reset(void);
+void embkfs_stat_get(struct embkfs_stat *out);
 
 
 /* COW rebuild helpers used by the metadata update path. */
@@ -556,6 +629,11 @@ int embkfs_rename_name(struct embkfs_volume *vol,
                        uint64_t new_dir_oid, const char *new_name);
 int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                        const char *old_path, const char *new_path);
+/* Set an object's PERMISSION bits (file-type bits are preserved from the
+ * existing inode; ctime moves, mtime does not). Real: inodes have always had a
+ * mode, there was just no road here from userspace. */
+int embkfs_chmod_object(struct embkfs_volume *vol, uint64_t oid, uint32_t mode);
+
 int embkfs_link_name(struct embkfs_volume *vol, uint64_t target_oid,
                      uint64_t new_dir_oid, const char *new_name);
 int embkfs_link_path(struct embkfs_volume *vol, uint64_t start_dir_oid,

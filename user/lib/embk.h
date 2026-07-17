@@ -87,11 +87,13 @@ struct embk_dirent {
     char     name[59];          /* NUL-terminated (truncated if longer) */
 };
 
-/* File metadata from embk_stat()/embk_fstat() (kernel struct vfs_stat). */
+/* File metadata from embk_stat()/embk_fstat() (kernel struct vfs_stat,
+ * mirrored FIELD-FOR-FIELD -- the kernel copies it raw; keep positions). */
 struct embk_stat {
     uint8_t  type;              /* EMBK_DT_* */
     uint32_t mode;              /* POSIX-shaped st_mode */
     uint64_t size;              /* logical size in bytes */
+    uint64_t mtime;             /* last-modified, seconds since epoch; 0 = untracked */
     uint64_t nlink;             /* hard-link count */
 };
 
@@ -122,6 +124,55 @@ static inline int embk_pipe(int out_handles[2]) {
  * installing ends into children, close YOUR copies or the reader hangs. */
 static inline int embk_close_handle(int handle) {
     return (int)embk_syscall1(EMBK_SYS_handle_close, handle);
+}
+/* Install a pipe-end handle into the CALLER's OWN fd table at target_fd
+ * (the self-install half of INSTALL_OBJ -- how the shell turns its read
+ * handle of a pipeline's output into an fd it can read()). COPY semantics:
+ * the handle stays alive; embk_close_handle it separately. Returns the fd. */
+static inline int embk_fd_install_obj(int handle, int target_fd) {
+    return (int)embk_syscall2(EMBK_SYS_fd_install_obj, handle, target_fd);
+}
+/* Bytes readable from fd RIGHT NOW without blocking (0 = nothing yet, NOT
+ * EOF), or -EMBK_*. Poll a pipe from a render loop: avail > 0 guarantees
+ * the next read() returns immediately. */
+static inline int64_t embk_fd_avail(int fd) {
+    return embk_syscall1(EMBK_SYS_fd_avail, fd);
+}
+/* Remove a file (the shell's rm). 0 or -EMBK_*. */
+static inline int embk_unlink(const char *path) {
+    return (int)embk_syscall1(EMBK_SYS_unlink, (int64_t)(intptr_t)path);
+}
+/* Create a directory (the shell's mkdir). 0 or -EMBK_*. */
+static inline int embk_mkdir(const char *path) {
+    return (int)embk_syscall1(EMBK_SYS_mkdir, (int64_t)(intptr_t)path);
+}
+/* Remove an EMPTY directory (the shell's rmdir; the fs refuses non-empty,
+ * never recurses). 0 or -EMBK_*. */
+static inline int embk_rmdir(const char *path) {
+    return (int)embk_syscall1(EMBK_SYS_rmdir, (int64_t)(intptr_t)path);
+}
+
+/* One `ps` row. Mirrors the kernel's struct process_info (process.h)
+ * FIELD-FOR-FIELD -- sys_proc_list copies it raw; grow both together.
+ * state: 0 UNUSED, 1 READY, 2 RUNNING, 3 BLOCKED, 4 ZOMBIE. */
+struct embk_proc_info {
+    uint32_t      pid;
+    uint32_t      parent_pid;   /* 0 if none */
+    int           state;        /* enum process_state's values */
+    uint8_t       priority;
+    int           exit_code;    /* meaningful only for ZOMBIE */
+    unsigned char is_kthread;
+};
+/* Snapshot every live process (the shell's ps). Returns the count written
+ * (<= max), or -EMBK_*. */
+static inline int embk_proc_list(struct embk_proc_info *out, int max) {
+    return (int)embk_syscall2(EMBK_SYS_proc_list, (int64_t)(intptr_t)out, max);
+}
+/* Kill by PID (the shell's kill). Unlike embk_kill (handle-scoped to your
+ * own children), this is the single-user OS's ambient process-manager
+ * authority. 0, or -EMBK_ENOENT if no such live pid. */
+static inline int embk_proc_kill(uint32_t pid) {
+    return (int)embk_syscall1(EMBK_SYS_proc_kill, (int64_t)pid);
 }
 static inline int64_t embk_lseek(int fd, int64_t offset, int whence) {
     return embk_syscall3(EMBK_SYS_lseek, fd, offset, whence);
@@ -157,22 +208,45 @@ static inline int64_t embk_sbrk(int64_t incr) {
 /* can't express, and the reason this SDK exists.                         */
 /* ==================================================================== */
 
-/* Launch `path` as a new process. `argv` is NULL-terminated (argv[0] is
- * conventionally the program name); argc is counted here so callers never
- * touch the raw ABI. `actions`/`n_actions` pre-open files onto specific fds
- * in the child before it runs (may be NULL/0). Returns an opaque per-caller
- * HANDLE (not a raw pid -- capability-scoped, only this process can name the
- * child via embk_wait/embk_kill), or -EMBK_*. */
-static inline int64_t embk_spawn(const char *path, char *const argv[],
-                                 const struct embk_spawn_file_action *actions,
-                                 int n_actions) {
+/* Launch `path` as a new process WITH an explicit environment.
+ *
+ * `argv` is NULL-terminated (argv[0] is conventionally the program name); argc
+ * is counted here so callers never touch the raw ABI. `actions`/`n_actions`
+ * pre-open files onto specific fds in the child before it runs (may be NULL/0).
+ *
+ * `envp` is a NULL-terminated array of "KEY=VALUE", or **NULL to give the child
+ * NO environment** -- which is the default and an honest one. THE CHILD INHERITS
+ * NOTHING: unlike fork()+exec(), where the environment tags along whether or not
+ * anyone chose to pass it, here a variable reaches a child only because a parent
+ * named it. That is the same rule as file-actions and obj-handles. If you want a
+ * child to see your own environment, pass `environ` explicitly -- and that is
+ * the point: it is a decision, visible at the call site.
+ *
+ * Returns an opaque per-caller HANDLE (not a raw pid -- capability-scoped, only
+ * this process can name the child via embk_wait/embk_kill), or -EMBK_*.
+ * Over the kernel's SPAWN_ENVP_MAX/SPAWN_ENVP_BYTES_MAX budget -> -EMBK_E2BIG
+ * (rejected, never silently truncated). */
+static inline int64_t embk_spawn_env(const char *path, char *const argv[],
+                                     char *const envp[],
+                                     const struct embk_spawn_file_action *actions,
+                                     int n_actions) {
     int argc = 0;
     if (argv) {
         while (argv[argc]) argc++;
     }
-    return embk_syscall5(EMBK_SYS_spawn, (int64_t)(intptr_t)path,
+    return embk_syscall6(EMBK_SYS_spawn, (int64_t)(intptr_t)path,
                          (int64_t)(intptr_t)argv, argc,
-                         (int64_t)(intptr_t)actions, n_actions);
+                         (int64_t)(intptr_t)actions, n_actions,
+                         (int64_t)(intptr_t)envp);
+}
+
+/* embk_spawn_env() with NO environment for the child. This is the plain spawn:
+ * every existing caller keeps its exact behaviour, because "no environment" is
+ * what they always got. */
+static inline int64_t embk_spawn(const char *path, char *const argv[],
+                                 const struct embk_spawn_file_action *actions,
+                                 int n_actions) {
+    return embk_spawn_env(path, argv, (char *const *)0, actions, n_actions);
 }
 
 /* Block until the child named by `handle` exits; returns its exit code (or
@@ -185,6 +259,76 @@ static inline int64_t embk_wait(int handle) {
  * for a following embk_wait() to collect the exit status. */
 static inline int64_t embk_kill(int handle) {
     return embk_syscall1(EMBK_SYS_kill, handle);
+}
+
+/* Ask the child named by `handle` to STOP -- politely. See docs/INTERRUPTION.md.
+ *
+ * The child's blocking syscalls start failing -EMBK_ECANCELED, so it wakes out of
+ * whatever it was waiting on and can unwind, clean up, and exit through error
+ * paths it already has. NO handler runs and nothing is injected into its control
+ * flow: it learns at a syscall boundary, or by calling embk_cancelled().
+ *
+ * Handle-scoped like embk_kill: you may only cancel a child you spawned. There
+ * is no cancel-by-pid, deliberately -- that would be ambient authority over
+ * something you were never handed.
+ *
+ * ⚠️ This may be IGNORED FOREVER. A child that never blocks and never polls will
+ * not notice. Cancellation is a request; embk_kill() is the answer when the
+ * request is declined, and deciding how long to wait is YOUR policy. The pairing
+ * is SIGTERM-then-SIGKILL, minus the ambient authority.
+ *
+ * Cancelling an already-exited child succeeds (its end state already holds). */
+static inline int64_t embk_cancel(int handle) {
+    return embk_syscall1(EMBK_SYS_cancel, handle);
+}
+
+/* 1 if THIS process has been cancelled, 0 if not.
+ *
+ * For compute loops that make no syscalls -- with nothing injected, a process
+ * that never blocks would otherwise never find out. Reading does NOT clear it
+ * (the flag is sticky), so cleanup that itself blocks still sees ECANCELED
+ * rather than hanging on a flag that cleared itself.
+ *
+ * The -1 is LOAD-BEARING: the kernel reads the first argument as
+ * handle-or-minus-one (see embk_child_cancelled). A syscall0 here would hand it
+ * whatever garbage sat in rdi -- occasionally a valid handle. */
+static inline int64_t embk_cancelled(void) {
+    return embk_syscall1(EMBK_SYS_cancelled, -1);
+}
+
+/* 1 if the CHILD named by spawn handle `handle` has been cancelled, 0 if not,
+ * -EMBK_EINVAL if the handle names nothing of yours.
+ *
+ * The escalation primitive (docs/INTERRUPTION.md §4.3). A parent that delegated
+ * ^C to a child never sees the keystroke -- the kernel consumed it -- so this is
+ * how it starts the grace clock: cancelled + still alive + grace expired =>
+ * embk_kill(). Without it, "cancelled but declining" is indistinguishable from
+ * "healthy but slow", and a parent would either never escalate or kill innocent
+ * long-running children. Handle-scoped, and strictly weaker than embk_cancel. */
+static inline int64_t embk_child_cancelled(int handle) {
+    return embk_syscall1(EMBK_SYS_cancelled, handle);
+}
+
+/* Route console Ctrl-C to the child named by `handle`; pass -1 to reclaim it.
+ * See docs/INTERRUPTION.md.
+ *
+ * While routed, a ^C at the keyboard CANCELS that child (embk_cancel semantics)
+ * instead of arriving as a byte. When nothing is routed, ^C is just an ordinary
+ * 0x03 input character.
+ *
+ * This is a DELEGATION -- there is no "foreground process" on EmbLink, no
+ * session and no process group. A shell that runs a command hands over the right
+ * to be interrupted, and takes it back when the child exits. **Reclaim it**, or
+ * ^C keeps pointing at a pid that may already be gone (harmless -- cancelling a
+ * corpse succeeds -- but then YOUR ^C does nothing, which looks like a bug).
+ *
+ * Only a handle you hold is accepted, so you cannot aim ^C at a process you were
+ * never given. The slot is global (one console) and last-writer-wins: a
+ * single-user concession, same class as embk_proc_kill.
+ *
+ * Cancellation may be declined -- pair it with embk_kill() as the backstop. */
+static inline int64_t embk_console_interrupt_route(int handle) {
+    return embk_syscall1(EMBK_SYS_console_interrupt_route, handle);
 }
 
 static inline int64_t embk_getpid(void) {
@@ -323,6 +467,8 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_KEY_HOME   0x02
 #define EMBK_KEY_END    0x05
 #define EMBK_KEY_DEL    0x7F
+#define EMBK_KEY_PGUP   0x0E
+#define EMBK_KEY_PGDN   0x0F
 struct embk_ui_input { int32_t x, y; uint32_t buttons; int32_t wheel; };
 static inline int embk_ui_input(struct embk_ui_input *out) {
     return (int)embk_syscall1(EMBK_SYS_ui_input, (int64_t)(intptr_t)out);

@@ -4,6 +4,9 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
+#include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "drivers/timer/hpet.h"
+#include "drivers/timer/timer.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "arch/x86_64/cpu/rwlock.h"
@@ -300,6 +303,17 @@ static void selftests_print_commands(void)
     kprintf("  test ring3\n");
     kprintf("  test ring3 threads\n");
     kprintf("  test pipe\n");
+    kprintf("  test shell\n");
+    kprintf("  test extern\n");
+    kprintf("  test cxx\n");
+    kprintf("  test posix\n");
+    kprintf("  test ioperf\n");
+    kprintf("  test env\n");
+    kprintf("  test ctrlc\n");
+    kprintf("  test ctrlc2\n");
+    kprintf("  test git\n");
+    kprintf("  test git repo\n");
+    kprintf("  test python\n");
     kprintf("  test surface\n");
     kprintf("  test channel\n");
     kprintf("  test compositor\n");
@@ -735,6 +749,444 @@ int selftests_handle_command(const char *cmd)
                 eof_ok ? "ok" : "FAIL",
                 freed_ok ? "yes" : "NO",
                 ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* The structured shell, end to end ON the OS: spawn /shell.elf -c "<line>"
+     * three times (its stdio is console-inherited, so results land on serial)
+     * and assert the exit codes: expression evaluation, a REAL ls pipeline
+     * over EMBKFS through where/sort-by/select, and the error path. The pure
+     * pipeline is host-tested (make shell-test); THIS proves the OS half:
+     * spawn, console fds, readdir/stat, and the exit-status plumbing. */
+    if (strcmp(cmd, "test shell") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shell: VFS not registered (need /shell.elf)\n");
+            return 1;
+        }
+        int ok = 1;
+
+        /* env: the shell must SHOW the environment it was handed, and `env set`
+         * must reach the same `environ` it passes to the commands it spawns.
+         * Spawned WITH an environment here, so the rendered table proves the
+         * whole chain: process_create_env -> RDX -> crt0 -> environ -> builtin. */
+        /* `|`, not `;` -- the lexer has no statement separator. Builtins run
+         * IN-PROCESS, so the set and the listing share one `environ`. */
+        char *aenv[] = { "/shell.elf", "-c", "env set EMBK_SET fromshell | env", NULL };
+        char *senv[] = { "EMBK_ENV_TEST=shell-ok", "HOME=/", NULL };
+        int pe = process_create_env("/shell.elf", aenv, 3, senv, NULL, 0);
+        int ce = pe >= 0 ? process_wait((uint32_t)pe) : -1;
+        if (pe < 0 || ce != 0) ok = 0;
+
+        char *a1[] = { "/shell.elf", "-c", "echo 1mb + 512kb", NULL };
+        int p1 = process_create("/shell.elf", a1, 3, NULL, 0);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        if (p1 < 0 || c1 != 0) ok = 0;
+
+        char *a2[] = { "/shell.elf", "-c",
+                       "ls / | where size > 100kb | sort-by size | select name size", NULL };
+        int p2 = process_create("/shell.elf", a2, 3, NULL, 0);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        if (p2 < 0 || c2 != 0) ok = 0;
+
+        char *a3[] = { "/shell.elf", "-c", "echo $nope", NULL };
+        int p3 = process_create("/shell.elf", a3, 3, NULL, 0);
+        int c3 = p3 >= 0 ? process_wait((uint32_t)p3) : -1;
+        if (p3 < 0 || c3 != 1) ok = 0;   /* the error path must exit 1 */
+
+        /* the standard-command batch, one line, RE-RUNNABLE (rm cleans up
+         * what save created; no mkdir -- there's no rmdir to undo it):
+         * save -> cat -> wc -> get -> rm -> ps -> count, with a cd/pwd
+         * warm-up. Exercises the cwd machinery + file round-trip + proc
+         * listing in a single shell run. */
+        char *a4[] = { "/shell.elf", "-c",
+                       "cd / | echo \"alpha beta\" | save st-f.txt | cat /st-f.txt "
+                       "| wc | get words | rm st-f.txt | mkdir st-d | rmdir st-d "
+                       "| ps | count", NULL };
+        int p4 = process_create("/shell.elf", a4, 3, NULL, 0);
+        int c4 = p4 >= 0 ? process_wait((uint32_t)p4) : -1;
+        if (p4 < 0 || c4 != 0) ok = 0;
+
+        kprintf("\n[cmd] test shell: expr rc=%d; ls-pipeline rc=%d; error-path rc=%d; "
+                "cmd-batch rc=%d -> %s\n",
+                c1, c2, c3, c4, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* C++ on the OS. cxxdemo.elf self-checks the things that actually break
+     * on a fresh C++ port -- global ctors + their order, new/delete/new[],
+     * templates, and a function-local static (which needs libsupc++'s
+     * __cxa_guard_acquire) -- and exits 0 only if every one passed, so this
+     * is just "spawn it and read the code". Its output lands on the console
+     * via inherited stdio, so a failure names itself.
+     *
+     * ABSENT-TOOLCHAIN CASE IS NOT A FAILURE: cxxdemo.elf is only built when
+     * a C++ cross compiler exists (Makefile's HAVE_CXX gate), so report SKIP
+     * rather than FAIL when it isn't on the image -- a C-only checkout is a
+     * supported configuration, not a broken one. */
+    if (strcmp(cmd, "test cxx") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test cxx: VFS not registered\n");
+            return 1;
+        }
+        struct vfs_stat st;
+        if (vfs_stat("/cxxdemo.elf", &st) != EMBK_OK) {
+            kprintf("\n[cmd] test cxx: SKIP -- /cxxdemo.elf not on the image "
+                    "(no C++ toolchain: see `make cxx-check`)\n");
+            return 1;
+        }
+        char *a[] = { "/cxxdemo.elf", NULL };
+        int pid = process_create("/cxxdemo.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test cxx: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* The POSIX layer in user/lib/syscalls.c. posixdemo.elf self-checks the
+     * things that break quietly rather than loudly: opendir()'s grow-and-retry
+     * loop against a >64-entry directory (the kernel's readdir truncates
+     * SILENTLY, so a missing retry loses files with no error anywhere), the
+     * d_type translation (native REG=1 vs DT_REG=8 -- a pass-through still
+     * "works" until it lies), the monotonic clock actually advancing, and that
+     * every call documented as ENOSYS really does refuse instead of returning a
+     * comfortable 0. Exits 0 only if all pass; its output reaches the console
+     * through inherited stdio, so a failure names itself.
+     *
+     * Unlike test cxx there is no toolchain gate: posixdemo.elf is plain C and
+     * is always on the image, so absence here IS a failure. */
+    /* Wall clock for the benchmark below. Same HPET conversion syscall.c's
+     * uptime_ms_now() uses; there is no kernel-wide uptime_ms() to borrow. */
+    #define IOPERF_MS() ({                                        \
+        uint64_t _pf = hpet_available() ? hpet_period_fs() : 0;   \
+        uint64_t _r;                                              \
+        if (_pf) {                                                \
+            uint64_t _tpms = 1000000000000ULL / _pf;              \
+            if (!_tpms) _tpms = 1;                                \
+            _r = hpet_read_counter() / _tpms;                     \
+        } else { _r = timer_get_ticks(); }                        \
+        _r; })
+
+    /* Isolated read benchmark. `test posix`'s blkstat brackets the WHOLE process
+     * -- the 70-directory dirent test and every small-file check land in the same
+     * counters as the 3 MB loop, so no number from it is attributable to the read
+     * path alone. That ambiguity has already cost several wrong conclusions about
+     * where the time goes. This reads ONE file the way CPython's zipimport does
+     * (8 KB sequential) with nothing else inside the bracket, and reports wall
+     * time next to device time so the two can be told apart. */
+    if (strcmp(cmd, "test ioperf") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test ioperf: VFS not registered\n");
+            return 1;
+        }
+        const char *path = "/python314.zip";
+        struct vfs_stat vst;
+        if (vfs_stat(path, &vst) != 0) {
+            kprintf("[ioperf] %s absent -- CPython not built; nothing to measure\n", path);
+            return 1;
+        }
+        static uint8_t rbuf[8192];
+        const uint64_t LIMIT = 3u * 1024u * 1024u;
+        struct embk_blkstat b0, b1;
+
+        /* Resolve ONCE and call the vnode's read op directly, because that is
+         * what the application path does: an fd holds a vnode. vfs_read() is a
+         * convenience wrapper that re-resolves the path on EVERY call, so
+         * benchmarking through it measures a directory walk per read -- a path no
+         * app takes, and worth 743% read amplification when first tried here. */
+        struct vnode vn;
+        if (vfs_resolve(path, &vn) != 0 || !vn.mnt || !vn.mnt->ops->read) {
+            kprintf("[ioperf] cannot resolve %s\n", path);
+            return 1;
+        }
+
+        embk_blkstat_reset();
+        embk_blkstat_get(&b0);
+        uint64_t w0 = IOPERF_MS();
+        uint64_t off = 0, sum = 0;
+        int rc = 0;
+        while (off < LIMIT) {
+            size_t got = 0;
+            rc = vn.mnt->ops->read(&vn, off, rbuf, sizeof rbuf, &got);
+            if (rc != 0 || got == 0) break;
+            /* Touch the bytes so the read can't be optimised into nothing and so
+             * a silently-empty buffer shows up as a suspicious checksum. */
+            for (size_t i = 0; i < got; i += 512) sum += rbuf[i];
+            off += got;
+        }
+        uint64_t w1 = IOPERF_MS();
+        embk_blkstat_get(&b1);
+
+        uint64_t wall = w1 - w0;
+        uint64_t nreq = b1.reads - b0.reads;
+        uint64_t nblk = b1.read_blocks - b0.read_blocks;
+        uint64_t nus  = b1.read_us - b0.read_us;
+        kprintf("[ioperf] rc=%d read %llu KB in %llu ms (%llu ms/MB), sum=%llu\n",
+                rc, (unsigned long long)(off / 1024), (unsigned long long)wall,
+                (unsigned long long)(off ? wall * 1048576ULL / off : 0),
+                (unsigned long long)sum);
+        kprintf("[ioperf] %llu requests, %llu KB from disk (%llu KB asked) = %llu%% amplification\n",
+                (unsigned long long)nreq, (unsigned long long)(nblk / 2),
+                (unsigned long long)(off / 1024),
+                (unsigned long long)(off ? (nblk / 2) * 100ULL / (off / 1024) : 0));
+        kprintf("[ioperf] %llu ms in dev->read (%llu%% of wall), %llu us/req, avg %llu blocks/req\n",
+                (unsigned long long)(nus / 1000),
+                (unsigned long long)(wall ? (nus / 1000) * 100ULL / wall : 0),
+                (unsigned long long)(nreq ? nus / nreq : 0),
+                (unsigned long long)(nreq ? nblk / nreq : 0));
+        return 1;
+    }
+
+    /* The same posixdemo.elf, but spawned WITH an explicit environment. Both
+     * halves matter: `test posix` proves a child given no environment reports
+     * getenv()==NULL honestly, and this proves an environment a parent DOES hand
+     * over arrives intact. EmbLink never inherits one -- see kernel spawn.h. */
+    if (strcmp(cmd, "test env") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test env: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/posixdemo.elf", NULL };
+        /* EMBK_EMPTY is set-but-empty on purpose: getenv() must return "" for it,
+         * not NULL -- "set to nothing" and "not set" are different answers. */
+        char *env[] = {
+            "EMBK_ENV_TEST=1",
+            "HOME=/",
+            "PATH=/",
+            "EMBK_EMPTY=",
+            NULL
+        };
+        int pid = process_create_env("/posixdemo.elf", a, 1, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test env: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* Console ^C routing, END TO END (docs/INTERRUPTION.md Phase 2). Spawns a
+     * userspace parent that routes ^C to a child blocked reading the console,
+     * then BLOCKS waiting for the harness to inject a real Ctrl+C through QMP
+     * `sendkey ctrl-c` -- the one half the kernel cannot fake from software
+     * (PS/2 IRQ -> Ctrl tracking -> 0x03 -> routed cancel). Without that
+     * keystroke this test HANGS, which is the correct failure mode: the child's
+     * console read genuinely never returns. Sentinel 42 = the parent saw every
+     * step hold. */
+    if (strcmp(cmd, "test ctrlc") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test ctrlc: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/init.elf", "ctrlc-parent", NULL };
+        int pid = process_create("/init.elf", a, 2, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test ctrlc: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 42) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* The ESCALATION half (docs/INTERRUPTION.md §4.3), against a child that
+     * DECLINES: the shell runs `/init.elf spin` (an embk_sleep_ms loop that
+     * never observes cancellation), the harness injects a real Ctrl+C, and the
+     * shell must cancel -> wait out its grace period -> embk_kill -> reap ->
+     * exit. Before the pump was made pollable the shell sat in a blocking pipe
+     * read for the child's whole life, so this test HUNG -- completion of the
+     * "[cmd]" line below IS the assertion. */
+    if (strcmp(cmd, "test ctrlc2") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test ctrlc2: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/shell.elf", "-c", "/init.elf spin", NULL };
+        int pid = process_create("/shell.elf", a, 3, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test ctrlc2: shell exit=%d -> %s (completion IS the pass)\n",
+                code, pid >= 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* git. `version` first, deliberately -- the same first question the CPython
+     * port asked with -c: does the binary initialise and reach its own code at
+     * all, before any repository work complicates the answer. */
+    if (strcmp(cmd, "test git") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test git: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/git.elf", "version", NULL };
+        char *env[] = { "HOME=/", NULL };
+        int pid = process_create_env("/git.elf", a, 2, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test git: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* The full git WORKFLOW: init -> config -> add -> commit -> log, a real
+     * repository at "/" (EmbLink has no per-process cwd -- chdir is an honest
+     * ENOSYS and getcwd()=="/" -- so the repo roots at the fs root rather than
+     * pretending -C works). Exercises everything the port added: /dev/null,
+     * rename (lockfiles!), unlink, ftruncate, mkdir trees, zlib objects.
+     * GIT_PAGER= (empty) because `log` would otherwise try to SPAWN a pager the
+     * moment it sees a console fd -- and exec is ENOSYS by design. */
+    if (strcmp(cmd, "test git repo") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test git repo: VFS not registered\n");
+            return 1;
+        }
+        char *env[] = { "HOME=/", "GIT_PAGER=", NULL };
+        int ok = 1;
+
+        /* A file worth committing, written kernel-side through the VFS. */
+        {
+            int fd = vfs_open("/README.md", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                static const char msg[] = "# EmbLinkOS\ngit works here.\n";
+                size_t w = 0;
+                vfs_fd_write(fd, msg, sizeof msg - 1, &w);
+                vfs_close(fd);
+            } else { kprintf("test git repo: README create failed\n"); ok = 0; }
+        }
+
+        struct { const char *what; char *argv[8]; int argc; } steps[] = {
+            { "init",   { "/git.elf", "init" }, 2 },
+            { "email",  { "/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
+            { "name",   { "/git.elf", "config", "user.name", "Motsou" }, 4 },
+            { "add",    { "/git.elf", "add", "README.md" }, 3 },
+            { "commit", { "/git.elf", "commit", "-m", "first commit on EmbLinkOS" }, 4 },
+            { "log",    { "/git.elf", "log", "--oneline" }, 3 },
+            { "status", { "/git.elf", "status" }, 2 },
+        };
+        for (unsigned i = 0; i < sizeof steps / sizeof steps[0] && ok; i++) {
+            int pid = process_create_env("/git.elf", steps[i].argv, steps[i].argc,
+                                         env, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            kprintf("[git %s] exit=%d\n", steps[i].what, code);
+            if (pid < 0 || code != 0) ok = 0;
+        }
+
+        kprintf("\n[cmd] test git repo: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test posix") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test posix: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/posixdemo.elf", NULL };
+        /* Bracket the run with the block-layer request counters. Only
+         * two numbers set throughput on this path (requests, and their average
+         * size), and this is the cheapest place to read them honestly. */
+        struct embk_blkstat bs0, bs1;
+        struct embkfs_stat es0, es1;
+        embk_blkstat_reset();
+        embkfs_stat_reset();
+        embk_blkstat_get(&bs0);
+        embkfs_stat_get(&es0);
+        int pid = process_create("/posixdemo.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        embk_blkstat_get(&bs1);
+        embkfs_stat_get(&es1);
+        uint64_t nreq = bs1.reads - bs0.reads;
+        uint64_t nblk = bs1.read_blocks - bs0.read_blocks;
+        uint64_t nus = bs1.read_us - bs0.read_us;
+        kprintf("[blkstat] %llu device reads, %llu blocks (%llu KB), avg %llu blocks/req\n",
+                (unsigned long long)nreq, (unsigned long long)nblk,
+                (unsigned long long)(nblk / 2), (unsigned long long)(nreq ? nblk / nreq : 0));
+        kprintf("[blkstat] %llu ms INSIDE dev->read, %llu us/req -- anything above\n"
+                "          this in the test's wall clock is NOT the disk\n",
+                (unsigned long long)(nus / 1000),
+                (unsigned long long)(nreq ? nus / nreq : 0));
+        kprintf("[embkfs]  %llu B-tree node reads, %llu prefix calls (most are\n"
+                "          want==0 size probes), ecache %llu hit / %llu miss\n",
+                (unsigned long long)(es1.node_reads - es0.node_reads),
+                (unsigned long long)(es1.prefix_calls - es0.prefix_calls),
+                (unsigned long long)(es1.ecache_hit - es0.ecache_hit),
+                (unsigned long long)(es1.ecache_miss - es0.ecache_miss));
+        kprintf("\n[cmd] test posix: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* CPython. `-c` rather than the REPL on purpose: the first question is
+     * simply whether the interpreter can INITIALISE (Py_Initialize walks the
+     * frozen importlib, sets up sys.path, opens stdio) and evaluate one
+     * expression -- no stdin, no terminal, no stdlib-on-disk needed, since
+     * importlib/zipimport are frozen into the binary. Anything it prints,
+     * including a startup error, reaches the console through inherited stdio.
+     *
+     * SKIP, not FAIL, when absent: python.elf only exists if the out-of-tree
+     * interpreter was built (Makefile's HAVE_PY gate), and a checkout without it
+     * is a supported configuration -- same rule as test cxx. */
+    if (strcmp(cmd, "test python") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test python: VFS not registered\n");
+            return 1;
+        }
+        struct vfs_stat st;
+        if (vfs_stat("/python.elf", &st) != EMBK_OK) {
+            kprintf("\n[cmd] test python: SKIP -- /python.elf not on the image "
+                    "(build it: /home/motsou/cross/configure-py-emblink.sh)\n");
+            return 1;
+        }
+        char *a[] = { "/python.elf", "-c", "print('hello from CPython on EmbLink')", NULL };
+        int pid = process_create("/python.elf", a, 3, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test python: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* The EXTERNAL pipeline contract, end to end: programs that are NOT
+     * builtins participating as stages. sysinfo.elf = producer (spawned
+     * with a pipe as its fd 3, emits one record frame); tally.elf =
+     * consumer (previous stage's value serialized into its fd 0, reads to
+     * EOF, re-emits). Exercises: extern spawn + INSTALL_OBJ + the shell's
+     * self-installed ends (SYS_fd_install_obj) + handle_close EOF + the
+     * sval fstat-based structured-in/out detection + wire round-trip
+     * ACROSS ADDRESS SPACES -- the machinery no builtin touches. */
+    if (strcmp(cmd, "test extern") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test extern: VFS not registered (need /shell.elf)\n");
+            return 1;
+        }
+        int ok = 1;
+
+        /* (1) producer alone: spawn, collect one frame, pretty-print */
+        char *a1[] = { "/shell.elf", "-c", "sysinfo", NULL };
+        int p1 = process_create("/shell.elf", a1, 3, NULL, 0);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        if (p1 < 0 || c1 != 0) ok = 0;
+
+        /* (2) producer into a builtin: the collected record flows on */
+        char *a2[] = { "/shell.elf", "-c", "sysinfo | get processes", NULL };
+        int p2 = process_create("/shell.elf", a2, 3, NULL, 0);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        if (p2 < 0 || c2 != 0) ok = 0;
+
+        /* (3) builtin into a CONSUMER external and back into a builtin:
+         * the full input path (serialize -> child fd 0 -> EOF -> re-emit) */
+        char *a3[] = { "/shell.elf", "-c", "ls / | tally | get rows", NULL };
+        int p3 = process_create("/shell.elf", a3, 3, NULL, 0);
+        int c3 = p3 >= 0 ? process_wait((uint32_t)p3) : -1;
+        if (p3 < 0 || c3 != 0) ok = 0;
+
+        /* (4) a missing external fails the pipeline cleanly (exit 1) */
+        char *a4[] = { "/shell.elf", "-c", "no-such-tool", NULL };
+        int p4 = process_create("/shell.elf", a4, 3, NULL, 0);
+        int c4 = p4 >= 0 ? process_wait((uint32_t)p4) : -1;
+        if (p4 < 0 || c4 != 1) ok = 0;
+
+        /* (5) extern CHAINED INTO extern (the streaming pump both ways):
+         * ls's table streams into tally #1, whose record streams into
+         * tally #2. */
+        char *a5[] = { "/shell.elf", "-c", "ls / | tally | tally | get rows", NULL };
+        int p5 = process_create("/shell.elf", a5, 3, NULL, 0);
+        int c5 = p5 >= 0 ? process_wait((uint32_t)p5) : -1;
+        if (p5 < 0 || c5 != 0) ok = 0;
+
+        kprintf("\n[cmd] test extern: producer rc=%d; producer|get rc=%d; "
+                "ls|tally|get rc=%d; missing-tool rc=%d; extern|extern rc=%d -> %s\n",
+                c1, c2, c3, c4, c5, ok ? "OK" : "FAIL");
         return 1;
     }
 

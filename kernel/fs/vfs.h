@@ -58,6 +58,13 @@ struct vfs_stat {
     uint8_t  type;     /* VFS_DT_*                                      */
     uint32_t mode;     /* POSIX st_mode (type bits + permissions)       */
     uint64_t size;     /* logical size in bytes                         */
+    uint64_t mtime;    /* last-modified, SECONDS since Unix epoch; 0 =
+                        * the fs doesn't track it (FAT32 v1, epfs). The
+                        * syscall layer zeroes the struct before dispatch,
+                        * so an fs that never writes this stays honest.
+                        * ABI: mirrored by user/lib's embk_vfs_stat AND
+                        * embk.h's embk_stat -- grow all three together
+                        * and rebuild every app. */
     uint64_t nlink;    /* hard-link count (FAT32: always 1)             */
 };
 
@@ -113,6 +120,30 @@ struct vfs_ops {
      * channel against" without the VFS layer needing to know what an
      * endpoint IS. */
     void *(*get_endpoint)(struct vnode *vn);
+
+    /* Truncate a regular file to exactly `size` bytes (O_TRUNC uses 0).
+     * NULL = unsupported: an open() with O_TRUNC then fails -ENOSYS rather
+     * than silently keeping stale bytes (the save/cp tail-corruption trap). */
+    int (*truncate)(struct vnode *vn, uint64_t size);
+
+    /* Remove the EMPTY directory named `name` from `dir`. A non-empty
+     * target must fail (-EMBK_ENOTEMPTY-shaped), never recurse. NULL =
+     * unsupported (-ENOSYS). */
+    int (*rmdir)(struct vnode *dir, const char *name, size_t name_len);
+
+    /* Move (old_dir, old_name) to (new_dir, new_name). BOTH directories are on
+     * this mount (the caller checks). An existing destination is REPLACED
+     * ATOMICALLY -- the name repoint and the victim's teardown land in ONE
+     * commit, so a crash can never leave both names gone. That guarantee is
+     * why this is a kernel op: the libc cannot synthesize it (unlink-then-
+     * rename loses the destination if you die between the two), and git's
+     * lockfile protocol depends on it. */
+    int (*rename)(struct vnode *old_dir, const char *old_name, size_t old_len,
+                  struct vnode *new_dir, const char *new_name, size_t new_len);
+
+    /* Set permission bits. The fs preserves the file-type bits itself -- chmod
+     * changes permissions, never what an object IS. */
+    int (*chmod)(struct vnode *vn, uint32_t mode);
 
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);

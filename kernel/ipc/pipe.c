@@ -93,6 +93,15 @@ int pipe_read(struct pipe *p, void *buf, size_t len, size_t *out_read) {
             *out_read = 0;               /* read() = 0 IS the EOF signal */
             return EMBK_OK;
         }
+        /* Cancelled -> don't sleep again (docs/INTERRUPTION.md). Ordered AFTER
+         * the EOF test on purpose: EOF is a real, complete answer and must win.
+         * Ordered BEFORE the block so a process cancelled while already asleep
+         * re-checks here on the wake process_cancel() gave it, instead of
+         * looping straight back down. */
+        if (current_process->cancelled) {
+            sched_unlock();
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&p->read_wait);
         sched_lock();
     }
@@ -116,6 +125,12 @@ int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written)
     sched_lock();
     while (p->count == PIPE_BUF_SIZE) {
         if (p->n_readers == 0) { sched_unlock(); return -EMBK_EPIPE; }
+        /* Cancelled -> stop waiting for space (docs/INTERRUPTION.md). EPIPE
+         * still wins above: a vanished reader is a real, permanent answer. */
+        if (current_process->cancelled) {
+            sched_unlock();
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&p->write_wait);
         sched_lock();
     }
@@ -134,6 +149,20 @@ int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written)
     sched_unlock();
     *out_written = n;    /* may be < len: partial write, caller loops */
     return EMBK_OK;
+}
+
+/* Non-blocking progress probe, per side -- the fd layer's avail hook.
+ *   side 0 (read):  bytes buffered right now (read won't block if > 0)
+ *   side 1 (write): free space right now (a write of <= that won't block;
+ *                   the shell's streaming extern pump interleaves on this)
+ * Self-locking; advisory (another peer may move first) -- the only
+ * guarantee needed is "avail > 0 => one op of that size won't block". */
+int64_t pipe_avail(struct pipe *p, int side) {
+    sched_lock();
+    int64_t n = (side == 0) ? (int64_t)p->count
+                            : (int64_t)(PIPE_BUF_SIZE - p->count);
+    sched_unlock();
+    return n;
 }
 
 /* Live-pipe count, for the EOF selftest's leak assertion (mirrors

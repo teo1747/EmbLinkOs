@@ -3,7 +3,28 @@
 
 
 #define SPAWN_ARGV_MAX             16          // max number of argv[] entries (including the NULL terminator) a spawn() can pass to a child process
-#define SPAWN_ARGV_BYTES_MAX       1024        // total bytes of argv[] strings (including NULL terminators) 
+#define SPAWN_ARGV_BYTES_MAX       1024        // total bytes of argv[] strings (including NULL terminators)
+
+/* ENVIRONMENT -- passed EXPLICITLY at spawn, exactly like argv, and never
+ * inherited.
+ *
+ * This is the deliberate EmbLink shape, not an oversight vs Unix. A Unix
+ * environment is ambient state a child receives whether or not anyone chose to
+ * give it: fork+exec copies it by default. EmbLink's whole position is that a
+ * child gets ONLY what the parent names -- that is why there is no exec, why
+ * file-actions list every fd, and why FD_CLOEXEC is vacuously true here. An
+ * env that leaked in by default would contradict all of it. So: envp==NULL
+ * means the child has NO environment, and getenv() honestly returns NULL.
+ *
+ * envp is NULL-TERMINATED rather than counted (unlike argc): it is what
+ * `char **environ` must be anyway, and sys_spawn has no free argument register
+ * left for a count.
+ *
+ * Budget: argv and envp share the child's TOP 4 KiB stack page with both
+ * pointer arrays. 1024 + 16*8 + 1024 + 32*8 = 2432 of 4096 -- process_create_env()
+ * enforces it rather than trusting this arithmetic. */
+#define SPAWN_ENVP_MAX             32          // max envp[] entries INCLUDING the NULL terminator
+#define SPAWN_ENVP_BYTES_MAX       1024        // total bytes of envp[] strings (including NUL terminators)
 #define SPAWN_ACTIONS_MAX           8          // max number of spawn actions (file descriptor remaps, etc.)
 #define SPAWN_ACTION_PATH_MAX      256         // Deliberately seperate from syscall.c's
                                                // SYSCALL_PATH_MAX -- process.h shouldn't

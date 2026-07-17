@@ -34,8 +34,19 @@ struct cpu_data {
      * See process.h's current_thread/current_process macros, which read
      * through here. Phase 4 (docs/architecture/process-and-scheduling.md):
      * the schedulable unit is now a thread, not a process -- current_process
-     * is derived from current_thread->proc, not stored separately. */
-    struct thread *current_thread;
+     * is derived from cur_thread->proc, not stored separately.
+     *
+     * NAMED `cur_thread`, NOT `current_thread`, ON PURPOSE: process.h defines
+     * a MACRO `current_thread` for the common `this_cpu()->cur_thread` read.
+     * If this field shared that name, the macro would expand at every direct
+     * field access -- `this_cpu()->current_thread` becomes
+     * `this_cpu()->(this_cpu()->current_thread)`, which fails to compile with
+     * the baffling "expected identifier before '(' token". (It worked only
+     * INSIDE the macro's own body, where the preprocessor refuses to expand a
+     * macro inside itself.) Distinct names mean the raw per-CPU field is
+     * always directly addressable -- which usercopy.c's current_pml4_atomic()
+     * needs to read it under cli. */
+    struct thread *cur_thread;
 
     /* Deferred reap, two levels (Phase 4): pending_thread_reap is the
      * thread whose kernel stack this core just switched away from (freed

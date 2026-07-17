@@ -67,6 +67,32 @@
 #define EMBK_SYS_win_resize   48
 #define EMBK_SYS_pipe         49
 #define EMBK_SYS_handle_close 50
+#define EMBK_SYS_fd_install_obj 51
+#define EMBK_SYS_fd_avail     52
+#define EMBK_SYS_unlink       53
+#define EMBK_SYS_mkdir        54
+#define EMBK_SYS_proc_list    55
+#define EMBK_SYS_proc_kill    56
+#define EMBK_SYS_rmdir        57
+/* set_fs_base(addr) -- install this thread's TLS thread pointer (%fs base).
+ * crt0 calls it once at startup, only when the program has a PT_TLS segment. */
+#define EMBK_SYS_set_fs_base  58
+
+/* cancel(handle) -- ask a child you hold a HANDLE for to stop; its blocking
+ * syscalls then fail -EMBK_ECANCELED. cancelled() -- has THIS process been
+ * cancelled? See docs/INTERRUPTION.md. */
+#define EMBK_SYS_cancel       59
+#define EMBK_SYS_cancelled    60
+
+/* console_interrupt_route(handle) -- route ^C to a child you hold a handle for;
+ * handle < 0 reclaims it. A delegation, not a "foreground process". */
+#define EMBK_SYS_console_interrupt_route 61
+
+/* rename(old,new) -- STRICT: fails -EEXIST if dest exists (POSIX replace is the
+ * libc veneer's job). ftruncate(fd,size) -- real, over the fs truncate op. */
+#define EMBK_SYS_rename       62
+#define EMBK_SYS_ftruncate    63
+#define EMBK_SYS_chmod        64
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

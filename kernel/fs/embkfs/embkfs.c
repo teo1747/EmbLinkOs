@@ -1460,6 +1460,18 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->generation   = sb->generation;
     /* read cache starts empty (rcache_gen=0 never matches a real generation) */
     vol->rcache_buf = NULL; vol->rcache_oid = 0; vol->rcache_gen = 0; vol->rcache_len = 0;
+    /* extent-map cache: same deal, same keying (see embkfs.h). Must be seeded --
+     * read_object_range tests ecache_ext before ecache_gen, so a garbage pointer
+     * from an uninitialised volume would be dereferenced. */
+    vol->ecache_ext = NULL; vol->ecache_oid = 0; vol->ecache_gen = 0; vol->ecache_n = 0;
+    vol->ecache_verified = NULL;
+    /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
+     * true here would serve a stale/garbage inode on the very first read. */
+    vol->icache_valid = false; vol->icache_oid = 0; vol->icache_gen = 0;
+    /* Read-ahead window: wcache_buf is the gate (NULL = unallocated), same shape
+     * as rcache/ecache, so a garbage pointer here would be read as a live cache. */
+    vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
+    vol->wcache_off = 0;    vol->wcache_len = 0;
     vol->root         = sb->root;
     vol->read_only    = read_only;
     vol->feature_incompat = sb->feature_incompat;
@@ -1500,10 +1512,16 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
  *   (5) self-block       : header->block == ptr->block
  * On success, `buf` is a valid, parent-vouched node block.
  */
+/* See struct embkfs_stat (embkfs.h). Attributes EMBKFS's block reads by cause. */
+static struct embkfs_stat g_efs_stat;
+void embkfs_stat_reset(void) { memset(&g_efs_stat, 0, sizeof g_efs_stat); }
+void embkfs_stat_get(struct embkfs_stat *out) { if (out) *out = g_efs_stat; }
+
 int embkfs_read_node(struct embkfs_volume *vol,
                      const struct embk_block_ptr *ptr,
                      uint8_t *buf, size_t buf_size)
 {
+    g_efs_stat.node_reads++;
     const char *name = vol->dev->name;
 
     if (vol->block_size > buf_size) {
@@ -2707,6 +2725,65 @@ static int embkfs_dirent_add_op(struct embkfs_volume *vol, uint64_t dir_oid,
     return EMBK_OK;
 }
 
+/* Point an EXISTING dirent at a different object, in ONE put.
+ *
+ * The replace half of an atomic rename. add_op cannot serve: it refuses a name
+ * that already exists (-EEXIST), and remove_op+add_op on the same key does NOT
+ * compose -- each builds its buffer from the ORIGINAL on-disk chain, so the
+ * second silently clobbers the first. Retargeting rewrites the record in place,
+ * so the chain length never changes (same name, same length).
+ *
+ * -EMBK_ENOENT if the name isn't there: the caller looked it up already, so
+ * this means the tree moved under us, not a routine miss. */
+/* Defined further down (with the open-object table); rename's replace path needs
+ * it to know whether a destination it is dropping is still held open. */
+static bool embkfs_object_is_open(struct embkfs_volume *vol, uint64_t oid);
+
+static int embkfs_dirent_retarget_op(struct embkfs_volume *vol, uint64_t dir_oid,
+                                     const char *name, size_t name_len,
+                                     uint64_t target_oid, uint8_t target_type,
+                                     uint8_t *probe, size_t probe_sz,
+                                     struct embk_put *op, uint8_t **out_buf)
+{
+    uint32_t hash = embk_crc32c(name, name_len, 0);
+    const struct embk_item_header *de =
+        embkfs_find_item(vol, dir_oid, EMBK_TYPE_DIR_ENTRY, hash, probe, probe_sz);
+    if (!de) return -EMBK_ENOENT;
+
+    uint32_t chain = de->size;
+    const uint8_t *old_data = embk_item_data(probe, vol->block_size, de, chain);
+    if (!old_data) return -EMBK_EINVAL;
+
+    uint8_t *buf = kmalloc(chain ? chain : 1);
+    if (!buf) return -EMBK_ENOMEM;
+    memcpy(buf, old_data, chain);
+
+    /* Walk OUR copy (probe gets reused by later find_item calls). */
+    bool found = false;
+    for (uint32_t off = 0; off + sizeof(struct embk_dir_entry_item) <= chain; ) {
+        struct embk_dir_entry_item *r = (struct embk_dir_entry_item *)(buf + off);
+        uint32_t rl = sizeof *r + r->name_len;
+        if (rl > chain - off) { kfree(buf); return -EMBK_EINVAL; }
+        if (r->name_len == name_len &&
+            memcmp(buf + off + sizeof *r, name, name_len) == 0) {
+            r->target_object_id = target_oid;
+            r->target_type      = target_type;
+            found = true;
+            break;
+        }
+        off += rl;
+    }
+    if (!found) { kfree(buf); return -EMBK_ENOENT; }
+
+    *out_buf = buf;
+    *op = (struct embk_put){
+        .key = { .object_id = dir_oid, .type = EMBK_TYPE_DIR_ENTRY, .offset = hash },
+        .data = buf,
+        .size = chain,
+    };
+    return EMBK_OK;
+}
+
 /* Read inode of oid into *out_ino and ensure it is a directory. */
 static int embkfs_read_dir_inode(struct embkfs_volume *vol, uint64_t oid,
                                  uint8_t *probe, size_t probe_sz,
@@ -2817,10 +2894,15 @@ static int embkfs_rename(struct embkfs_volume *vol,
     int rc = embkfs_lookup(vol, old_dir_oid, old_name, &target);
     if (rc != EMBK_OK) return rc;
 
-    uint64_t existing;
+    /* An existing destination is REPLACED, atomically, in the same commit that
+     * moves the name -- POSIX rename semantics, and the reason this is a kernel
+     * op at all. The libc used to fake it with unlink-then-rename, which loses
+     * the destination if we die between the two. */
+    uint64_t existing = 0;
+    bool replacing = false;
     rc = embkfs_lookup(vol, new_dir_oid, new_name, &existing);
-    if (rc == EMBK_OK) return -EMBK_EEXIST;
-    if (rc != -EMBK_ENOENT) return rc;
+    if (rc == EMBK_OK) replacing = true;
+    else if (rc != -EMBK_ENOENT) return rc;
 
     struct embk_inode_item old_parent;
     rc = embkfs_read_dir_inode(vol, old_dir_oid, probe, sizeof probe, &old_parent);
@@ -2846,6 +2928,49 @@ static int embkfs_rename(struct embkfs_volume *vol,
         if (inside) return -EMBK_EINVAL;
     }
 
+    /* --- the victim, when replacing ------------------------------------- */
+    struct embk_inode_item vic;          /* the destination we are about to drop */
+    bool vic_last = false, vic_defer = false;
+    if (replacing) {
+        if (existing == target) return EMBK_OK;   /* already the same object (hardlink) */
+
+        const struct embk_item_header *vi =
+            embkfs_find_item(vol, existing, EMBK_TYPE_INODE, 0, probe, sizeof probe);
+        if (!vi) return -EMBK_ENOENT;
+        const struct embk_inode_item *vp = embk_item_data(probe, vol->block_size, vi, sizeof *vp);
+        if (!vp) return -EMBK_EINVAL;
+        vic = *vp;
+        bool vic_is_dir = ((vic.mode & EMBKFS_S_IFMT) == EMBKFS_S_IFDIR);
+
+        /* POSIX type rules. Refused, not silently coerced: replacing a
+         * directory with a file (or vice versa) is a caller bug, and the two
+         * teardowns are not the same operation. */
+        if (vic_is_dir != is_dir) return vic_is_dir ? -EMBK_EISDIR : -EMBK_ENOTDIR;
+        if (vic_is_dir) {
+            /* Replacing a directory means it must be EMPTY, and then its
+             * removal is rmdir's job (link accounting for "..", etc). Not
+             * built here: git never does it, and a half-right version of it
+             * would be worse than an honest refusal. */
+            return -EMBK_ENOTSUP;
+        }
+
+        vic_last  = (vic.links <= 1);
+        vic_defer = vic_last && embkfs_object_is_open(vol, existing);
+    }
+
+    /* Both dirent ops must land on DIFFERENT keys, or they don't compose: each
+     * builds its buffer from the ORIGINAL chain, so same-key ops clobber each
+     * other. Same dir + different names that COLLIDE on the CRC32C name hash is
+     * the only way that happens -- vanishingly rare, but silent corruption if
+     * ignored, so refuse loudly instead. (Fixing it means one combined chain
+     * rewrite; nothing needs it yet.) */
+    if (old_dir_oid == new_dir_oid &&
+        embk_crc32c(old_name, old_len, 0) == embk_crc32c(new_name, new_len, 0)) {
+        kprintf("EMBKFS: %s: rename %s -> %s: name-hash collision in one directory "
+                "is not supported\n", dev, old_name, new_name);
+        return -EMBK_ENOTSUP;
+    }
+
     struct embk_put remove_op, add_op;
     uint8_t *remove_buf = NULL;
     uint8_t *add_buf = NULL;
@@ -2854,13 +2979,42 @@ static int embkfs_rename(struct embkfs_volume *vol,
                                  probe, sizeof probe, &remove_op, &remove_buf);
     if (rc != EMBK_OK) return rc;
 
-    rc = embkfs_dirent_add_op(vol, new_dir_oid, new_name, new_len,
+    /* Replacing -> RETARGET the existing name (add_op would refuse it with
+     * -EEXIST); otherwise add it. Either way: ONE put on the destination key. */
+    rc = replacing
+       ? embkfs_dirent_retarget_op(vol, new_dir_oid, new_name, new_len,
+                                   target, ttype, probe, sizeof probe,
+                                   &add_op, &add_buf)
+       : embkfs_dirent_add_op(vol, new_dir_oid, new_name, new_len,
                               target, ttype, probe, sizeof probe,
                               &add_op, &add_buf);
     if (rc != EMBK_OK) { kfree(remove_buf); return rc; }
 
     uint64_t new_gen = vol->generation + 1;
-    struct embk_put ops[4];
+
+    /* When replacing, the victim's extents are freed in THIS SAME commit, so
+     * the op count is no longer a fixed handful -- same shape as unlink's. */
+    struct embk_extref *vic_ext = NULL;
+    uint32_t vic_n = 0;
+    if (replacing && vic_last && !vic_defer) {
+        rc = embkfs_count_extents(vol, existing, &vic_n);
+        if (rc != EMBK_OK) { kfree(remove_buf); kfree(add_buf); return rc; }
+        if (vic_n) {
+            vic_ext = kmalloc((uint64_t)vic_n * sizeof *vic_ext);
+            if (!vic_ext) { kfree(remove_buf); kfree(add_buf); return -EMBK_ENOMEM; }
+            uint32_t got = 0; bool over = false;
+            rc = embkfs_collect_extents(vol, existing, vic_ext, vic_n, &got, &over);
+            if (rc != EMBK_OK || over || got != vic_n) {
+                kfree(vic_ext); kfree(remove_buf); kfree(add_buf); return -EMBK_EINVAL;
+            }
+            rc = embkfs_validate_extent_map(vol, vic_ext, vic_n, vic.size, "rename victim map");
+            if (rc != EMBK_OK) { kfree(vic_ext); kfree(remove_buf); kfree(add_buf); return rc; }
+        }
+    }
+
+    uint32_t ops_cap = 4 + 1 + vic_n;   /* 2 dirents + 2 parents + victim inode + its extents */
+    struct embk_put *ops = kmalloc((uint64_t)ops_cap * sizeof *ops);
+    if (!ops) { kfree(vic_ext); kfree(remove_buf); kfree(add_buf); return -EMBK_ENOMEM; }
     uint32_t nops = 0;
     ops[nops++] = remove_op;
     ops[nops++] = add_op;
@@ -2881,7 +3035,10 @@ static int embkfs_rename(struct embkfs_volume *vol,
     old_parent_new.ctime      = now_ns;
     old_parent_new.generation = new_gen;
     if (is_dir && old_dir_oid != new_dir_oid) {
-        if (old_parent_new.links == 0) { kfree(remove_buf); kfree(add_buf); return -EMBK_EINVAL; }
+        if (old_parent_new.links == 0) {
+            kfree(ops); kfree(vic_ext); kfree(remove_buf); kfree(add_buf);
+            return -EMBK_EINVAL;
+        }
         old_parent_new.links -= 1;
     }
     ops[nops++] = (struct embk_put){
@@ -2899,8 +3056,45 @@ static int embkfs_rename(struct embkfs_volume *vol,
             .data = (const uint8_t *)&new_parent_new, .size = sizeof new_parent_new };
     }
 
+    /* The victim, torn down in the SAME commit that repoints the name at
+     * `target`. Mirrors unlink's three arms exactly -- including the DEFER one:
+     * a destination someone still holds open keeps its inode and blocks (links
+     * 0), and embkfs_object_put reclaims them at last close. Replacing a file
+     * out from under a reader must not free blocks it is still reading. */
+    struct embk_inode_item vic_upd;
+    if (replacing) {
+        if (vic_defer) {
+            vic_upd = vic;
+            vic_upd.links      = 0;
+            vic_upd.ctime      = now_ns;   /* metadata-only: its data is untouched */
+            vic_upd.generation = new_gen;
+            ops[nops++] = (struct embk_put){
+                .key = { .object_id = existing, .type = EMBK_TYPE_INODE, .offset = 0 },
+                .data = (const uint8_t *)&vic_upd, .size = sizeof vic_upd };
+        } else if (vic_last) {
+            ops[nops++] = (struct embk_put){
+                .key = { .object_id = existing, .type = EMBK_TYPE_INODE, .offset = 0 },
+                .del = true };
+            for (uint32_t i = 0; i < vic_n; i++)
+                ops[nops++] = (struct embk_put){
+                    .key = { .object_id = existing, .type = EMBK_TYPE_EXTENT,
+                             .offset = vic_ext[i].offset },
+                    .del = true };
+        } else {
+            vic_upd = vic;
+            vic_upd.links     -= 1;        /* a hard link elsewhere still names it */
+            vic_upd.ctime      = now_ns;
+            vic_upd.generation = new_gen;
+            ops[nops++] = (struct embk_put){
+                .key = { .object_id = existing, .type = EMBK_TYPE_INODE, .offset = 0 },
+                .data = (const uint8_t *)&vic_upd, .size = sizeof vic_upd };
+        }
+    }
+
     rc = embkfs_txn_apply_ops(vol, ops, nops, new_gen);
 
+    kfree(ops);
+    kfree(vic_ext);
     kfree(remove_buf);
     kfree(add_buf);
     if (rc != EMBK_OK) {
@@ -4156,6 +4350,70 @@ static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
                                      uint8_t *out, uint64_t want,
                                      uint64_t *out_total_len, uint32_t *out_mode);
 
+/* Range read that skips the prefix entirely -- see its definition below. */
+static int embkfs_read_object_range(struct embkfs_volume *vol, uint64_t oid,
+                                    uint64_t offset, uint8_t *out, uint64_t len,
+                                    uint64_t *out_read);
+
+/* Get an object's extent map, from the (oid, generation)-keyed cache when
+ * possible; collect + validate + install it on a miss.
+ *
+ * Collecting a map is TWO FULL B-TREE SCANS (count_extents, then
+ * collect_extents), each reading a node per leaf holding this object's extents,
+ * plus a kmalloc and an O(n) validate. read_object_range cached that;
+ * read_object_prefix did NOT, and it is the path EVERY file <= EMBKFS_RCACHE_MAX
+ * takes -- i.e. every app load -- so it paid both scans on every call. Measured:
+ * ~95% of this workload's device reads are B-tree nodes, so uncached scans are
+ * exactly the wrong thing to leave lying around.
+ *
+ * ⚠️ OWNERSHIP: the returned array is owned by the CACHE, never by the caller.
+ * Callers must NOT kfree it -- doing so hands the next cache hit freed memory.
+ * (That bug has already been made once here; it cost seven kfree sites.)
+ * The pointer stays valid until the next miss on a DIFFERENT (oid, generation),
+ * so a caller must not hold it across another object's read.
+ *
+ * `out_vfy` returns the parallel per-extent "already verified this generation"
+ * array, or NULL if the caller doesn't need it. */
+static int embkfs_extents_cached(struct embkfs_volume *vol, uint64_t oid,
+                                 uint64_t inode_size, const char *where,
+                                 struct embk_extref **out_ext, uint32_t *out_n,
+                                 uint8_t **out_vfy);
+
+/* Fetch an object's inode item, from the (oid, generation)-keyed cache when
+ * possible. Finding an inode is a B-tree DESCENT THAT READS BLOCKS, and the read
+ * path did two per call (the size probe in read_object_at + read_object_range's
+ * own lookup) -- measured at ~2 of the ~3 device reads an 8 KB chunk cost, when
+ * only one of them is the data. A write commit bumps `generation`, so a stale
+ * entry can never be served. Returns a COPY, not a pointer into a shared probe
+ * buffer, so callers can't be invalidated by the next lookup. */
+static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
+                               struct embk_inode_item *out)
+{
+    static uint8_t probe_i[4096];
+
+    if (!vol || !out) return -EMBK_EINVAL;
+
+    if (vol->icache_valid && vol->icache_oid == oid &&
+        vol->icache_gen == vol->generation) {
+        *out = vol->icache_ino;
+        return EMBK_OK;
+    }
+
+    const struct embk_item_header *ii =
+        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe_i, sizeof probe_i);
+    if (!ii) return -EMBK_ENOENT;
+    const struct embk_inode_item *ino =
+        embk_item_data(probe_i, vol->block_size, ii, sizeof *ino);
+    if (!ino) return -EMBK_EINVAL;
+
+    vol->icache_ino   = *ino;          /* copy: probe_i is reused by the next call */
+    vol->icache_oid   = oid;
+    vol->icache_gen   = vol->generation;
+    vol->icache_valid = true;
+    *out = *ino;
+    return EMBK_OK;
+}
+
 int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
                         const uint8_t *data, uint64_t len)
 {
@@ -4198,6 +4456,50 @@ int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
  * size are cached for fast sequential reads; larger ones use the direct path. */
 #define EMBKFS_RCACHE_MAX (8u * 1024u * 1024u)
 
+/* Read-ahead window for objects too big for the whole-object cache above.
+ * MUST be a power of two (the lookup masks the offset) and a multiple of the
+ * 4096-byte fs block. 64 KB = 8 app-sized (8 KB) reads per fill, and matches
+ * EMBKFS_IO_BATCH_BLOCKS below so one window is exactly one device request --
+ * the two constants are meant to be kept equal.
+ *
+ * RELATED, ACROSS THE LANGUAGE BOUNDARY, to mkfs's EXTENT_MAX_BYTES
+ * (tools/embkfs_mkfs/mkfs_embkfs.py, currently 1 MiB). An extent's checksum
+ * covers the whole extent, so cold amplification is (2E - W)/E for extent E and
+ * window W -- measured 194% at E=1MiB/W=64KiB, matching the model exactly.
+ * Enlarging this window shrinks that; E <= W would reach 100%.
+ *
+ * But do NOT chase that number by shrinking extents: A/B'd, E=64KiB hit 101%
+ * cold and cost ~85% MORE device time system-wide, because ~95% of device reads
+ * on a real workload are B-TREE NODE reads and more extents means a bigger tree
+ * for every COW rebuild to walk. See the long note at that constant. */
+#define EMBKFS_WCACHE_WIN (64u * 1024u)
+
+/* Blocks fetched per DEVICE request. The storage cost that dominates is PER
+ * REQUEST -- ATA command setup plus a busy-wait for the DMA completion IRQ,
+ * ~2.7 ms under TCG -- and it does NOT scale with transfer size. Reading one
+ * 4 KB block per request therefore pinned throughput near 1.5 MB/s (a 2 GB read
+ * would take ~23 minutes) even though the transfer itself is real bus-master
+ * DMA: at 4 KB the setup IS the cost, so DMA had nothing to amortise over.
+ *
+ * 16 blocks = 64 KB, equal to EMBKFS_WCACHE_WIN so one window fill is exactly
+ * ONE device request. This was 8 (32 KB) "to match block.c's block_bounce[64*512]
+ * cap" -- but that cap only applies to buffers that FAIL buffer_dma_ok() and get
+ * bounced, and iobatch is BSS precisely so it does not (see below). The bounce
+ * buffer was never in this path, so 32 KB was a self-imposed limit. The real
+ * per-command ceiling is the ATA driver's 255-sector chunk (~127 KB) in
+ * ata_block_read(); 128 sectors stays comfortably inside it, and a contiguous
+ * 64 KB span needs at most 2 of the 8 available PRD entries.
+ *
+ * iobatch lives in kernel BSS on purpose: buffer_dma_ok() requires the kernel
+ * range and a <4 GB physical address, both true here, so the block layer DMAs
+ * straight into it with NO bounce copy. (kmalloc memory would fail that test --
+ * KHEAP_BASE sits below KERNEL_VIRTUAL_BASE, and heap pages are physically
+ * scattered anyway, so KV2P on them is meaningless.) Sharing one static is
+ * consistent with the probe[]/datablk[] statics already in this file -- every FS
+ * op runs under embk_vfs.c's big lock. */
+#define EMBKFS_IO_BATCH_BLOCKS 16
+static uint8_t iobatch[EMBKFS_IO_BATCH_BLOCKS * 4096] __attribute__((aligned(16)));
+
 int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
                           uint64_t offset, uint8_t *buf, uint64_t len,
                           uint64_t *out_read)
@@ -4219,9 +4521,18 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
         return EMBK_OK;
     }
 
-    uint64_t total = 0;
-    int rc = embkfs_read_object_prefix(vol, oid, NULL, 0, &total, NULL);
+    /* Size from the cached inode. This used to be
+     * `embkfs_read_object_prefix(vol, oid, NULL, 0, &total, NULL)` -- want==0 so
+     * it decoded nothing, but it still paid a full B-tree descent (block reads)
+     * on EVERY read just to learn ino->size. That was one of the ~2 redundant
+     * device reads per chunk. */
+    struct embk_inode_item ino_at;
+    int rc = embkfs_inode_cached(vol, oid, &ino_at);
     if (rc != EMBK_OK) return rc;
+    /* Same type gate read_object_prefix applied -- keep refusing dirs/devices. */
+    uint32_t mode_at = ino_at.mode & EMBKFS_S_IFMT;
+    if (mode_at != EMBKFS_S_IFREG && mode_at != EMBKFS_S_IFLNK) return -EMBK_EINVAL;
+    uint64_t total = ino_at.size;
     if (offset >= total) return EMBK_OK;
 
     uint64_t want = total - offset;
@@ -4246,16 +4557,53 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
         }
     }
 
-    uint64_t need_prefix = offset + want;
-    uint8_t *tmp = kmalloc(need_prefix ? need_prefix : 1);
-    if (!tmp) return -EMBK_ENOMEM;
-    rc = embkfs_read_object_prefix(vol, oid, tmp, need_prefix, NULL, NULL);
-    if (rc == EMBK_OK) {
-        memcpy(buf, tmp + offset, want);
-        *out_read = want;
+    /* Too big for the whole-object cache: serve from a read-ahead WINDOW.
+     *
+     * Only serve a request that fits ENTIRELY inside the window. A partial serve
+     * would mean returning a short read mid-file, and short reads on this path
+     * have already cost us one silent data-loss bug -- not worth re-opening for
+     * the one read in eight that straddles a boundary. Those fall through to the
+     * direct range read below, which is exactly what every read did before. */
+    uint64_t woff = offset & ~(uint64_t)(EMBKFS_WCACHE_WIN - 1);
+    bool whit = vol->wcache_buf && vol->wcache_oid == oid &&
+                vol->wcache_gen == vol->generation && vol->wcache_off == woff;
+
+    if (!whit) {
+        if (!vol->wcache_buf) vol->wcache_buf = kmalloc(EMBKFS_WCACHE_WIN);
+        if (vol->wcache_buf) {
+            uint64_t got = 0;
+            rc = embkfs_read_object_range(vol, oid, woff, vol->wcache_buf,
+                                          EMBKFS_WCACHE_WIN, &got);
+            if (rc == EMBK_OK && got > 0) {
+                vol->wcache_oid = oid;
+                vol->wcache_gen = vol->generation;
+                vol->wcache_off = woff;
+                vol->wcache_len = got;
+                whit = true;
+            } else {
+                /* Don't leave a half-filled window installed as valid. */
+                vol->wcache_len = 0;
+                vol->wcache_gen = 0;
+            }
+        }
     }
-    kfree(tmp);
-    return rc;
+
+    if (whit && offset >= woff && (offset - woff) + want <= vol->wcache_len) {
+        memcpy(buf, vol->wcache_buf + (offset - woff), want);
+        *out_read = want;
+        return EMBK_OK;
+    }
+
+    /* Window unusable (OOM, straddles the end, or read failed). Serve the range
+     * DIRECTLY instead of decoding [0, offset+want) into a scratch buffer first.
+     *
+     * The old code here did exactly that -- kmalloc(offset+want) + a full prefix
+     * decode, PER READ -- which made every read O(offset) in both time and
+     * memory, so reading a >RCACHE_MAX file sequentially was O(n^2). That is what
+     * froze CPython: python314.zip is 10.3 MB, over the 8 MB cap, and zipimport
+     * reads its central directory at ~10 MB offsets. read_object_range() skips
+     * the extents below `offset` without touching the disk. */
+    return embkfs_read_object_range(vol, oid, offset, buf, want, out_read);
 }
 
 int embkfs_write_object_at(struct embkfs_volume *vol, uint64_t oid,
@@ -4422,6 +4770,13 @@ int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
     return embkfs_rename(vol, old_parent, old_leaf, new_parent, new_leaf);
 }
 
+/* DELIBERATELY NOT on the shared extent cache (unlike read_object_prefix and
+ * read_object_range). Its only caller is embkfs_readlink_object(): symlink
+ * targets are tiny single-extent objects and readlink is not a hot path, while
+ * the ecache is SINGLE-SLOT -- routing this through it would let a symlink
+ * evict a large file's extent map for no gain. It owns its own array, so the
+ * kfree(ext) calls below are correct here and must NOT be "cleaned up" to match
+ * the other two. */
 static int embkfs_read_object_data(struct embkfs_volume *vol, uint64_t oid,
                                    uint8_t *out, uint64_t out_sz,
                                    uint64_t *out_len, uint32_t *out_mode)
@@ -4517,12 +4872,66 @@ static int embkfs_read_object_data(struct embkfs_volume *vol, uint64_t oid,
     return EMBK_OK;
 }
 
+/* See the declaration above for the ownership contract. */
+static int embkfs_extents_cached(struct embkfs_volume *vol, uint64_t oid,
+                                 uint64_t inode_size, const char *where,
+                                 struct embk_extref **out_ext, uint32_t *out_n,
+                                 uint8_t **out_vfy)
+{
+    if (!vol || !out_ext || !out_n) return -EMBK_EINVAL;
+
+    if (vol->ecache_ext && vol->ecache_oid == oid &&
+        vol->ecache_gen == vol->generation) {
+        g_efs_stat.ecache_hit++;
+        *out_ext = vol->ecache_ext;
+        *out_n   = vol->ecache_n;
+        if (out_vfy) *out_vfy = vol->ecache_verified;
+        return EMBK_OK;
+    }
+
+    g_efs_stat.ecache_miss++;
+    uint32_t en = 0;
+    int rc = embkfs_count_extents(vol, oid, &en);
+    if (rc != EMBK_OK) return rc;
+    if (en == 0) return -EMBK_EINVAL;
+
+    struct embk_extref *ext = kmalloc((uint64_t)en * sizeof *ext);
+    if (!ext) return -EMBK_ENOMEM;
+    uint32_t got = 0; bool over = false;
+    rc = embkfs_collect_extents(vol, oid, ext, en, &got, &over);
+    if (rc != EMBK_OK || over || got != en) { kfree(ext); return -EMBK_EINVAL; }
+    rc = embkfs_validate_extent_map(vol, ext, en, inode_size, where);
+    if (rc != EMBK_OK) { kfree(ext); return rc; }
+
+    uint8_t *vfy = kmalloc(en);
+    if (!vfy) { kfree(ext); return -EMBK_ENOMEM; }
+    memset(vfy, 0, en);                  /* nothing verified yet */
+
+    /* Install last: until this point `ext` is still ours to free, and after it
+     * the cache owns it. Free the OLD entry only now, so an early return above
+     * can never have dropped a live cache. */
+    if (vol->ecache_ext) kfree(vol->ecache_ext);
+    if (vol->ecache_verified) kfree(vol->ecache_verified);
+    vol->ecache_ext      = ext;
+    vol->ecache_verified = vfy;
+    vol->ecache_n        = en;
+    vol->ecache_oid      = oid;
+    vol->ecache_gen      = vol->generation;
+
+    *out_ext = ext;
+    *out_n   = en;
+    if (out_vfy) *out_vfy = vfy;
+    return EMBK_OK;
+}
+
 static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
                                      uint8_t *out, uint64_t want,
                                      uint64_t *out_total_len, uint32_t *out_mode)
 {
     static uint8_t probe[4096];
     static uint8_t datablk[4096];
+
+    g_efs_stat.prefix_calls++;
 
     const struct embk_item_header *ii =
         embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
@@ -4539,18 +4948,23 @@ static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
 
     uint64_t need = (want < ino->size) ? want : ino->size;
 
+    /* Extent map from the shared (oid, generation) cache; was an uncached
+     * count_extents + collect_extents + validate here. The array below is OWNED
+     * BY THE CACHE: nothing in this function may kfree(ext).
+     *
+     * ⚠️ DON'T EXPECT SPEED FROM THIS -- measured identical (5401 device reads,
+     * 5152 node reads, before and after). This path is COLD BY CONSTRUCTION:
+     * read_object_at fills rcache with the WHOLE object for anything
+     * <= EMBKFS_RCACHE_MAX and then serves from RAM, so prefix runs about ONCE
+     * per file per generation, and the one collect it does is the one a cache
+     * miss would have done anyway. ("No cache here" was a true observation and a
+     * false problem.) What the sharing buys is one less copy of the install
+     * block, and no per-call kmalloc of the extent array. */
+    struct embk_extref *ext;
     uint32_t en = 0;
-    int rc = embkfs_count_extents(vol, oid, &en);
+    int rc = embkfs_extents_cached(vol, oid, ino->size, "read_object_prefix",
+                                   &ext, &en, NULL);
     if (rc != EMBK_OK) return rc;
-    if (en == 0) return -EMBK_EINVAL;
-
-    struct embk_extref *ext = kmalloc((uint64_t)en * sizeof *ext);
-    if (!ext) return -EMBK_ENOMEM;
-    uint32_t got = 0; bool over = false;
-    rc = embkfs_collect_extents(vol, oid, ext, en, &got, &over);
-    if (rc != EMBK_OK || over || got != en) { kfree(ext); return -EMBK_EINVAL; }
-    rc = embkfs_validate_extent_map(vol, ext, en, ino->size, "read_object_prefix");
-    if (rc != EMBK_OK) { kfree(ext); return rc; }
 
     uint64_t spb = vol->block_size / vol->dev->block_size;
     uint64_t pos = 0;
@@ -4570,13 +4984,13 @@ static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
              * actually wanted (v2.2 Phase 3/4). */
             uint64_t comp_size = ext[i].compressed_size;
             uint8_t *raw = kmalloc(comp_size ? comp_size : 1);
-            if (!raw) { kfree(ext); return -EMBK_ENOMEM; }
+            if (!raw) { return -EMBK_ENOMEM; }
             uint32_t csum = 0; uint64_t written = 0;
             for (uint64_t blk = 0; blk < ext[i].length; blk++) {
                 uint64_t chunk = comp_size - written;
                 if (chunk > vol->block_size) chunk = vol->block_size;
                 rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb, spb, datablk);
-                if (rc != EMBK_OK) { kfree(raw); kfree(ext); return rc; }
+                if (rc != EMBK_OK) { kfree(raw); return rc; }
                 csum = embk_crc32c(datablk, enc ? vol->block_size : chunk, csum);
                 if (enc) {
                     aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + blk, datablk, datablk, vol->block_size);
@@ -4584,11 +4998,11 @@ static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
                 memcpy(raw + written, datablk, chunk);
                 written += chunk;
             }
-            if (csum != ext[i].checksum) { kfree(raw); kfree(ext); return -EMBK_EINVAL; }
+            if (csum != ext[i].checksum) { kfree(raw); return -EMBK_EINVAL; }
             uint8_t *logical = kmalloc(ext[i].logical_size ? ext[i].logical_size : 1);
             bool dok = logical && embk_decompress(raw, (uint32_t)comp_size, logical, (uint32_t)ext[i].logical_size);
             kfree(raw);
-            if (!dok) { kfree(logical); kfree(ext); return -EMBK_EINVAL; }
+            if (!dok) { kfree(logical); return -EMBK_EINVAL; }
             uint64_t take = need - pos;
             if (take > ext[i].logical_size) take = ext[i].logical_size;
             memcpy(out + pos, logical, take);
@@ -4602,28 +5016,284 @@ static int embkfs_read_object_prefix(struct embkfs_volume *vol, uint64_t oid,
          * already reached `need` for THIS extent's own share -- the
          * checksum was computed at write time over the WHOLE extent, so
          * verifying it requires the whole thing regardless of how much of
-         * it the caller actually wants back. */
-        for (uint64_t blk = 0; blk < ext[i].length; blk++) {
-            uint64_t chunk = ext[i].logical_size - written;
-            if (chunk > vol->block_size) chunk = vol->block_size;
-            rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb, spb, datablk);
-            if (rc != EMBK_OK) { kfree(ext); return rc; }
-            csum = embk_crc32c(datablk, enc ? vol->block_size : chunk, csum);
-            if (enc) {
-                aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + blk, datablk, datablk, vol->block_size);
+         * it the caller actually wants back.
+         *
+         * BATCHED: one device request per EMBKFS_IO_BATCH_BLOCKS blocks, not per
+         * block. The per-request cost (command setup + a busy-wait for the DMA
+         * IRQ) is ~2.7 ms under TCG and is paid PER REQUEST, not per byte -- so
+         * issuing 4 KB at a time capped throughput near 1.5 MB/s no matter that
+         * the transfer itself is DMA. This loop fills rcache for EVERY file
+         * <= EMBKFS_RCACHE_MAX, i.e. every app load, so it is the hot one. */
+        for (uint64_t blk = 0; blk < ext[i].length; ) {
+            uint64_t nb = ext[i].length - blk;
+            if (nb > EMBKFS_IO_BATCH_BLOCKS) nb = EMBKFS_IO_BATCH_BLOCKS;
+
+            /* iobatch is kernel BSS: in the kernel range and under the 32-bit
+             * DMA limit, so the block layer DMAs straight into it -- no bounce
+             * copy. nb*block_size never exceeds block.c's 32 KB bounce cap. */
+            rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb,
+                                 (uint32_t)(nb * spb), iobatch);
+            if (rc != EMBK_OK) { return rc; }
+
+            for (uint64_t j = 0; j < nb; j++) {
+                uint8_t *blkbuf = iobatch + j * vol->block_size;
+                uint64_t chunk = ext[i].logical_size - written;
+                if (chunk > vol->block_size) chunk = vol->block_size;
+                /* Per-block CRC/decrypt order is unchanged -- the checksum is
+                 * defined over the blocks in sequence, so batching the fetch
+                 * must not reorder this. */
+                csum = embk_crc32c(blkbuf, enc ? vol->block_size : chunk, csum);
+                if (enc) {
+                    aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + blk + j,
+                                    blkbuf, blkbuf, vol->block_size);
+                }
+                if (pos < need) {
+                    uint64_t take = need - pos;
+                    if (take > chunk) take = chunk;
+                    memcpy(out + pos, blkbuf, take);
+                    pos += take;
+                }
+                written += chunk;
             }
-            if (pos < need) {
-                uint64_t take = need - pos;
-                if (take > chunk) take = chunk;
-                memcpy(out + pos, datablk, take);
-                pos += take;
-            }
-            written += chunk;
+            blk += nb;
         }
-        if (csum != ext[i].checksum) { kfree(ext); return -EMBK_EINVAL; }
+        if (csum != ext[i].checksum) { return -EMBK_EINVAL; }
     }
 
-    kfree(ext);
+    /* No kfree(ext) anywhere in here: the ecache owns the array. */
+    return EMBK_OK;
+}
+
+/* Read [offset, offset+len) of an object WITHOUT decoding the prefix before it.
+ *
+ * This is the real fix for the O(n^2) that EMBKFS_RCACHE_MAX only papered over.
+ * read_object_prefix() always starts at logical 0, so serving a read at offset N
+ * cost O(N) time AND an O(N) kmalloc -- every call. Files <= RCACHE_MAX hid it
+ * behind the whole-object cache; anything BIGGER fell back to that path and a
+ * sequential read became O(n^2). CPython's 10.3 MB python314.zip (555-entry
+ * central directory read at ~10 MB offsets) is what exposed it.
+ *
+ * The walk below is the same one read_object_prefix does, with one change that
+ * is the whole point: an extent lying entirely BELOW `offset` is skipped with
+ * ZERO I/O -- no block reads, no decrypt, no checksum, no decompress. Cost
+ * becomes O(#extents) to locate + O(len) to deliver.
+ *
+ * Integrity is preserved for everything we actually return: an extent we TOUCH
+ * is still read in full and checksum-verified, because (per the note in
+ * read_object_prefix) the checksum was computed at write time over the WHOLE
+ * extent. We simply don't verify extents whose bytes the caller isn't asking
+ * for -- which is what any range read does, and what the cached path effectively
+ * did too once it was warm.
+ */
+static int embkfs_read_object_range(struct embkfs_volume *vol, uint64_t oid,
+                                    uint64_t offset, uint8_t *out, uint64_t len,
+                                    uint64_t *out_read)
+{
+    static uint8_t probe_r[4096];
+    static uint8_t datablk_r[4096];
+
+    if (!vol || !out || !out_read) return -EMBK_EINVAL;
+    *out_read = 0;
+    if (len == 0) return EMBK_OK;
+
+    /* Cached inode: this was a B-tree descent (block reads) on EVERY call. */
+    struct embk_inode_item ino_c;
+    int irc = embkfs_inode_cached(vol, oid, &ino_c);
+    if (irc != EMBK_OK) return irc;
+
+    uint32_t mode = ino_c.mode & EMBKFS_S_IFMT;
+    if (mode != EMBKFS_S_IFREG && mode != EMBKFS_S_IFLNK) return -EMBK_EINVAL;
+    if (ino_c.size == 0 || offset >= ino_c.size) return EMBK_OK;   /* EOF: 0 bytes */
+
+    uint64_t avail_total = ino_c.size - offset;
+    if (len > avail_total) len = avail_total;
+
+    /* Extent map from the shared (oid, generation) cache -- see
+     * embkfs_extents_cached(). Collecting one costs two full B-tree scans + a
+     * kmalloc + an O(n) validate; doing that per read is what dominated once the
+     * prefix decode was gone. The array is OWNED BY THE CACHE: every `return`
+     * below must NOT kfree(ext), or the next hit serves freed memory. */
+    int rc;
+    struct embk_extref *ext;
+    uint32_t en = 0;
+    uint8_t *vfy;                            /* parallel to ext[], same keying */
+    rc = embkfs_extents_cached(vol, oid, ino_c.size, "read_object_range",
+                               &ext, &en, &vfy);
+    if (rc != EMBK_OK) return rc;
+
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    /* Find the first extent overlapping `offset` by BINARY SEARCH rather than
+     * walking from extent 0. The walk was O(offset/extent_size) CPU on EVERY
+     * read: harmless while mkfs emitted one extent per file, but it silently
+     * caps how small extents can get -- and small extents are exactly what makes
+     * the first-touch verify cheap. At 64 KB extents a read near the end of a
+     * 2 GB file would have walked 32,768 entries, per read, reintroducing the
+     * O(n^2) this rebuild just removed (as CPU instead of I/O, which the profile
+     * says is now the scarce one).
+     *
+     * Exact because embkfs_validate_extent_map() has already proven the map
+     * tiles the file contiguously from 0, so ext[] is sorted by .offset and
+     * ext[i].offset is precisely the logical start of extent i. */
+    uint32_t first = 0;
+    {
+        uint32_t lo = 0, hi = en;
+        while (lo < hi) {                    /* first i with offset < end(i) */
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (ext[mid].offset + ext[mid].logical_size <= offset) lo = mid + 1;
+            else                                                   hi = mid;
+        }
+        first = lo;
+    }
+
+    uint64_t elog = (first < en) ? ext[first].offset : 0;  /* logical start of ext[i] */
+    uint64_t done = 0;    /* bytes delivered into out[] */
+
+    for (uint32_t i = first; i < en && done < len; i++) {
+        uint64_t esz = ext[i].logical_size;
+
+        /* Kept as defence, not as the mechanism: `first` already lands on the
+         * right extent, so this is false on entry and costs nothing. It only
+         * fires if the map were ever not what validate proved it to be. */
+        if (elog + esz <= offset) { elog += esz; continue; }
+
+        uint64_t skip_in = (offset > elog) ? (offset - elog) : 0;   /* into this extent */
+        uint64_t take = esz - skip_in;
+        if (take > len - done) take = len - done;
+
+        if (ext[i].flags & EMBKFS_EXTENT_F_HOLE) {
+            memset(out + done, 0, take);
+            done += take; elog += esz;
+            continue;
+        }
+
+        bool enc = (ext[i].flags & EMBKFS_EXTENT_F_ENCRYPTED) != 0;
+
+        if (ext[i].flags & EMBKFS_EXTENT_F_COMPRESSED) {
+            /* Compressed extents have no random access: the whole blob must be
+             * read+decrypted+verified+decompressed before any slice of it
+             * exists. That is per-EXTENT work though, not per-FILE -- the
+             * extents before `offset` were already skipped above. */
+            uint64_t comp_size = ext[i].compressed_size;
+            uint8_t *raw = kmalloc(comp_size ? comp_size : 1);
+            if (!raw) { return -EMBK_ENOMEM; }
+            uint32_t csum = 0; uint64_t written = 0;
+            for (uint64_t blk = 0; blk < ext[i].length; blk++) {
+                uint64_t chunk = comp_size - written;
+                if (chunk > vol->block_size) chunk = vol->block_size;
+                rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb, spb, datablk_r);
+                if (rc != EMBK_OK) { kfree(raw); return rc; }
+                csum = embk_crc32c(datablk_r, enc ? vol->block_size : chunk, csum);
+                if (enc) {
+                    aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + blk, datablk_r, datablk_r, vol->block_size);
+                }
+                memcpy(raw + written, datablk_r, chunk);
+                written += chunk;
+            }
+            if (csum != ext[i].checksum) { kfree(raw); return -EMBK_EINVAL; }
+            uint8_t *logical = kmalloc(esz ? esz : 1);
+            bool dok = logical && embk_decompress(raw, (uint32_t)comp_size, logical, (uint32_t)esz);
+            kfree(raw);
+            if (!dok) { kfree(logical); return -EMBK_EINVAL; }
+            memcpy(out + done, logical + skip_in, take);   /* slice, not prefix */
+            kfree(logical);
+            done += take; elog += esz;
+            continue;
+        }
+
+        /* Plain (possibly encrypted) extent.
+         *
+         * ALREADY VERIFIED in this generation -> touch only the blocks that
+         * actually overlap the request. This is the case that matters: mkfs
+         * gives a file ONE extent, so without this a 10 MB extent was fully
+         * re-read and re-CRC'd to serve every 8 KB, i.e. O(filesize) PER READ. */
+        if (vfy[i]) {
+            uint64_t first = skip_in / vol->block_size;         /* block index */
+            uint64_t want_end = skip_in + take;                 /* extent-relative */
+            /* One block per device request was the whole steady-state cost: every
+             * request pays ~2.7ms of command setup + IRQ wait regardless of size,
+             * so an 8 KB read cost 2 requests (~5.4ms) to move 8 KB -- measured at
+             * ~690 ms/MB, which is exactly what the profile showed. Batch like the
+             * verify loop below. `last` is the exclusive block bound: ceil to a
+             * block, clamped to the extent, so we never read past what was asked
+             * for and `esz - bstart` can never underflow. */
+            uint64_t last = (want_end + vol->block_size - 1) / vol->block_size;
+            if (last > ext[i].length) last = ext[i].length;
+            for (uint64_t blk = first; blk < last; ) {
+                uint64_t nb = last - blk;
+                if (nb > EMBKFS_IO_BATCH_BLOCKS) nb = EMBKFS_IO_BATCH_BLOCKS;
+                rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb,
+                                     (uint32_t)(nb * spb), iobatch);
+                if (rc != EMBK_OK) { return rc; }
+                for (uint64_t j = 0; j < nb; j++) {
+                    uint64_t b = blk + j;
+                    uint64_t bstart = b * vol->block_size;
+                    uint64_t chunk = esz - bstart;
+                    if (chunk > vol->block_size) chunk = vol->block_size;
+                    uint8_t *blkbuf = iobatch + j * vol->block_size;
+                    /* XTS is keyed by ABSOLUTE disk block, so batching must keep
+                     * using each block's own index -- not the batch's first. */
+                    if (enc) {
+                        aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + b,
+                                        blkbuf, blkbuf, vol->block_size);
+                    }
+                    uint64_t lo = bstart > skip_in ? bstart : skip_in;
+                    uint64_t hi_a = bstart + chunk, hi_b = want_end;
+                    uint64_t hi = hi_a < hi_b ? hi_a : hi_b;
+                    if (hi > lo) {
+                        memcpy(out + done + (lo - skip_in), blkbuf + (lo - bstart), hi - lo);
+                    }
+                }
+                blk += nb;
+            }
+            done += take; elog += esz;
+            continue;
+        }
+
+        /* FIRST touch of this extent: read every block and verify the checksum
+         * (it was computed at write time over the WHOLE extent, so there is no
+         * cheaper way to establish trust), copying out only what was asked for.
+         * Then remember it, so the reads above can be cheap. */
+        /* BATCHED, same reasoning as read_object_prefix: one device request per
+         * EMBKFS_IO_BATCH_BLOCKS blocks. This is the once-per-extent verify, so
+         * for a single-extent 10 MB file it is 2,647 blocks -- at one request
+         * each that alone was ~7 s. */
+        uint32_t csum = 0;
+        uint64_t written = 0;
+        for (uint64_t blk = 0; blk < ext[i].length; ) {
+            uint64_t nb = ext[i].length - blk;
+            if (nb > EMBKFS_IO_BATCH_BLOCKS) nb = EMBKFS_IO_BATCH_BLOCKS;
+            rc = embk_block_read(vol->dev, (ext[i].disk_block + blk) * spb,
+                                 (uint32_t)(nb * spb), iobatch);
+            if (rc != EMBK_OK) { return rc; }
+
+            for (uint64_t j = 0; j < nb; j++) {
+                uint8_t *blkbuf = iobatch + j * vol->block_size;
+                uint64_t chunk = esz - written;
+                if (chunk > vol->block_size) chunk = vol->block_size;
+                csum = embk_crc32c(blkbuf, enc ? vol->block_size : chunk, csum);
+                if (enc) {
+                    aes_xts_decrypt(embkfs_xts(vol), ext[i].disk_block + blk + j,
+                                    blkbuf, blkbuf, vol->block_size);
+                }
+                /* Intersect this block's logical span [written, written+chunk)
+                 * with the wanted span [skip_in, skip_in+take), extent-relative. */
+                uint64_t lo = written > skip_in ? written : skip_in;
+                uint64_t hi_a = written + chunk, hi_b = skip_in + take;
+                uint64_t hi = hi_a < hi_b ? hi_a : hi_b;
+                if (hi > lo) {
+                    memcpy(out + done + (lo - skip_in), blkbuf + (lo - written), hi - lo);
+                }
+                written += chunk;
+            }
+            blk += nb;
+        }
+        if (csum != ext[i].checksum) { return -EMBK_EINVAL; }
+        vfy[i] = 1;                     /* verified for this (oid, generation) */
+        done += take; elog += esz;
+    }
+
+    /* ext is the CACHE's array now -- must NOT be freed here. */
+    *out_read = done;
     return EMBK_OK;
 }
 
@@ -4689,6 +5359,46 @@ int embkfs_link_name(struct embkfs_volume *vol, uint64_t target_oid,
     rc = embkfs_txn_apply_ops(vol, ops, nops, new_gen);
     kfree(add_buf);
     return rc;
+}
+
+/* chmod: set the PERMISSION bits of an object's mode.
+ *
+ * REAL, not a stub: EMBKFS inodes have carried a mode since v1 -- there was
+ * simply never a road from userspace to change it. git init is the caller that
+ * exposed the gap (it chmods a lockfile to probe core.filemode, and dies if that
+ * fails).
+ *
+ * The FILE-TYPE bits (EMBKFS_S_IFMT) are preserved from the existing inode and
+ * the caller's are ignored: chmod changes permissions, never what a thing IS.
+ * A caller passing S_IFDIR at a regular file must not be able to turn it into a
+ * directory by accident.
+ *
+ * ctime, not mtime: the inode changed, the CONTENT did not -- the same POSIX
+ * pairing embkfs_link_name observes just above. */
+int embkfs_chmod_object(struct embkfs_volume *vol, uint64_t oid, uint32_t mode)
+{
+    static uint8_t probe[4096];
+    if (!vol) return -EMBK_EINVAL;
+    if (vol->read_only) return -EMBK_EROFS;
+
+    const struct embk_item_header *ii =
+        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
+    if (!ii) return -EMBK_ENOENT;
+    const struct embk_inode_item *ino =
+        embk_item_data(probe, vol->block_size, ii, sizeof *ino);
+    if (!ino) return -EMBK_EINVAL;
+
+    struct embk_inode_item upd = *ino;
+    uint64_t new_gen = vol->generation + 1;
+    upd.mode       = (ino->mode & EMBKFS_S_IFMT) | (mode & ~EMBKFS_S_IFMT);
+    upd.ctime      = rtc_now_ns();
+    upd.generation = new_gen;
+
+    struct embk_put op = {
+        .key = { .object_id = oid, .type = EMBK_TYPE_INODE, .offset = 0 },
+        .data = (const uint8_t *)&upd, .size = sizeof upd };
+
+    return embkfs_txn_apply_ops(vol, &op, 1, new_gen);
 }
 
 int embkfs_link_path(struct embkfs_volume *vol, uint64_t start_dir_oid,

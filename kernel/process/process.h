@@ -133,6 +133,18 @@ struct thread {
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */
     uint64_t user_rsp;         /**< User mode stack pointer (ring-3 threads only) */
+
+    /* The thread pointer: what IA32_FS_BASE is set to while this thread runs, so
+     * `mov %fs:0x0,%reg` finds its TCB. 0 for kthreads and for any ring-3 thread
+     * that never called sys_set_fs_base -- writing 0 is harmless, and a program
+     * with no TLS never reads %fs at all.
+     *
+     * THIS FIELD IS AUTHORITATIVE, not a cache of the MSR: CR4.FSGSBASE is off
+     * (see cpu/fsbase.h), so ring 3 cannot WRFSBASE and the kernel is the only
+     * writer. schedule() reinstalls it on every switch; nothing ever reads the
+     * MSR back. A thread inherits nothing here -- each sets up its own. */
+    uint64_t fs_base;
+
     enum process_state state;  /**< Current state of this thread */
 
     /* Wait-queue membership. wait_queue is NULL unless state == BLOCKED;
@@ -228,6 +240,13 @@ struct thread {
     uint64_t argc;          /* number of argv[] entries (user-mode threads only) */
     uint64_t argv_uva;          /* pointer to argv[] array (user-mode threads only) */
     bool has_argv;          /* true if this thread has a valid argc/argv_uva (user-mode threads only) */
+    uint64_t envp_uva;      /* pointer to the NULL-terminated envp[] array in the
+                             * child's address space, or 0 for NO environment.
+                             * Delivered in RDX -- main(argc, argv, envp). 0 is a
+                             * first-class answer here, not a failure: a child is
+                             * only given an environment when its parent passes
+                             * one (see spawn.h). Guarded by has_argv, which is
+                             * set on the same path. */
 };
 
 /* The resource owner: address space, pid, parent/child tracking, fd/handle
@@ -239,6 +258,25 @@ struct thread {
 struct process {
     uint32_t pid;              /**< Process ID. 0 means this slot is free. */
     uint64_t pml4_phys;        /**< Physical address of this process's PML4 (page table) */
+
+    /** Cancellation: "stop what you are doing" — see docs/INTERRUPTION.md.
+     *
+     * EmbLink has no signals and injects nothing into user control flow. This
+     * flag is the whole mechanism: a blocking syscall that sees it set returns
+     * -EMBK_ECANCELED instead of sleeping, so the process learns at a point it
+     * ALREADY checks (a syscall return) rather than on an interrupted stack.
+     * sys_cancelled() lets a compute loop with no syscalls poll it.
+     *
+     * STICKY on purpose: once set it is never cleared. A process must not be
+     * able to "miss" a cancellation by being between calls, and cleanup code
+     * that itself blocks would deadlock if the flag auto-cleared on read.
+     *
+     * Only a parent holding this child's HANDLE can set it (sys_cancel), or the
+     * console's routed interrupt target. Never ambient.
+     *
+     * Cancellation is POLITE and may be ignored forever; process_kill() remains
+     * the uncatchable backstop, and escalating is the parent's policy. */
+    volatile bool cancelled;
 
     /* Parent/child tracking for a real blocking sys_wait/process_wait(). */
     struct process *parent;    /* who called spawn() to create us. NULL means
@@ -393,6 +431,25 @@ int process_create(const char *path, char *const argv[], int argc,
                                  const struct spawn_file_action *actions, int n_count);
 
 /**
+ * @brief Create a new process WITH an explicit environment.
+ *
+ * process_create() is this with envp==NULL, i.e. a child with NO environment --
+ * which is the EmbLink default and an honest one: nothing is inherited unless a
+ * parent names it (see spawn.h's SPAWN_ENVP_MAX comment).
+ *
+ * @param envp NULL-terminated array of "KEY=VALUE" strings, or NULL for none.
+ *             Copied into the child's own stack before this returns, so the
+ *             caller's storage need not outlive the call -- same contract as
+ *             argv. Bounded by SPAWN_ENVP_MAX / SPAWN_ENVP_BYTES_MAX; a request
+ *             over budget is rejected with -EMBK_E2BIG rather than truncated,
+ *             because a SILENTLY half-delivered environment would surface as an
+ *             inexplicable missing variable much later.
+ */
+int process_create_env(const char *path, char *const argv[], int argc,
+                       char *const envp[],
+                       const struct spawn_file_action *actions, int n_count);
+
+/**
  * @brief Switch to the next ready thread in the scheduler.
  */
 void schedule(void);
@@ -441,6 +498,34 @@ void wait_queue_wake_one(struct wait_queue *wq);
 
 /** @brief Wake every thread waiting on `wq` (BLOCKED -> READY). */
 void wait_queue_wake_all(struct wait_queue *wq);
+
+/**
+ * @brief Ask a process to stop — the POLITE half (docs/INTERRUPTION.md).
+ *
+ * Sets the target's sticky `cancelled` flag and wakes any blocked threads so
+ * their blocking syscalls return -EMBK_ECANCELED instead of sleeping on. Runs no
+ * handler and injects nothing: the target learns at a syscall boundary, or by
+ * polling sys_cancelled().
+ *
+ * Destroys nothing and may be ignored forever — process_kill() is the
+ * uncatchable backstop, and escalating is the caller's policy. Cancelling an
+ * already-dead process succeeds (the requested end state holds).
+ *
+ * @return EMBK_OK, or -EMBK_EINVAL if no such process.
+ */
+int process_cancel(uint32_t pid);
+
+/**
+ * @brief Has `pid` been cancelled? 1 / 0, or -EMBK_EINVAL if no such process.
+ *
+ * Exists for the ESCALATION half of docs/INTERRUPTION.md: a parent that
+ * delegated ^C to a child cannot see the keystroke (the kernel consumed it), so
+ * the only way it can start its grace-then-kill clock is to observe the child's
+ * cancel state. Without this, "cancelled but declining" is indistinguishable
+ * from "healthy long-running command" — and the parent would either never
+ * escalate or kill innocent slow children.
+ */
+int process_is_cancelled(uint32_t pid);
 
 /* Blocking primitives for IPC and other kernel subsystems outside process.c.
  * sched_lock/unlock take/release the global scheduler lock (which the
@@ -700,7 +785,72 @@ int process_handle_reap_dead(struct process *owner);
  * (cpu/usercopy.c's access_ok(), fs/fd.c's fd_table()) checks
  * current_thread, not current_process, for exactly this reason. `this_cpu()`
  * itself is declared in percpu.h, included above. */
-#define current_thread (this_cpu()->current_thread)
-#define current_process (current_thread->proc)
+/* ---- reading "what is this core running", SAFELY ------------------------
+ *
+ * The underlying per-CPU read is TWO steps: this_cpu() resolves the core
+ * (opening with a SLOW, uncached MMIO LAPIC-ID read), then the result is
+ * dereferenced. Syscalls run with IF=1 (syscall_dispatch sti's), so a timer
+ * can land between those steps -- and if the scheduler resumes this thread
+ * ON A DIFFERENT CORE, the already-computed &cpu_table[old] still sitting in
+ * a register makes the deref return whatever OTHER thread is by then running
+ * on the old core. You silently get a FOREIGN thread/process.
+ *
+ * That is not theoretical -- the wide MMIO window made it reachable, and it
+ * shipped TWO very different bugs before being understood:
+ *   - access_ok() validating a user pointer against a foreign address space
+ *     -> the long-open, SMP-only "transient EFAULT" / sys_read byte drop;
+ *   - sys_sbrk() growing a FOREIGN process's heap, mapping the pages into
+ *     their pml4 and handing OUR malloc THEIR break -> a hard user-mode page
+ *     fault in shell.elf's malloc_extend_top.
+ *
+ * So the read is atomic BY CONSTRUCTION here: resolve-core and read-field
+ * happen inside one IF=0 window, and only the RESULT escapes (a thread /
+ * process pointer stays valid for its owner no matter which core it runs on
+ * a microsecond later). Restoring IF only when it was already set means this
+ * is equally correct under g_sched_lock or in an IRQ -- it never turns
+ * interrupts on behind a caller's back.
+ *
+ * Cost: a pushfq/cli/sti around a read that ALREADY pays an MMIO LAPIC
+ * access. Correctness is worth vastly more than those few cycles; if the
+ * read ever shows up in a profile, the real answer is the one Linux uses --
+ * make it a single %gs-relative instruction, or derive it from the kernel
+ * stack pointer (thread-owned => migration-safe by construction) -- not to
+ * hand the footgun back to every caller. */
+static inline struct thread *current_thread_atomic(void) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    struct thread *t = this_cpu()->cur_thread;   /* no IRQ -> no migration */
+    if (flags & (1ULL << 9)) {                    /* restore IF only if it was set:
+                                                   * never enable interrupts inside
+                                                   * a caller that had them off */
+        __asm__ volatile("sti" ::: "memory");
+    }
+    return t;
+}
+
+static inline struct process *current_process_atomic(void) {
+    struct thread *t = current_thread_atomic();
+    return t ? t->proc : (struct process *)0;
+}
+
+/* The names everything already uses -- now safe BY DEFAULT. Previously these
+ * expanded to the raw two-step read, so all ~150 call sites across the kernel
+ * carried the race and every NEW call site inherited it. Routing the macros
+ * through the accessors fixes them all at once and makes the correct thing
+ * the automatic thing.
+ *
+ * READ-ONLY, deliberately: a call is not an lvalue, so `current_thread = x`
+ * no longer compiles. That is the point -- WRITES belong to the scheduler
+ * and must happen with preemption already off, which the four writers in
+ * process.c satisfy (g_sched_lock held / early boot). They write the field
+ * directly: `this_cpu()->cur_thread = t`. (Spellable at all only because the
+ * field is named cur_thread, not current_thread -- a same-named field made
+ * every direct access expand into itself.)
+ *
+ * `current_process` stays a derived read (`->proc`) and is likewise not
+ * assignable: `current_process = x` would have meant "reassign the current
+ * thread's owner", never what any caller wanted. */
+#define current_thread  (current_thread_atomic())
+#define current_process (current_process_atomic())
 
 #endif /* __PROCESS_H__ */

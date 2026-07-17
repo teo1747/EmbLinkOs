@@ -5,6 +5,7 @@
 #include "drivers/char/serial.h"
 #include "include/kstring.h"   // for memcpy
 #include "mm/pmm.h"            // for KV2P, KERNEL_VIRTUAL_BASE
+#include "drivers/timer/hpet.h" // blkstat time-in-device attribution
 
 #include <stdint.h>
 
@@ -22,6 +23,26 @@ static uint32_t disk_letters = 0;
 // One shared bounce buffer in kernel BSS (low physical, KV2P-able, < 4GB).
 // Sized to the max single transfer the adapters issue (64 sectors = 32KB).
 static uint8_t block_bounce[64 * 512] __attribute__((aligned(16)));
+
+// Request counters (see block.h). Counts requests that actually reach a
+// driver -- the bounce path issues several per call, so this is incremented at the
+// dev->read sites, NOT at entry to embk_block_read.
+static struct embk_blkstat blkstat;
+
+void embk_blkstat_reset(void) { blkstat.reads = 0; blkstat.read_blocks = 0; blkstat.read_us = 0; }
+void embk_blkstat_get(struct embk_blkstat *out) { if (out) *out = blkstat; }
+
+// Microseconds, straight off the HPET. Only used to attribute wall time to the
+// device, so a 0 on a machine without an HPET just makes the attribution empty
+// rather than wrong.
+static uint64_t blk_now_us(void) {
+    if (!hpet_available()) return 0;
+    uint64_t pf = hpet_period_fs();               // femtoseconds per tick
+    if (!pf) return 0;
+    uint64_t tpus = 1000000000ULL / pf;           // ticks per microsecond
+    if (tpus == 0) tpus = 1;
+    return hpet_read_counter() / tpus;
+}
 
 // Does `buf` satisfy `dev`'s DMA constraints?
 static bool buffer_dma_ok(struct embk_block_device *dev, const void *buf) {
@@ -102,7 +123,11 @@ int embk_block_read(struct embk_block_device *dev,
 
     // Fast path: buffer already DMA-safe for this device.
     if (buffer_dma_ok(dev, buffer)) {
-        return dev->read(dev, lba, count, buffer);
+        blkstat.reads++; blkstat.read_blocks += count;
+        uint64_t t0 = blk_now_us();
+        int rc = dev->read(dev, lba, count, buffer);
+        blkstat.read_us += blk_now_us() - t0;
+        return rc;
     }
 
     // Bounce path: read in bounce-sized chunks, copy out.
@@ -110,7 +135,10 @@ int embk_block_read(struct embk_block_device *dev,
     uint8_t *dst = (uint8_t *)buffer;
     while (count > 0) {
         uint32_t chunk = (count > max_blocks) ? max_blocks : count;
+        blkstat.reads++; blkstat.read_blocks += chunk;
+        uint64_t t0 = blk_now_us();
         int rc = dev->read(dev, lba, chunk, block_bounce);
+        blkstat.read_us += blk_now_us() - t0;
         if (rc != EMBK_OK) return rc;
         memcpy(dst, block_bounce, (size_t)chunk * (size_t)dev->block_size);
         lba   += chunk;
