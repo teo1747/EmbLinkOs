@@ -23,12 +23,35 @@ rather than checked in.
 import json
 import os
 import glob
+import shutil
 import subprocess
 
 ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-CC = "/usr/local/cross/bin/x86_64-elf-gcc"
-CXX = "/home/motsou/cross/gcc-cxx/bin/x86_64-elf-g++"   # optional; see HAVE_CXX
-NEWLIB_INC = "/home/motsou/cross/newlib-c99/x86_64-elf/include"
+
+
+def _make_var(name, default=""):
+    """Ask the Makefile for a variable, so this script cannot drift from the
+    build and contains nobody's home directory. The Makefile's `?=` defaults
+    stay the single source of truth; override them there or on the command
+    line and clangd follows automatically."""
+    try:
+        out = subprocess.run(["make", "-C", ROOT, "-s", "--no-print-directory",
+                              "print-" + name],
+                             capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() or default
+    except Exception:
+        return default
+
+
+# CC: on PATH is the normal case (docs/BUILD_SETUP.md puts the cross toolchain
+# there); fall back to the conventional location if it is not.
+CC = shutil.which("x86_64-elf-gcc") or "/usr/local/cross/bin/x86_64-elf-gcc"
+
+_NEWLIB_PREFIX = _make_var("newlib-prefix")
+NEWLIB_INC = (_NEWLIB_PREFIX + "/x86_64-elf/include") if _NEWLIB_PREFIX else ""
+
+_CXX_PREFIX = _make_var("cxx-prefix")
+CXX = (_CXX_PREFIX + "/bin/x86_64-elf-g++") if _CXX_PREFIX else ""   # optional; see HAVE_CXX
 
 
 def toolchain_isystem():

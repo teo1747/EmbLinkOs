@@ -40,20 +40,68 @@ typedef struct block {
 #define MIN_BLOCK_SIZE (sizeof(block_t) + KHEAP_ALIGNMENT + sizeof(uint64_t))
 
 
-// Slab pool: manages fixed-size allocations. Each pool maintains a free list
-// of pre-carved objects from a "slab block" (a larger allocation subdivided).
-// Each object is prefixed with: [magic (1 byte)][pool_idx (1 byte)][user_data]
-#define SLAB_OBJ_HEADER_SIZE 2
-#define SLAB_MAGIC 0xAA
-
+/* Slab pools: O(1) alloc/free for fixed sizes (16..1024). Rebuilt after the
+ * first attempt was disabled for two fatal bugs -- documented here because the
+ * fixes ARE the design:
+ *
+ *   1. DISCRIMINATION BY RANGE, not by a magic byte. The old version tagged each
+ *      object [0xAA][pool] and hoped kfree could tell slab from general by that
+ *      byte -- but 0xAA occurs in ordinary data, so it collided (this is the
+ *      "metadata collision" the TODO named). Instead, every slab region records
+ *      its [start,end) in g_slab_ranges[]; kfree/krealloc look a pointer up
+ *      there. A range hit is DEFINITIVE -- it cannot false-positive on general
+ *      data the way a byte can.
+ *
+ *   2. INTRUSIVE free list, not a side array. The old free_list was a void*[]
+ *      grown with kheap_alloc() -- called from *under* heap_lock, which re-locks
+ *      the same spinlock and SELF-DEADLOCKS. A free object now stores the next
+ *      pointer in its OWN first 8 bytes (obj_size >= 16 >= sizeof(void*)), so
+ *      push/pop are O(1) and allocate nothing.
+ *
+ * A slab region is just a permanent general allocation (kheap_alloc_locked)
+ * subdivided into objects -- no manual block-list surgery, and the region keeps
+ * the general allocator's canaries. Objects have NO per-object header. */
 typedef struct slab_pool {
-    uint64_t obj_size;      // size of each object (16, 32, 64, ...)
-    void **free_list;       // singly-linked free list (void* array, NULL terminated)
-    uint32_t free_count;    // number of objects on free list
-    uint32_t free_cap;      // capacity of free_list array
-    uint64_t total_objs;    // total objects ever allocated from this pool
-    uint64_t used_objs;     // objects currently in use
+    uint64_t obj_size;      // 16, 32, 64, ...
+    void    *free_head;     // intrusive: *(void**)obj == next free object
+    uint64_t total_objs;    // objects ever carved into this pool
+    uint64_t used_objs;     // currently handed out
 } slab_pool_t;
+
+/* Registry of slab-owned address ranges. kheap_free()/kheap_realloc() consult it
+ * to route a pointer: a hit means "this is a slab object of pool N", a miss means
+ * "general block". Fixed and bounded; if it fills, grow just declines and the
+ * size falls back to the general allocator (honest degradation, never unsafe). */
+#define SLAB_MAX_RANGES 128
+#define SLAB_REGION_BYTES (8u * 1024u)   // per grow; keeps range count low
+typedef struct slab_range { uintptr_t start, end; uint8_t pool_idx; } slab_range_t;
+static slab_range_t g_slab_ranges[SLAB_MAX_RANGES];
+static int g_slab_range_count;
+
+// Size classes and their pools. Declared here (not lower down) so the lookup
+// helpers below can see slab_sizes[].
+static const uint64_t slab_sizes[KHEAP_SLAB_SIZES] = {
+    16, 32, 64, 128, 256, 512, 1024
+};
+static slab_pool_t slab_pools[KHEAP_SLAB_SIZES];
+
+// pool_idx if ptr lies in a slab region, else -1. The whole discrimination.
+static int slab_range_lookup(void *ptr) {
+    uintptr_t a = (uintptr_t)ptr;
+    for (int i = 0; i < g_slab_range_count; i++) {
+        if (a >= g_slab_ranges[i].start && a < g_slab_ranges[i].end)
+            return g_slab_ranges[i].pool_idx;
+    }
+    return -1;
+}
+
+// Smallest size class that fits `size`, or -1 if too big for any pool. Rounds
+// UP (so kmalloc(20) uses the 32 pool) -- exact-match-only made slabs never fire.
+static inline int slab_class_for(uint64_t size) {
+    for (int i = 0; i < KHEAP_SLAB_SIZES; i++)
+        if (size <= slab_sizes[i]) return i;
+    return -1;
+}
 
 
 static spinlock_t heap_lock = SPINLOCK_INIT; // Spinlock to protect heap data structures in case of concurrent access from multiple cores or interrupts
@@ -64,12 +112,6 @@ static uint64_t  heap_end = 0; // next virtual address beyond the heap
 static uint64_t total_size = 0; // total size of the heap in bytes (including all blocks and canaries)
 static uint64_t used_size = 0;  // total used bytes (excluding free blocks and canaries)
 static uint64_t block_count = 0; // total number of blocks (free + used)
-
-// Slab pools for fixed sizes (16, 32, 64, 128, 256, 512, 1024)
-static const uint64_t slab_sizes[KHEAP_SLAB_SIZES] = {
-    16, 32, 64, 128, 256, 512, 1024
-};
-static slab_pool_t slab_pools[KHEAP_SLAB_SIZES];
 
 // Round up size to next multiple of KHEAP_ALIGNMENT(align must be power of 2)
 static inline uint64_t align_up(uint64_t size, uint64_t align) {
@@ -97,15 +139,6 @@ static inline block_t *block_next_addr(block_t *block) {
 }
 
 // Find slab pool index for a given size, or -1 if no exact match
-static inline int slab_find_pool(uint64_t size) {
-    for (int i = 0; i < KHEAP_SLAB_SIZES; i++) {
-        if (size == slab_sizes[i])
-            return i;
-    }
-    return -1;
-}
-
-
 // Allocate one more page and append it to the heap. Returns pointer to the new block or NULL on failure.
 static uint64_t heap_grow(uint64_t bytes) {
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE; // Round up to full pages
@@ -132,138 +165,66 @@ static uint64_t heap_grow(uint64_t bytes) {
 static void kheap_slab_init(void) {
     for (int i = 0; i < KHEAP_SLAB_SIZES; i++) {
         slab_pools[i].obj_size = slab_sizes[i];
-        slab_pools[i].free_list = 0;
-        slab_pools[i].free_count = 0;
-        slab_pools[i].free_cap = 0;
+        slab_pools[i].free_head = 0;
         slab_pools[i].total_objs = 0;
         slab_pools[i].used_objs = 0;
     }
+    g_slab_range_count = 0;
 }
 
-// Grow a slab pool by allocating a new slab block via the main heap
-// Carves KHEAP_SLAB_MIN_OBJS objects and adds them to the free list
+static void *kheap_alloc_locked(uint64_t size);   /* grow carves regions from it */
+
+/* Grow a pool: carve one region of SLAB_REGION_BYTES worth of objects and thread
+ * them onto the intrusive free list. The region is a PERMANENT general
+ * allocation -- we never free it, we subdivide it -- so it keeps the general
+ * allocator's canaries and needs no manual block-list surgery. Its [start,end)
+ * is registered so kfree can route objects back here by RANGE. */
 static void kheap_slab_grow_locked(slab_pool_t *pool) {
-    uint64_t objs_to_carve = KHEAP_SLAB_MIN_OBJS;
-    // Each object needs header (SLAB_OBJ_HEADER_SIZE) + obj_size
-    uint64_t slab_block_size = objs_to_carve * (SLAB_OBJ_HEADER_SIZE + pool->obj_size) + sizeof(block_t) + sizeof(uint64_t);
+    if (g_slab_range_count >= SLAB_MAX_RANGES)
+        return;   /* registry full: decline, and the size falls back to general */
 
-    // Allocate a slab block from the main allocator (NOT from a pool)
-    // We call kheap_alloc_locked with a "don't-recurse" marker to avoid infinite loop
-    block_t *current = heap_head;
-    block_t *suitable = NULL;
-    while (current) {
-        if (!(current->flags & BLOCK_USED) && current->size >= slab_block_size) {
-            suitable = current;
-            break;
-        }
-        current = current->next;
+    uint64_t objs = SLAB_REGION_BYTES / pool->obj_size;
+    if (objs < KHEAP_SLAB_MIN_OBJS) objs = KHEAP_SLAB_MIN_OBJS;
+
+    /* kheap_alloc_locked, NOT kheap_alloc: we already hold heap_lock, and the
+     * public wrapper would re-lock the same spinlock and self-deadlock -- the
+     * exact bug that disabled the first slab. This region request is > 1024, so
+     * it goes to the general path, not recursively back into a slab. */
+    uint8_t *region = (uint8_t *)kheap_alloc_locked(objs * pool->obj_size);
+    if (!region)
+        return;   /* OOM: pool stays empty, caller falls back to general */
+
+    g_slab_ranges[g_slab_range_count].start    = (uintptr_t)region;
+    g_slab_ranges[g_slab_range_count].end      = (uintptr_t)region + objs * pool->obj_size;
+    g_slab_ranges[g_slab_range_count].pool_idx = (uint8_t)(pool - slab_pools);
+    g_slab_range_count++;
+
+    for (uint64_t i = 0; i < objs; i++) {
+        void *obj = region + i * pool->obj_size;
+        *(void **)obj = pool->free_head;   /* intrusive push */
+        pool->free_head = obj;
     }
-
-    if (!suitable) {
-        uint64_t new_block_addr = heap_grow(slab_block_size);
-        if (!new_block_addr) {
-            return;  // Out of memory
-        }
-        block_t *last = heap_head;
-        while (last->next) {
-            last = last->next;
-        }
-        suitable = (block_t *)new_block_addr;
-        suitable->size = ((slab_block_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-        suitable->flags = BLOCK_FREE;
-        suitable->prev = last;
-        suitable->next = 0;
-        suitable->canary = 0;
-        *block_tail_canary(suitable) = KHEAP_CANARY_TAIL;
-        last->next = suitable;
-        block_count++;
-    }
-
-    // Mark this block as slab-allocated (for special handling on free)
-    uint64_t leftover = suitable->size - slab_block_size;
-    if (leftover >= MIN_BLOCK_SIZE) {
-        block_t *new_block = (block_t *)((uint8_t *)suitable + slab_block_size);
-        new_block->size = leftover;
-        new_block->flags = BLOCK_FREE;
-        new_block->prev = suitable;
-        new_block->next = suitable->next;
-        new_block->canary = 0;
-        *block_tail_canary(new_block) = KHEAP_CANARY_TAIL;
-        if (suitable->next) {
-            suitable->next->prev = new_block;
-        }
-        suitable->next = new_block;
-        suitable->size = slab_block_size;
-        block_count++;
-    }
-
-    suitable->flags = BLOCK_USED;  // Mark as used (no slab flag needed anymore)
-    suitable->canary = KHEAP_CANARY_HEAD;
-    *block_tail_canary(suitable) = KHEAP_CANARY_TAIL;
-
-    // Carve objects from the slab block and add to free list
-    uint8_t *slab_data = (uint8_t *)block_user_data(suitable);
-    uint16_t pool_idx = (uint16_t)(pool - slab_pools);  // Calculate pool index once
-    for (uint64_t i = 0; i < objs_to_carve; i++) {
-        uint8_t *obj_slot = slab_data + i * (SLAB_OBJ_HEADER_SIZE + pool->obj_size);
-        // Store magic and pool index in the header
-        obj_slot[0] = SLAB_MAGIC;
-        obj_slot[1] = (uint8_t)pool_idx;
-        void *obj = (void *)(obj_slot + SLAB_OBJ_HEADER_SIZE);   // skip header
-
-        // Grow free_list array if needed
-        if (pool->free_count >= pool->free_cap) {
-            uint32_t new_cap = pool->free_cap ? pool->free_cap * 2 : 16;
-            void **new_list = (void **)kheap_alloc(new_cap * sizeof(void *));
-            if (!new_list)
-                return;  // Out of memory
-            if (pool->free_list) {
-                for (uint32_t j = 0; j < pool->free_count; j++) {
-                    new_list[j] = pool->free_list[j];
-                }
-                kheap_free(pool->free_list);
-            }
-            pool->free_list = new_list;
-            pool->free_cap = new_cap;
-        }
-
-        pool->free_list[pool->free_count++] = obj;
-        pool->total_objs++;
-    }
+    pool->total_objs += objs;
 }
 
-// Allocate from a slab pool. Returns NULL if pool is exhausted and can't grow.
+// O(1) alloc: pop the intrusive free list, growing the pool if empty.
 static void *kheap_slab_alloc_locked(slab_pool_t *pool) {
-    if (pool->free_count == 0) {
+    if (!pool->free_head) {
         kheap_slab_grow_locked(pool);
-        if (pool->free_count == 0) {
-            return NULL;  // Failed to grow
-        }
+        if (!pool->free_head)
+            return NULL;   // couldn't grow (OOM or registry full)
     }
-
-    void *obj = pool->free_list[--pool->free_count];
+    void *obj = pool->free_head;
+    pool->free_head = *(void **)obj;   /* intrusive pop */
     pool->used_objs++;
     return obj;
 }
 
-// Free an object back to its slab pool
+// O(1) free: push onto the intrusive free list. The caller has already confirmed
+// (by range lookup) that `obj` belongs to `pool`.
 static void kheap_slab_free_locked(slab_pool_t *pool, void *obj) {
-    if (pool->free_count >= pool->free_cap) {
-        uint32_t new_cap = pool->free_cap ? pool->free_cap * 2 : 16;
-        void **new_list = (void **)kheap_alloc(new_cap * sizeof(void *));
-        if (!new_list)
-            return;  // Out of memory, leak the object
-        if (pool->free_list) {
-            for (uint32_t j = 0; j < pool->free_count; j++) {
-                new_list[j] = pool->free_list[j];
-            }
-            kheap_free(pool->free_list);
-        }
-        pool->free_list = new_list;
-        pool->free_cap = new_cap;
-    }
-
-    pool->free_list[pool->free_count++] = obj;
+    *(void **)obj = pool->free_head;
+    pool->free_head = obj;
     pool->used_objs--;
 }
 
@@ -307,9 +268,15 @@ static void *kheap_alloc_locked(uint64_t size) {
         return 0; // Don't allocate zero bytes
     }
 
-    // Try slab pools first for fixed sizes (DISABLED FOR NOW - causing issues)
-    // int slab_idx = slab_find_pool(size);
-    // if (slab_idx >= 0) { ... }
+    // Small requests go to a slab pool (O(1), less fragmentation). On slab OOM /
+    // registry-full, slab_alloc returns NULL and we fall through to the general
+    // first-fit path below -- the slab is an optimisation, never a requirement.
+    int cls = slab_class_for(size);
+    if (cls >= 0) {
+        void *obj = kheap_slab_alloc_locked(&slab_pools[cls]);
+        if (obj)
+            return obj;
+    }
 
     // Calculate total block size needed (user data + header + tail canary), aligned to KHEAP_ALIGNMENT
 
@@ -385,6 +352,16 @@ static void *kheap_alloc_locked(uint64_t size) {
 static void kheap_free_locked(void *ptr) {
     if (!ptr) {
         return; // No operation on NULL pointer
+    }
+
+    // Slab object? Decide by RANGE, not by a byte in the object -- the range
+    // registry cannot false-positive the way the old magic byte did. A hit means
+    // this pointer is definitively a slab object; route it to its pool and stop
+    // (it has no block_t header, so the general path below would misread it).
+    int cls = slab_range_lookup(ptr);
+    if (cls >= 0) {
+        kheap_slab_free_locked(&slab_pools[cls], ptr);
+        return;
     }
 
     block_t *block = block_from_user(ptr);
@@ -477,6 +454,27 @@ void *kheap_realloc(void *ptr, uint64_t new_size) {
     }
 
     spin_lock(&heap_lock);
+
+    // Slab object? It has no block_t header, so the general path below would
+    // misread block->size. Handle by class: if the new size still fits this
+    // class's object, the pointer is unchanged; otherwise allocate fresh, copy
+    // the object's worth of bytes, and free the old back to its pool.
+    int cls = slab_range_lookup(ptr);
+    if (cls >= 0) {
+        uint64_t obj_size = slab_sizes[cls];
+        if (new_size <= obj_size) {
+            spin_unlock(&heap_lock);
+            return ptr;
+        }
+        void *new_ptr = kheap_alloc_locked(new_size);   /* under the lock already */
+        if (new_ptr) {
+            uint8_t *s = (uint8_t *)ptr, *d = (uint8_t *)new_ptr;
+            for (uint64_t i = 0; i < obj_size; i++) d[i] = s[i];
+            kheap_slab_free_locked(&slab_pools[cls], ptr);
+        }
+        spin_unlock(&heap_lock);   /* new_ptr==NULL: original intact, per realloc contract */
+        return new_ptr;
+    }
 
     block_t *block = block_from_user(ptr);
     uint64_t old_user_size = block->size - sizeof(block_t) - sizeof(uint64_t);
@@ -612,10 +610,11 @@ void kheap_slab_stats(void) {
     kprintf("=== Slab Pool Stats ===\n");
     for (int i = 0; i < KHEAP_SLAB_SIZES; i++) {
         slab_pool_t *pool = &slab_pools[i];
-        kprintf("  %u-byte pool: %u used / %lu total, %u free\n",
+        kprintf("  %u-byte pool: %lu used / %lu total (%lu free)\n",
                 (unsigned int)pool->obj_size,
-                (unsigned int)pool->used_objs,
+                pool->used_objs,
                 pool->total_objs,
-                (unsigned int)pool->free_count);
+                pool->total_objs - pool->used_objs);
     }
+    kprintf("  slab ranges: %d / %d\n", g_slab_range_count, SLAB_MAX_RANGES);
 }

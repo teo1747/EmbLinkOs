@@ -266,6 +266,35 @@ int read(int fd, void *buf, size_t len) {
  *
  * Returns 0 with `out` filled, or -1 with errno set.
  */
+/* THE WORKING DIRECTORY.
+ *
+ * Deliberately a LIBC fact, not a kernel one. kernel/fs/vfs.c is absolute-only
+ * on purpose ("the ONLY path parser in the kernel"), and the precedent is
+ * already set: when CPython needed relative paths the fix went HERE, to keep
+ * that contract intact and put the POSIX veneer where the rest of the POSIX
+ * veneer lives. So the kernel never sees a relative path -- everything below
+ * hands it an absolute, normalized one.
+ *
+ * PER-PROCESS COMES FREE: every process has its own copy of this libc's data.
+ * There is no kernel state to add, no syscall, and no way for one process's cwd
+ * to leak into another's -- which is the property a kernel implementation would
+ * have had to work to guarantee.
+ *
+ * NOT INHERITED, like everything else here: a child starts at "/" unless its
+ * parent NAMES a starting directory, by passing PWD in the environment (crt0
+ * seeds this from it). Same rule as file-actions and envp -- see the kernel's
+ * spawn.h. A shell that wants `cd` to stick for its children passes PWD; one
+ * that doesn't, doesn't. */
+static char g_cwd[EMBK_PATH_MAX] = "/";
+
+/* Make `in` absolute against g_cwd (if relative) and NORMALIZE it: "." dropped,
+ * ".." pops a component. Output is always absolute and never ends in '/' except
+ * for the root itself.
+ *
+ * The normalization is not decoration. Absolute paths used to pass through
+ * untouched, so "/a/../b" reached the kernel verbatim and failed at a ".."
+ * component the VFS has no rule for. git walks UP to find a repo root -- ".." is
+ * its normal idiom, not an edge case. */
 static int path_abs(const char *in, char *out, size_t out_sz) {
     if (!in) {
         errno = EFAULT;
@@ -279,18 +308,47 @@ static int path_abs(const char *in, char *out, size_t out_sz) {
         return -1;
     }
 
-    size_t len = strlen(in);
+    /* Join first, into a scratch big enough for cwd + '/' + name. */
+    char raw[EMBK_PATH_MAX * 2];
     if (in[0] == '/') {
-        if (len >= out_sz) { errno = ENAMETOOLONG; return -1; }
-        memcpy(out, in, len + 1);
-        return 0;
+        if (strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
+        strcpy(raw, in);
+    } else {
+        size_t cl = strlen(g_cwd);
+        if (cl + 1 + strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
+        strcpy(raw, g_cwd);
+        if (cl > 0 && raw[cl - 1] != '/') strcat(raw, "/");
+        strcat(raw, in);
     }
 
-    /* Relative: resolve against the fixed root. +2 = the leading '/' and the
-     * NUL. */
-    if (len + 2 > out_sz) { errno = ENAMETOOLONG; return -1; }
-    out[0] = '/';
-    memcpy(out + 1, in, len + 1);
+    /* Normalize segment by segment. ".." at the root stays at the root (POSIX:
+     * "/.." is "/"), rather than walking off the front of the buffer. */
+    if (out_sz < 2) { errno = ENAMETOOLONG; return -1; }
+    size_t o = 0;
+    out[o++] = '/';
+    const char *p = raw;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *seg = p;
+        size_t n = 0;
+        while (p[n] && p[n] != '/') n++;
+        p += n;
+
+        if (n == 1 && seg[0] == '.') continue;
+        if (n == 2 && seg[0] == '.' && seg[1] == '.') {
+            while (o > 1 && out[o - 1] != '/') o--;   /* pop the last component */
+            if (o > 1) o--;                            /* and its slash */
+            continue;
+        }
+        if (o > 1) {
+            if (o + 1 >= out_sz) { errno = ENAMETOOLONG; return -1; }
+            out[o++] = '/';
+        }
+        if (o + n >= out_sz) { errno = ENAMETOOLONG; return -1; }
+        for (size_t i = 0; i < n; i++) out[o++] = seg[i];
+    }
+    out[o] = '\0';
     return 0;
 }
 
@@ -598,14 +656,9 @@ int access(const char *path, int mode) {
 /* Working directory                                                   */
 /* ------------------------------------------------------------------ */
 
-/* EmbLink has NO per-process working directory: every VFS path is absolute.
- * Reporting the root is a faithful description of that model rather than a
- * placeholder -- a caller that joins a relative name onto "/" produces exactly
- * the absolute path the VFS expects, so code built on getcwd() behaves right.
- * Failing here instead would stop CPython during startup.
- *
- * chdir() below refuses to move anywhere else, so the pair stays consistent:
- * nobody can come to believe they are somewhere they are not. */
+/* getcwd/chdir are REAL now: see g_cwd + path_abs above. The cwd is this
+ * process's own libc state -- per-process by construction, never shared, never
+ * inherited unless a parent names PWD at spawn. */
 char *getcwd(char *buf, size_t size) {
     if (!buf) {
         /* The GNU "allocate it for me" extension is deliberately not offered;
@@ -614,24 +667,48 @@ char *getcwd(char *buf, size_t size) {
         errno = EINVAL;
         return (char *)0;
     }
-    if (size < 2) { errno = ERANGE; return (char *)0; }
-    buf[0] = '/';
-    buf[1] = '\0';
+    size_t need = strlen(g_cwd) + 1;
+    if (size < need) { errno = ERANGE; return (char *)0; }
+    memcpy(buf, g_cwd, need);
     return buf;
 }
 
+/* chdir VERIFIES before it moves: the target must exist and be a directory.
+ * Storing an unchecked string would let every later relative path resolve
+ * against somewhere that isn't there, turning one bad chdir into a pile of
+ * confusing ENOENTs far from the cause. */
 int chdir(const char *path) {
-    /* Succeed only for the directory we are already (and permanently) in. Any
-     * other target is refused loudly rather than silently ignored, which would
-     * leave the caller resolving paths against a root it didn't choose. */
-    if (path && path[0] == '/' && path[1] == '\0') return 0;
-    errno = ENOSYS;
-    return -1;
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(path, abs, sizeof abs) != 0) return -1;   /* errno set */
+
+    struct stat st;
+    if (stat(abs, &st) != 0) return -1;                     /* ENOENT etc */
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+
+    memcpy(g_cwd, abs, strlen(abs) + 1);
+    return 0;
+}
+
+/* Called by crt0 BEFORE ctors and main, once environ is installed.
+ *
+ * PWD is how a parent HANDS OVER a starting directory -- the same explicit
+ * naming as envp and file-actions, using the mechanism that already exists. No
+ * PWD means no inheritance, and we stay at "/", which is the honest default.
+ *
+ * Best-effort on purpose: a PWD naming somewhere gone must not kill startup, it
+ * must leave us at the root. chdir() does the verifying. */
+void embk_cwd_init_from_env(void) {
+    const char *pwd = getenv("PWD");
+    if (pwd && pwd[0] == '/') (void)chdir(pwd);
 }
 
 int fchdir(int fd) {
+    /* There IS a cwd now, but an fd does not know its own path: fd_entry holds
+     * a vnode (mnt + ino), and nothing maps an ino back to a name. Answering
+     * would mean inventing a path. Honest ENOSYS until the VFS can name a
+     * vnode. */
     (void)fd;
-    errno = ENOSYS;   /* no cwd to change -- see chdir() */
+    errno = ENOSYS;
     return -1;
 }
 
@@ -1044,6 +1121,7 @@ int unlink(const char *path) {
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
+#include <sys/mman.h>
 #include <pwd.h>
 
 /* ---- REAL ------------------------------------------------------------- */
@@ -1184,6 +1262,14 @@ pid_t waitpid(pid_t pid, int *status, int options) {
     (void)pid; (void)status; (void)options;
     errno = ENOSYS; return (pid_t)-1;
 }
+/* WEAK: a libc stub must YIELD to an application that ships its own. CPython
+ * carries a dup2 compat implementation (for platforms lacking the call) and a
+ * strong definition here collides with it -- "multiple definition of `dup2'",
+ * found the moment python.elf was relinked against this libc. Weak means their
+ * definition simply wins, which is what a portable program expects from a libc
+ * it is overriding. (Theirs fails too -- it goes through fcntl(F_DUPFD), which
+ * we also refuse -- but it fails as THEIR code, on their terms.) */
+__attribute__((weak))
 int dup2(int oldfd, int newfd) { (void)oldfd; (void)newfd; errno = ENOSYS; return -1; }
 pid_t setsid(void)             { errno = ENOSYS; return (pid_t)-1; }
 pid_t getpgid(pid_t pid)       { (void)pid; errno = ENOSYS; return (pid_t)-1; }
@@ -1220,6 +1306,25 @@ int ioctl(int fd, unsigned long request, ...) {
     (void)fd; (void)request;
     errno = ENOSYS;
     return -1;
+}
+
+/* NO mmap. Memory here is sbrk (a real growable heap) and typed objects
+ * (shared surfaces, zero-copy windows); mapping a FILE into an address space is
+ * a capability this OS has never had. Refused, not faked out of malloc: an
+ * anonymous-looking block would silently not be MAP_SHARED and would not be
+ * backed by the file the caller named. TCC's `-run` is the caller; `tcc -o`
+ * never reaches here. */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    (void)addr; (void)len; (void)prot; (void)flags; (void)fd; (void)off;
+    errno = ENOSYS;
+    return MAP_FAILED;
+}
+int munmap(void *addr, size_t len) { (void)addr; (void)len; errno = ENOSYS; return -1; }
+int mprotect(void *addr, size_t len, int prot) {
+    (void)addr; (void)len; (void)prot; errno = ENOSYS; return -1;
+}
+int msync(void *addr, size_t len, int flags) {
+    (void)addr; (void)len; (void)flags; errno = ENOSYS; return -1;
 }
 
 int statvfs(const char *path, struct statvfs *buf)  { (void)path; (void)buf; errno = ENOSYS; return -1; }

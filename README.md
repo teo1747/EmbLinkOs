@@ -10,6 +10,14 @@ graphical desktop (`home.elf`), runs multiple windowed apps with a real
 compositor, and has a from-scratch UI toolkit (**EmUI**) that friends can
 build apps against without touching kernel code.
 
+**It also compiles C on itself.** A C compiler (TCC) runs as a normal process
+and produces working programs without ever leaving the OS — compile, assemble,
+link, run. It hosts **C++/libstdc++**, **CPython 3.14** and **git 2.49** too,
+none of them forks. All of that on an OS that is deliberately **not POSIX**:
+there is no `fork`/`exec` here, which is exactly why the compiler is TCC (one
+self-contained binary) and not GCC (a driver that fork/execs `cc1`/`as`/`ld`,
+and so is structurally impossible here). See [docs/PORTS.md](docs/PORTS.md).
+
 ## What it is
 
 EmbLinkOS starts from a 512-byte boot sector and works its way up: real mode
@@ -71,6 +79,15 @@ toolkit apps are built against.
 - A newlib-based libc port (freestanding, static-newlib, and
   dynamically-linked-against-`libembk.so` build modes) — see
   [user/README.md](user/README.md).
+- **A C compiler on the OS** — TCC compiles, assembles and links a program into
+  a running process, entirely on the metal (`test tcc link` → `exit=42`).
+- **C++/libstdc++, CPython 3.14, git 2.49** run as ordinary processes —
+  see [docs/PORTS.md](docs/PORTS.md).
+- A structured, Nushell-flavored **shell** with typed pipelines —
+  see [docs/SHELL.md](docs/SHELL.md).
+- **Interruption** (Ctrl-C) without signals: a routed, capability-scoped
+  cancellation that blocking syscalls observe — see
+  [docs/INTERRUPTION.md](docs/INTERRUPTION.md).
 
 ## Building and running
 
@@ -112,10 +129,14 @@ KVM acceleration, host-side UI unit tests, ...).
 | [docs/EMUI_INTERNALS.md](docs/EMUI_INTERNALS.md) | How EmUI itself is built, for anyone extending the toolkit |
 | [user/README.md](user/README.md) | The userland SDK layers and newlib port details |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System-wide design decisions and the current stack |
+| [docs/PORTS.md](docs/PORTS.md) | C++, CPython, git and the C compiler on the OS — what works, what honestly can't |
+| [docs/SHELL.md](docs/SHELL.md) | The structured shell: typed pipelines, builtins, semantics |
+| [docs/INTERRUPTION.md](docs/INTERRUPTION.md) | Ctrl-C without signals: how cancellation is routed and observed |
 | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) | Phase-by-phase build history |
 | [docs/TODO.md](docs/TODO.md) | Open items by subsystem |
 | [docs/architecture/process-and-scheduling.md](docs/architecture/process-and-scheduling.md) | Process/thread/scheduler deep-dive |
-| [docs/EMBKFS_spec_v2.2.md](docs/EMBKFS_spec_v2.2.md) | The filesystem's on-disk format |
+| [docs/EMBKFS_spec_v2.3.md](docs/EMBKFS_spec_v2.3.md) | The filesystem: latest additions (atomic rename, extents, the read path) |
+| [docs/EMBKFS_spec_v2.2.md](docs/EMBKFS_spec_v2.2.md) | The filesystem's on-disk format (compression, encryption, snapshots) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to make and prove a change in this repo |
 
 ## Project layout
@@ -137,6 +158,7 @@ user/
   lib/                         The userland SDK (embk.h) + newlib retargeting (crt0.c, syscalls.c)
   bin/                         Userland programs, including the home launcher and EmUI apps
 tools/embkfs_mkfs/             Python reference implementation: builds and verifies EMBKFS images
+tools/{tcc,cpython,git,zlib,cxx}/  Build scripts + patches for the ports (see docs/PORTS.md)
 docs/                          Architecture, setup, and UI documentation
 ```
 

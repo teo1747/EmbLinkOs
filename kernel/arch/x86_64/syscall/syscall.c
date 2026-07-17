@@ -1123,6 +1123,30 @@ static int64_t sys_key_poll(struct regs *r) {
     return 0;
 }
 
+/* Pop one KEY EVENT (make OR break, with modifiers) into a user buffer.
+ * Returns 1 on an event, 0 when the queue is empty, -EFAULT on a bad pointer.
+ *
+ * A SECOND stream beside sys_key_poll's characters, not a replacement -- see
+ * keyboard.h for why they cannot be one thing (C0 is full: Up and Ctrl+S are
+ * the same byte, and F-keys / releases have no byte at all). Text readers keep
+ * using key_poll and are untouched.
+ *
+ * Non-blocking on purpose: the callers are frame loops and games, which already
+ * have a clock and must not park a thread on a keypress. */
+static int64_t sys_key_event_poll(struct regs *r) {
+    struct key_event ev;
+    if (!keyboard_event_pop(&ev)) return 0;
+    if (copy_to_user((void *)r->rdi, &ev, sizeof ev) != EMBK_OK) return -EMBK_EFAULT;
+    return 1;
+}
+
+/* The live modifier bitmap (EKM_*). The event stream says what CHANGED; this
+ * says what is held RIGHT NOW, which a poller that missed a make cannot infer. */
+static int64_t sys_key_mods(struct regs *r) {
+    (void)r;
+    return (int64_t)keyboard_mods();
+}
+
 /* Grab/release the keyboard so the kernel shell stops draining it while a UI app
  * owns keystrokes (rdi != 0 grabs). Auto-released when this process is reaped. */
 static int64_t sys_key_grab(struct regs *r) {
@@ -1490,6 +1514,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_rename       62
 #define SYS_ftruncate    63
 #define SYS_chmod        64
+#define SYS_key_event_poll 65
+#define SYS_key_mods       66
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1557,6 +1583,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_rename]       = sys_rename,
     [SYS_ftruncate]    = sys_ftruncate,
     [SYS_chmod]        = sys_chmod,
+    [SYS_key_event_poll] = sys_key_event_poll,
+    [SYS_key_mods]       = sys_key_mods,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

@@ -469,6 +469,60 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_KEY_DEL    0x7F
 #define EMBK_KEY_PGUP   0x0E
 #define EMBK_KEY_PGDN   0x0F
+
+/* ---- key EVENTS (make/break + modifiers) --------------------------------
+ * A SECOND stream beside the characters above, not a replacement. The char
+ * stream answers "what did the user type"; it cannot answer "what key is down"
+ * because C0 is full -- Ctrl+letter owns 0x01-0x1A, so EMBK_KEY_UP (0x13) and
+ * Ctrl+S are literally the same byte, and F-keys/releases have no byte at all.
+ * Keep using embk_key_poll() for text; use this for real key state.
+ * Mirrors EKC_, EKM_ and struct key_event in kernel/drivers/input/keyboard.h --
+ * change one, change both. */
+#define EMBK_KC_F1     0x101   /* F2..F12 follow consecutively */
+#define EMBK_KC_F12    0x10C
+#define EMBK_KC_INS    0x110
+#define EMBK_KC_LWIN   0x111
+#define EMBK_KC_RWIN   0x112
+#define EMBK_KC_MENU   0x113
+#define EMBK_KC_LEFT   0x120
+#define EMBK_KC_RIGHT  0x121
+#define EMBK_KC_UP     0x122
+#define EMBK_KC_DOWN   0x123
+#define EMBK_KC_HOME   0x124
+#define EMBK_KC_END    0x125
+#define EMBK_KC_PGUP   0x126
+#define EMBK_KC_PGDN   0x127
+#define EMBK_KC_DEL    0x128
+#define EMBK_KC_LSHIFT 0x130
+#define EMBK_KC_LCTRL  0x132
+#define EMBK_KC_LALT   0x134
+#define EMBK_KC_CAPS   0x140
+#define EMBK_KC_NUM    0x141
+#define EMBK_KC_SCROLL 0x142
+
+#define EMBK_KM_SHIFT  0x01
+#define EMBK_KM_CTRL   0x02
+#define EMBK_KM_ALT    0x04
+#define EMBK_KM_GUI    0x08
+#define EMBK_KM_CAPS   0x10
+#define EMBK_KM_NUM    0x20
+#define EMBK_KM_SCROLL 0x40
+
+struct embk_key_event {
+    unsigned short code;      /* unshifted ASCII, or an EMBK_KC_* */
+    unsigned char  mods;      /* EMBK_KM_* at event time */
+    unsigned char  pressed;   /* 1 = pressed, 0 = released */
+};
+
+/* 1 = got an event, 0 = queue empty. Never blocks. */
+static inline int embk_key_event_poll(struct embk_key_event *ev) {
+    return (int)embk_syscall1(EMBK_SYS_key_event_poll, (uint64_t)(uintptr_t)ev);
+}
+/* What is held RIGHT NOW (EMBK_KM_*), which events alone cannot tell you if
+ * you missed the press. */
+static inline int embk_key_mods(void) {
+    return (int)embk_syscall0(EMBK_SYS_key_mods);
+}
 struct embk_ui_input { int32_t x, y; uint32_t buttons; int32_t wheel; };
 static inline int embk_ui_input(struct embk_ui_input *out) {
     return (int)embk_syscall1(EMBK_SYS_ui_input, (int64_t)(intptr_t)out);

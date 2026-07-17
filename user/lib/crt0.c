@@ -239,6 +239,11 @@ static void run_ctors(void)
 extern char **environ;
 extern char *embk_empty_env[1];
 
+/* syscalls.c: seeds the working directory from PWD, if the parent named one.
+ * Must run AFTER environ is installed and BEFORE anything resolves a relative
+ * path -- a ctor that opens a data file is exactly that. */
+extern void embk_cwd_init_from_env(void);
+
 __attribute__((noinline, used))
 static void start_c(int argc, char **argv, char **envp)
 {
@@ -252,6 +257,11 @@ static void start_c(int argc, char **argv, char **envp)
      * dereferenceable. "No environment" and "an environment with nothing in it"
      * are indistinguishable to a reader, and only one of them is safe. */
     environ = envp ? envp : embk_empty_env;
+
+    /* The working directory a parent HANDED us (PWD), or "/" if it named none.
+     * Nothing is inherited on EmbLink -- see syscalls.c's g_cwd. Ordered after
+     * environ (it reads it) and before ctors (one may open a relative path). */
+    embk_cwd_init_from_env();
 
     setup_tls();                            /* %fs BEFORE any ctor: one may
                                              * touch a __thread variable, and a

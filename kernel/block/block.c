@@ -1,4 +1,5 @@
 #include "block/block.h"
+#include "process/ksync.h"      /* the bounce buffer needs a SLEEPING lock: a mutex */
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -23,6 +24,24 @@ static uint32_t disk_letters = 0;
 // One shared bounce buffer in kernel BSS (low physical, KV2P-able, < 4GB).
 // Sized to the max single transfer the adapters issue (64 sectors = 32KB).
 static uint8_t block_bounce[64 * 512] __attribute__((aligned(16)));
+
+/* --- the bounce buffer's lock -------------------------------------------
+ * ONE buffer, shared by every caller. It was unlocked, on the reasoning that
+ * block I/O is "synchronous". That reasoning expired: there are now SMP,
+ * preemption, and several processes doing file I/O at once (CPython and git read
+ * while a UI app runs). Two concurrent bounce-path transfers would memcpy over
+ * each other's data and each return the other's sectors -- silent corruption.
+ *
+ * A MUTEX, not a spinlock: the ATA path `hlt`-waits for the disk (ata.c) while
+ * preemptible, so the buffer is held across a multi-ms wait, and a spinlock held
+ * across that would deadlock the next thread into the block layer on the same
+ * core. mutex_lock() sleeps instead. (This was the case that motivated building
+ * kernel/process/ksync.{c,h}; before it existed the same wait-queue pattern was
+ * open-coded right here.) Pre-scheduler safe: boot callers are single-threaded,
+ * so the mutex is never contended and never sleeps. */
+static struct mutex bounce_lock = MUTEX_INIT;
+static inline void bounce_acquire(void) { mutex_lock(&bounce_lock); }
+static inline void bounce_release(void) { mutex_unlock(&bounce_lock); }
 
 // Request counters (see block.h). Counts requests that actually reach a
 // driver -- the bounce path issues several per call, so this is incremented at the
@@ -131,6 +150,10 @@ int embk_block_read(struct embk_block_device *dev,
     }
 
     // Bounce path: read in bounce-sized chunks, copy out.
+    // The lock spans the WHOLE loop, not each chunk: releasing between chunks
+    // would let another caller reuse the buffer mid-transfer, which is the exact
+    // corruption we are here to prevent.
+    bounce_acquire();
     uint32_t max_blocks = sizeof(block_bounce) / dev->block_size;
     uint8_t *dst = (uint8_t *)buffer;
     while (count > 0) {
@@ -139,12 +162,13 @@ int embk_block_read(struct embk_block_device *dev,
         uint64_t t0 = blk_now_us();
         int rc = dev->read(dev, lba, chunk, block_bounce);
         blkstat.read_us += blk_now_us() - t0;
-        if (rc != EMBK_OK) return rc;
+        if (rc != EMBK_OK) { bounce_release(); return rc; }   /* the error path MUST release */
         memcpy(dst, block_bounce, (size_t)chunk * (size_t)dev->block_size);
         lba   += chunk;
         count -= chunk;
         dst   += chunk * dev->block_size;
     }
+    bounce_release();
     return EMBK_OK;
 }
 
@@ -164,17 +188,19 @@ int embk_block_write(struct embk_block_device *dev,
         return dev->write(dev, lba, count, buffer);
     }
 
+    bounce_acquire();          /* same one buffer as the read path -- same lock */
     uint32_t max_blocks = sizeof(block_bounce) / dev->block_size;
     const uint8_t *src = (const uint8_t *)buffer;
     while (count > 0) {
         uint32_t chunk = (count > max_blocks) ? max_blocks : count;
         memcpy(block_bounce, src, (size_t)chunk * (size_t)dev->block_size);
         int rc = dev->write(dev, lba, chunk, block_bounce);
-        if (rc != EMBK_OK) return rc;
+        if (rc != EMBK_OK) { bounce_release(); return rc; }
         lba   += chunk;
         count -= chunk;
         src   += chunk * dev->block_size;
     }
+    bounce_release();
     return EMBK_OK;
 }
 

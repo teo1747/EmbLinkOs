@@ -1,0 +1,26 @@
+--- tcc-0.9.27/tccelf.c
++++ tcc-0.9.27/tccelf.c
+@@ -1079,9 +1079,22 @@
+             }
+ 
+ #ifdef TCC_TARGET_X86_64
++            /* EmbLink fix: in a STATIC link, R_X86_64_PLT32 is just PC32.
++               A PLT exists so a shared object can PREEMPT a call; a static link
++               has neither shared objects nor a runtime resolver, so every PLT
++               slot it mints is unbindable. Worse, relocate_plt() is called ONLY
++               under `if (dynamic)` (see elf_output_file), so those slots keep
++               their placeholder GOT-slot displacement and `jmp *0x18(%rip)`
++               reads its target from INSIDE .plt -- executing neighbouring stub
++               bytes as an address. That is the wild jump to 0x4825FFFFFF
++               (= the bytes `ff ff` + `ff 25 48 00 00 00` of the next stub).
++               tcc took this path for EVERY ordinary call (main, malloc, memcpy,
++               exit: 407 of them, all st_shndx=.text), because upstream only
++               excludes non-default-visibility and local symbols here. */
+             if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
+                 (ELFW(ST_VISIBILITY)(sym->st_other) != STV_DEFAULT ||
+-		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL)) {
++		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL ||
++		 s1->static_link)) {
+                 rel->r_info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
+                 continue;
+             }

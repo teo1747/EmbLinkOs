@@ -8,6 +8,74 @@ everything set up and just want the list of `make` targets, see
 [CONTRIBUTING.md](../CONTRIBUTING.md#build--run) instead — this doc is about
 first-time setup and the *why*, not day-to-day usage.
 
+## TL;DR — the exact order, on a fresh machine
+
+Everything below is explained further down; this is the checklist. **Steps 1-4
+are all you need for a bootable OS.** Steps 5+ are the optional ports, and
+skipping them costs you nothing but those four apps.
+
+```sh
+# 1. host packages (Debian/Ubuntu)
+sudo apt install nasm qemu-system-x86 gdb python3 python3-pil mtools \
+                 dosfstools fdisk make build-essential texinfo bison flex \
+                 libgmp-dev libmpfr-dev libmpc-dev
+
+# 2. the x86_64-elf cross compiler -> /usr/local/cross/bin  (§ below, ~30 min)
+#    then put it on PATH, in your shell rc:
+export PATH=/usr/local/cross/bin:$PATH
+
+# 3. the newlib-c99 rebuild (§ below). Then tell the build where it went --
+#    this ONE variable is what every script and mkfs derives from:
+#      edit the Makefile's `NEWLIB_PREFIX ?=` line once, or pass it every time.
+make NEWLIB_PREFIX=$HOME/cross/newlib-c99
+
+# 4. build + boot. This is the whole OS.
+make && make run-embkfs
+```
+
+Check it worked: the OS boots to the EmUI desktop. At the serial prompt,
+`test posix` should print `ALL PASS`.
+
+```sh
+# 5. OPTIONAL ports -- each is independent; build only what you want.
+#    Every script takes the SOURCE TREE as an argument and derives the rest.
+
+# C++ / libstdc++  (~1h)
+tools/cxx/build-gcc-cxx.sh ~/cross/gcc-13.2.0
+make CXX_PREFIX=~/cross/gcc-cxx          # then: test cxx  -> 13/13
+
+# CPython  (applies our newlib patch for you)
+tools/cpython/configure-py-emblink.sh ~/cross/Python-3.14.6
+make -C ~/cross/Python-3.14.6/../build-py -j8
+make PY_SRC=~/cross/Python-3.14.6 PY_BUILD=~/cross/build-py
+#   then boot with -cpu max and run: test python   (getentropy is RDRAND-only)
+
+# git  (needs zlib FIRST -- git's object store IS deflate+crc32)
+tools/zlib/build-zlib-emblink.sh ~/cross/zlib-1.3.1 ~/cross/build-zlib
+ZLIB_BUILD=~/cross/build-zlib tools/git/build-git-emblink.sh ~/cross/git-2.49.1 -j8
+make GIT_SRC=~/cross/git-2.49.1 ZLIB_BUILD=~/cross/build-zlib
+#   then boot with -cpu max and run: test git repo
+
+# TCC -- a C compiler that RUNS ON the OS (applies our patch for you)
+tools/tcc/build-tcc-emblink.sh ~/cross/tcc-0.9.27
+make TCC_SRC=~/cross/tcc-0.9.27
+#   then: test tcc link   -> must print `exit=42`
+```
+
+**If you set the `*_PREFIX` / `*_SRC` variables on the command line, pass them
+every time** (or edit the `?=` defaults in the Makefile once — recommended;
+they currently point at the original author's home directory).
+
+### What breaks if you skip a step
+
+| Symptom | Cause |
+|---|---|
+| `x86_64-elf-gcc: command not found` | step 2, or `PATH` |
+| `undefined reference to __sfnprintf`, `%zu` prints `zu` | step 3 — you're on the stock newlib, not the C99 rebuild |
+| `make` works, but `test tcc link` fails while `test tcc compile` passes | `libc.a` isn't on the image → `NEWLIB_PREFIX` unset/wrong |
+| a tcc-built program dies instantly at a nonsense address | you built tcc by hand instead of with our script (see below) |
+| `git add` dies / `test python` faults on startup | QEMU without `-cpu max` — `getentropy` is RDRAND-only and refuses to fake entropy |
+
 ## What you need, and why
 
 | Tool | What it's for |
@@ -232,6 +300,75 @@ for the concrete Makefile + `mkfs_embkfs.py` steps — mechanically it's "copy
 an existing app's three registration points and rename," not something that
 needs new loader code.
 
+## Optional ports: C++, CPython, git, TCC
+
+The core OS builds with just the cross toolchain above. Four bigger programs are
+**optional** and live OUTSIDE this repo, because they are large third-party trees
+we do not vendor. Each is gated by a `HAVE_*` check in the Makefile that simply
+looks for the built binary:
+
+| Port | Makefile var | Build it with | Patches upstream? |
+|---|---|---|---|
+| C++ / libstdc++ | `CXX_PREFIX` | `tools/cxx/build-gcc-cxx.sh <gcc-src>` (~1h) | no |
+| CPython | `PY_SRC`, `PY_BUILD` | `tools/cpython/configure-py-emblink.sh <py-src>` | **YES** (applied for you) |
+| zlib (for git) | `ZLIB_BUILD` | `tools/zlib/build-zlib-emblink.sh <zlib-src>` | no |
+| git | `GIT_SRC`, `ZLIB_BUILD` | `tools/git/build-git-emblink.sh <git-src>` | no |
+| **TCC** (compiler ON the OS) | `TCC_SRC` | `tools/tcc/build-tcc-emblink.sh <tcc-src>` | **YES** (applied for you) |
+
+Every script derives its paths (`MYOS` from its own location, `NEWLIB_PREFIX`
+from `make print-newlib-prefix`) and takes the source tree as an argument, so
+none of them contains anyone's home directory. Two of the four **patch upstream
+sources**; the patches sit next to the scripts and are applied idempotently, so
+run the script rather than building by hand.
+
+**git additionally needs a cross-built zlib** (its object store IS deflate +
+crc32 -- `git init` cannot write its first object without it). Build it with
+`tools/zlib/build-zlib-emblink.sh <zlib-src> <outdir>` and point `ZLIB_BUILD`
+at the outdir. Do this BEFORE the git script; it is the only ordering
+constraint among the ports.
+
+**Absent means absent, not broken**: with none of them built, `make` still
+produces a bootable image -- those apps are just not on it. So a fresh clone
+works with the base toolchain alone. Every path above is `?=`, so override it on
+the command line (`make TCC_SRC=~/src/tcc-0.9.27`) or edit the one line.
+
+### CPython needs OUR patch too
+
+`tools/cpython/0001-newlib-timezone-and-clockid.patch` -- CPython does not build
+against newlib unmodified. newlib spells the timezone globals the way MSVC does
+(`_timezone`/`_daylight`/`_tzname`, no plain `timezone`), and its `clockid_t` is
+long-sized, which trips a `Py_BUILD_ASSERT`. Both are gated on `__NEWLIB__`.
+This one at least fails LOUDLY at compile time.
+
+`tools/cpython/emblink-config.site` is the other half: EmbLink binaries cannot
+run on the build host, so autoconf can never execute a probe -- every such answer
+is pre-cached there, each stating what is actually TRUE of EmbLink. Never flip
+one to "yes" to get past configure; a false yes compiles a call to something that
+does not exist.
+
+### TCC needs OUR patch -- a pristine tcc silently produces CRASHING binaries
+
+`tools/tcc/build-tcc-emblink.sh /path/to/tcc-0.9.27` fetches nothing, but it
+**applies `tools/tcc/0001-static-link-plt32-is-pc32.patch`** and encodes the
+exact configure. Use it; do not build tcc by hand.
+
+Upstream tcc 0.9.27 routes every `R_X86_64_PLT32` through a PLT so a shared
+object could preempt the call. A `-static` link has no shared objects and no
+runtime resolver, so those slots are unbindable -- and `relocate_plt()` runs only
+under `if (dynamic)`, so the stubs keep a placeholder displacement and
+`jmp *0x18(%rip)` reads its target from INSIDE `.plt`, executing neighbouring
+stub bytes as an address. **It does not fail at build time.** tcc exits 0, the
+ELF is valid, and the program dies at a wild jump (`RIP=0x4825FFFFFF` -- literally
+those PLT bytes). The patch makes PLT32 a plain PC32 call when `static_link` is
+set, and `.plt` disappears.
+
+Verify a tcc build the only way that means anything -- boot and run:
+
+    test tcc link     -> [tcc link] /l.elf ran: exit=42 (want 42)
+
+`42` appears only if the OS really compiled, assembled, linked AND ran the
+program. `tcc -v` exiting 0 proves nothing about any of that.
+
 ## Troubleshooting
 
 - **`x86_64-elf-gcc: command not found`** — the cross compiler isn't on
@@ -250,4 +387,12 @@ needs new loader code.
   [EMUI_GUIDE.md](EMUI_GUIDE.md#wiring-your-app-into-the-boot-image).
 - **`NEWLIB_PREFIX` points at a path that doesn't exist** — the Makefile's
   default is hardcoded to the original author's home directory. Override it
-  on the command line or edit the Makefile once.
+  on the command line or edit the Makefile once. Everything derives from this
+  ONE variable, including the `libc.a` that mkfs packs at the image root for
+  tcc (`EMBK_NEWLIB_LIBC`) — so there is never a second path to fix.
+- **`test tcc link` fails but `test tcc compile` passes** — either `libc.a`
+  isn't on the image (mkfs prints the objects it packs; no `libc.a` line means
+  `NEWLIB_PREFIX` is unset/wrong) or your tcc is unpatched (see
+  [above](#tcc-needs-our-patch----a-pristine-tcc-silently-produces-crashing-binaries)).
+- **A tcc-built program dies instantly at a nonsense address** — unpatched tcc.
+  Rebuild it with `tools/tcc/build-tcc-emblink.sh`.

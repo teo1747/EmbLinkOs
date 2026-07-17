@@ -155,21 +155,65 @@ static void test_clocks(void) {
     CK_FAILS("clock_gettime(unknown id) refused", clock_gettime((clockid_t)9999, &a), EINVAL);
 }
 
+/* THE WORKING DIRECTORY. A libc fact, not a kernel one: the kernel stays the
+ * one absolute-only path parser and never sees a relative path. Per-process
+ * comes free -- every process has its own copy of this libc's g_cwd.
+ *
+ * The checks that matter are the ones proving relative paths RESOLVE against
+ * it, and that ".." pops. git finds a repo root by walking UP; ".." is its
+ * normal idiom, and absolute paths used to reach the kernel unnormalized. */
 static void test_cwd(void) {
     printf("working directory:\n");
-    char buf[64];
-    memset(buf, 'x', sizeof buf);
+    char buf[128];
+
     char *p = getcwd(buf, sizeof buf);
     ck("getcwd() succeeds", p == buf);
-    ck("getcwd() == \"/\" (EmbLink's fixed-root model)", p && strcmp(p, "/") == 0);
+    ck("getcwd() starts at \"/\" (nothing inherited unless PWD names it)",
+       p && strcmp(p, "/") == 0);
+    ck("chdir(\"/\") succeeds", chdir("/") == 0);
 
-    ck("chdir(\"/\") succeeds (we are always there)", chdir("/") == 0);
+    /* Somewhere real to stand. */
+    (void)mkdir("/cwdtest", 0755);
+    (void)mkdir("/cwdtest/sub", 0755);
 
-    /* Refusing every other chdir is what keeps getcwd()'s answer honest. */
-    CK_FAILS("chdir(elsewhere) refused", chdir("/somewhere"), ENOSYS);
+    ck("chdir to a real directory == 0", chdir("/cwdtest") == 0);
+    ck("getcwd() reports it", getcwd(buf, sizeof buf) && strcmp(buf, "/cwdtest") == 0);
 
-    /* buffer too small for "/" + NUL */
+    /* THE POINT: a relative name must resolve against the cwd, not the root. */
+    int fd = open("rel.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    ck("open(relative) succeeds", fd >= 0);
+    if (fd >= 0) { write(fd, "R", 1); close(fd); }
+    struct stat st;
+    ck("...and it landed in the CWD, not at /",
+       stat("/cwdtest/rel.txt", &st) == 0 && stat("/rel.txt", &st) != 0);
+
+    /* Relative chdir, then ".." back up. */
+    ck("chdir(\"sub\") relative == 0", chdir("sub") == 0);
+    ck("getcwd() == /cwdtest/sub", getcwd(buf, sizeof buf) && strcmp(buf, "/cwdtest/sub") == 0);
+    ck("chdir(\"..\") == 0", chdir("..") == 0);
+    ck("\"..\" popped exactly one component", getcwd(buf, sizeof buf) && strcmp(buf, "/cwdtest") == 0);
+
+    /* Normalization of an ABSOLUTE path -- these used to reach the kernel raw. */
+    ck("absolute path with .. resolves", stat("/cwdtest/sub/../rel.txt", &st) == 0);
+    ck("absolute path with . resolves",  stat("/cwdtest/./rel.txt", &st) == 0);
+    /* ".." at the root stays at the root (POSIX: "/.." is "/"), rather than
+     * walking off the front of the buffer. */
+    ck("chdir(\"/..\") lands at the root, not off the end", chdir("/..") == 0);
+    ck("getcwd() == \"/\" after /..", getcwd(buf, sizeof buf) && strcmp(buf, "/") == 0);
+
+    /* chdir VERIFIES: an unchecked store would turn one bad chdir into a pile
+     * of confusing ENOENTs far from the cause. */
+    CK_FAILS("chdir(missing) -> ENOENT", chdir("/no_such_dir"), ENOENT);
+    fd = open("/cwdtest/rel.txt", O_RDONLY);
+    if (fd >= 0) close(fd);
+    CK_FAILS("chdir(a FILE) -> ENOTDIR", chdir("/cwdtest/rel.txt"), ENOTDIR);
+    ck("a refused chdir did NOT move us", getcwd(buf, sizeof buf) && strcmp(buf, "/") == 0);
+
     CK_FAILS("getcwd(buf,1) -> ERANGE", getcwd(buf, 1) == NULL ? -1 : 0, ERANGE);
+
+    (void)unlink("/cwdtest/rel.txt");
+    (void)rmdir("/cwdtest/sub");
+    (void)rmdir("/cwdtest");
 }
 
 static void test_dir_basics(void) {

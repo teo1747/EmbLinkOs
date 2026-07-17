@@ -75,17 +75,56 @@ left to do.
 
 ### Heap
 - [x] kmalloc/kfree locking — spinlock with cli/sti save-restore.
-- [ ] Slab allocator — fixed-size pools (16/32/64/128/256/512/1024 bytes) with O(1)
-  common-case alloc (DEFERRED: current design has metadata collision issues; needs
-  safer approach like tracking slab block ranges separately).
+- [x] ~~Slab allocator — fixed-size pools (16..1024) with O(1) common-case alloc
+  (DEFERRED: metadata collision issues).~~ **DONE, and enabled.** The deferral
+  reason is now the design. The first attempt had TWO fatal bugs:
+  1. **Metadata collision** — it tagged each object `[0xAA][pool]` and hoped free
+     could tell slab from general by that byte, but 0xAA occurs in real data.
+     FIX: a **range registry** (`g_slab_ranges[]`) — every region records its
+     `[start,end)`, and free/realloc route a pointer by RANGE lookup, which
+     cannot false-positive the way a byte can. (This is the "track slab block
+     ranges separately" the note asked for.)
+  2. **Self-deadlock** — its free-list was a side array grown with `kheap_alloc()`
+     called from *under* heap_lock, re-locking the same spinlock. FIX: an
+     **intrusive free list** — a free object stores the next pointer in its own
+     first 8 bytes (O(1), allocates nothing). No per-object header at all.
+  A region is a permanent general allocation (`kheap_alloc_locked`, not the
+  re-locking public wrapper) subdivided into objects. `slab_class_for` rounds UP
+  (kmalloc(20)->32 pool) so slabs actually fire; on slab OOM / registry-full it
+  falls back to general (an optimisation, never a requirement). krealloc/kfree
+  range-check; kcalloc is transparent.
+  Verified: `test kheap` 11/11 — every size class end-to-end, the **0xAA collision
+  regression** (a general block full of the old magic byte frees correctly),
+  multi-grow with no deadlock, no object aliasing, krealloc slab->general keeps
+  data; kheap_check() clean after each phase. Plus: the whole kernel's small
+  allocations now route through it, so booting to the desktop + `test posix` ALL
+  PASS (smp=4) is thousands of live slab ops with zero corruption.
 - [x] krealloc in-place expansion — checks if next block is free before allocating
   new; coalesces and returns same pointer if expansion succeeds. Reduces copies
   and fragmentation in dynamic array growth (e.g., embkfs_free_index_reserve).
-- [ ] First-fit is O(n) — consider segregated free lists by size class (lower priority).
+- [ ] First-fit is O(n) — for allocations > 1024 bytes (small ones are now O(1)
+  via the slab above). Segregated free lists by size class for the general path
+  remain an option (lower priority).
 - [ ] Security hardening (later): guard pages between allocations, allocation
   randomization, quarantine/delayed-free for use-after-free detection.
 
 ### Synchronization
+
+- [x] **Sleeping mutex + counting semaphore** (`kernel/process/ksync.{c,h}`).
+  Built on the wait-queue primitives that `keyboard.c`/`pipe.c`/`block.c` had
+  each open-coded. A **sleeping** lock, not a spinlock: the distinction is a
+  property of the CALLER (does it sleep while holding?), and the motivating case
+  — the block-layer bounce buffer, held across a `hlt`-wait for the disk — does.
+  Mutex is non-recursive and **detects self-deadlock** (re-lock by the owner is
+  a loud halt, not a silent hang) and non-owner unlock (a warning). `test ksync`
+  = 12/12 invariants; the bounce buffer now uses it (`test posix` still ALL PASS).
+  - [ ] Not cancellation-aware (a blocked acquire ignores `process_cancel`) —
+    fine for briefly-held locks; revisit if one guards a long wait.
+  - [ ] Not IRQ-safe by design (a handler cannot sleep). Spinlocks remain the
+    IRQ-context tool. No compile-time guard enforces this yet.
+  - [ ] No priority inheritance — a low-prio holder can be starved while a
+    high-prio waiter sleeps. Irrelevant until priorities drive scheduling.
+
 - [ ] Spinlock has no deadlock detection / lock-ordering checks.
 - [x] Reader-writer locks — rwlock_t in kernel/cpu/rwlock.c (many readers OR one
   writer, single atomic state word; irqsave/irqrestore since multiple readers
@@ -168,18 +207,70 @@ left to do.
   exposed as a child block device (sda1, sda2…) that delegates to its parent
   disk at the partition's start LBA, bounded by its length. Mount probe sees
   partitions alongside whole disks. See kernel/block/partition.c.
-  - [ ] GPT not parsed yet — a protective-MBR (type 0xEE) disk is detected and
-    skipped with a notice.
-  - [ ] Extended/logical partitions (type 0x05/0x0F) detected but not walked.
+  - [x] ~~GPT not parsed yet~~ **DONE** — header at LBA 1 behind the protective
+    MBR, **CRC32 validated before any field is trusted** (every number we act on
+    -- entry array location, count, size -- comes out of that block, so a corrupt
+    one would register partitions over arbitrary sectors: fail closed). Sparse
+    tables handled (all-zero type GUID = unused slot); `last_lba` is INCLUSIVE.
+    ⚠️ **GPT needs CRC32-IEEE (0xEDB88320)** — `kernel/fs/embkfs/crc32c.c` is
+    CRC32**C** (Castagnoli), a DIFFERENT polynomial. Reusing it because "we
+    already have a crc32" would reject every real GPT on earth. `crc32_ieee()`
+    now lives in partition.c.
+    Verified against `sfdisk` as an independent oracle (`make part_gpt.img`):
+    3/3 partitions, start+length exact.
+    - [ ] Backup header (last LBA) not tried when the primary's CRC fails —
+      we refuse rather than recover. The recovery is the point of the backup.
+    - [ ] Entry-array CRC (`partition_entry_array_crc32`) not checked; only the
+      header's.
+  - [x] ~~Extended/logical partitions (type 0x05/0x0F) detected but not walked.~~
+    **DONE** — the EBR chain walks; logicals register as `sda5+` (the container
+    itself gets no device: nothing could mount it).
+    🪤 **THE EBR TRAP: the two entries use DIFFERENT BASES.** Entry 0 (the
+    logical) is relative to THIS EBR's LBA; entry 1 (the link to the next EBR) is
+    relative to the EXTENDED partition's start. One base for both "works" for the
+    first logical and then walks into nonsense. The walk is also bounded (32) and
+    rejects self-links — a corrupt EBR must not hang the boot.
+    Verified against `sfdisk` (`make part_ext.img`): sda1/5/6/7 exact.
+    🪤 Names went TWO-digit: logicals start at 5 and GPT allows 128, so the old
+    single digit made `sda12` collide with `sda2` — two devices, one name.
   - [ ] Scan must run after `sti` (ATA read path is IRQ-driven). Placed in
     main.c right before block enumeration / mount probe for that reason.
 - [x] ~~Block-layer reads/writes on IDE secondary channel hang~~ — done
   (EMBKFS v2 Phase 21), see the ATA/DMA entry above. Disks on the
   secondary channel (3rd/4th drive) now work; FAT32's test disk staying
   on IDE primary slave is now just convention, not a hard requirement.
-- [ ] Block-layer DMA bounce buffer is shared global state — needs a lock
-  once transfers can be concurrent (IRQ-driven / multi-threaded). Fine while
-  synchronous. Also: bounce always copies; multi-PRD scatter-gather (page-walk
+- [x] ~~Block-layer DMA bounce buffer is shared global state — needs a lock~~
+  **DONE.** The old "fine while synchronous" note had expired: SMP, preemption
+  and several processes doing file I/O (CPython/git read while a UI app runs)
+  mean two concurrent bounce-path transfers would memcpy over each other and each
+  return the other's sectors — **silent corruption, not a crash**. The facts
+  that decided the design, established before writing it:
+  - callers are `fat32.c` / `embkfs.c` / `partition.c` — **not IRQ handlers**;
+  - **nothing serialises it higher up** (`embkfs` has no lock at all);
+  - **the ATA path `hlt`-spins and is preemptible**, so the buffer is held across
+    a multi-millisecond disk wait.
+  ⚠️ **That last fact makes a spinlock WRONG** — a preempted holder would deadlock
+  the next thread into the block layer on the same core ("slept holding a
+  spinlock"). The kernel has no mutex, so this is a **sleeping lock built from
+  the wait-queue primitives** `keyboard.c`/`pipe.c` already use: a flag + a queue,
+  `{test → set}` made atomic by `g_sched_lock`.
+  Notes for the next reader: the lock spans the **whole chunk loop** (releasing
+  between chunks would let another caller reuse the buffer mid-transfer — the
+  exact corruption being prevented), **both `rc != OK` error paths release**, and
+  **pre-scheduler safety is by construction**: boot callers are single-threaded,
+  so `busy` is never true, the `while` never runs, and `sched_block` is never
+  reached without a thread to block.
+  Verified: boots (the pre-scheduler partition scan is the thing that would hang),
+  `test posix` **ALL PASS**, `test ioperf` unchanged (440 ms/MB cold, 194%
+  amplification, disk still 1% of wall).
+  - [ ] ⚠️ **The race itself is NOT covered by a test.** Every test above is
+    single-threaded, so the lock is never contended — they prove no deadlock and
+    no regression, not that the corruption is gone. A genuine concurrent-I/O
+    test (two processes reading different files at once, checking neither gets
+    the other's bytes) is the missing piece.
+  - [ ] Bounce always copies; multi-PRD scatter-gather (page-walk via
+    `vmm_get_phys`) would be the zero-copy alternative, and would retire the
+    shared buffer — and this lock with it. Also: bounce always copies; multi-PRD scatter-gather (page-walk
   via vmm_get_phys) would be the zero-copy alternative (already on TODO).
 
 ---
@@ -236,16 +327,63 @@ left to do.
   (`vmm_map_mmio_wc` still doesn't exist — see `vmm_map_mmio` entry above).
 
 ### Keyboard
-- [ ] Only ASCII press events. Add release tracking for proper modifier state.
-- [ ] No modifier handling (Shift, Caps Lock, Ctrl, Alt) — needs a state
-  machine; Shift+key, Caps Lock toggle (latches differently from Shift).
-- [ ] No extended scan codes (0xE0): arrows, Home/End/PgUp/PgDn, Ins/Del,
-  right-side Ctrl/Alt, Windows/Menu — multi-byte scancode state machine.
-- [ ] No F1–F12 (0x3B–0x44).
-- [ ] No layout abstraction — only US QWERTY hardcoded; support keymaps
-  (AZERTY, Dvorak, …).
-- [ ] No PS/2 controller (8042) init — relies on BIOS leaving it usable.
-  Configure via port 0x64: disable mouse port, set scancode set, enable IRQs.
+
+*(`kernel/drivers/input/keyboard.c`. Several items below were closed by work
+that needed them: **Ctrl** by Ctrl-C ([INTERRUPTION.md](INTERRUPTION.md)),
+**arrows/Home/End** by the EmUI text editor and the shell's history recall.)*
+
+- [x] ~~Only ASCII press events. Add release tracking for proper modifier
+  state.~~ **DONE for the keys that need it** — Shift (`0xAA`/`0xB6`) and Ctrl
+  (`0x9D`) breaks are tracked. Non-modifier releases are still dropped
+  deliberately: nothing consumes key-up, and a make/break API is a bigger change
+  (see the open item below).
+- [x] ~~No modifier handling (Shift, ..., Ctrl, ...)~~ — **Shift and Ctrl are
+  handled**: `shift_down`/`ctrl_down` plus a full `scan_to_ascii_shift[]` table,
+  so uppercase and `|` are typeable. **Ctrl works from BOTH keys** — right Ctrl
+  arrives as `0xE0,0x1D` and is tracked identically, so `^C` works from either.
+  🪤 The driver never tracked Ctrl at all until Ctrl-C needed it: **Ctrl+C simply
+  typed `c`**, which made `^C` untypeable and looked like a routing bug.
+- [x] ~~No extended scan codes (0xE0)~~ — **arrows, Home/End, PgUp/PgDn and Del
+  are delivered** as private single-byte `EK_*` codes (`keyboard.h`), NOT ANSI
+  escape sequences, so consumers need no escape state machine. Mirrored as
+  `EMBK_KEY_*` in `user/lib/embk.h` — **change one, change both.**
+  Also handles set-1's **fake shift**: an `0xE0`-prefixed `0x2A`/`0xAA` pads nav
+  keys and must never touch real shift state.
+- [x] ~~**Caps Lock**~~ **DONE** — a real latch: it flips on the MAKE and ignores
+  its own break, applies to **letters only**, and **XORs with Shift**
+  (Caps+Shift+a = 'a'). Applying it to the shift table — the obvious
+  implementation — would make Caps type `!` for `1`, which no keyboard does.
+  LED driven via `0xED`. Verified live: press → `mods=0x10`, press → `0x00`.
+- [x] ~~**Alt**~~ **DONE** — `EKM_ALT`, both sides, on the event stream
+  (verified live: `EKC_LALT` down → `mods=0x04`, up → `0x00`).
+- [x] ~~**F1–F12**~~ **DONE** — `EKC_F1..EKC_F12` on the **event** stream. They
+  get no character *by design*: C0 is Ctrl+letter's, and inventing an escape
+  sequence would force every reader to become a state machine.
+- [x] ~~**Ins**, **Windows/Menu**~~ **DONE** — `EKC_INS`/`EKC_LWIN`/`EKC_RWIN`/
+  `EKC_MENU`, event-only for the same reason.
+- [x] ~~**No key-up delivery / no make-break API.**~~ **DONE** — `struct
+  key_event {code, mods, pressed}` + `sys_key_event_poll` (65) / `sys_key_mods`
+  (66). A **second stream** beside the characters, not a re-encoding: the char
+  stream is out of room and ambiguous (Up and Ctrl+S are both `0x13`), so text
+  readers keep doing byte compares and are untouched. Still open: **typematic
+  repeat-rate** control (`0xF3`).
+- [x] ~~No layout abstraction~~ **DONE** — `struct keymap` + `keyboard_set_layout()`;
+  **us** and **dvorak** ship. An unknown name is REFUSED, not silently ignored.
+  ⚠️ **AZERTY is still not shippable, and not for want of a table**: French needs
+  é è ç à ù, which are **not ASCII**, and the char stream is `char`. An "AZERTY"
+  today could only be QWERTY-with-letters-moved plus silent holes — a worse lie
+  than saying no. **Real AZERTY needs the char stream to carry a wider encoding
+  first**; that is the actual open item, not the keymap.
+- [x] ~~No PS/2 controller (8042) init~~ **DONE** — explicit config-byte RMW
+  (IRQ1 on, kbd clock on, translation on) + an explicit `set 2` select.
+  🪤 **Scancode set and translation are ONE decision**: device-in-set-1 with
+  translation on makes the controller translate set-1 as set-2 → dead keyboard.
+  We pick the standard pairing (device set 2 + translation) because our tables
+  are set 1, and say so.
+  🪤 **`mouse.c` RMWs the SAME config byte.** We touch only keyboard bits (0/4/6)
+  and deliberately issue **no controller self-test (0xAA) and no port disables**
+  (0xAD/0xA7) — every textbook init does, and here they would reset state the
+  mouse depends on. Verified: `IntelliMouse wheel enabled` still appears.
 - [x] ~~Migrate to USB HID once there's a USB stack~~ — done, see USB section.
 
 ---
@@ -374,18 +512,29 @@ interrupt-driven.
     `vfs_resolve` with a hop-count bound (ELOOP). NOTE: true `..` then differs
     from the lexical breadcrumb `..` (a symlink's real parent vs its path
     parent) — revisit the stack semantics when this lands.
-- [ ] No `.truncate` op → O_TRUNC can't be honored at open(). EMBKFS has
-  `embkfs_truncate_object`.
-  - FIX: add `.truncate` op + adapter; wire O_TRUNC in vfs_open.
+- [x] ~~No `.truncate` op → O_TRUNC can't be honored at open().~~ **DONE** —
+  `vfs.h` has `.truncate(vn, size)`, `vfs_fd_truncate()` exposes it as
+  `ftruncate(2)`, and O_TRUNC is wired in `vfs_open`. A filesystem that leaves
+  the op NULL fails an O_TRUNC open with `-ENOSYS` rather than silently opening
+  a file it did not truncate. Driven by git, which ftruncates its index.
 - [ ] stat() simplifications: directory nlink hardcoded to 2 (real = 2 +
   subdir count); directory size reported as ENTRY COUNT, not bytes (ls tags it
   'e'). Decide whether anything depends on either before "fixing."
-- [ ] `unlink` op has remove(3) semantics — it rmdirs an empty directory.
-  POSIX unlink(2) must return EISDIR on a directory; rmdir(2) is dirs-only.
-  - FIX (syscall layer): split unlink(2)/rmdir(2), either via a separate
-    `.rmdir` op or a stat-and-dispatch in the syscall handler.
-- [ ] Absolute paths only — no cwd / relative resolution (arrives with
-  per-process context).
+- [x] ~~`unlink` op has remove(3) semantics — it rmdirs an empty directory.~~
+  **DONE** — `embkfs_unlink()` returns **`-EISDIR`** on a directory; `rmdir` is
+  a separate, dirs-only path that returns `-ENOTEMPTY` on a populated one.
+  (The v2.2 `unlink` was worse than mis-specified: it was a **stale lie** that
+  reported success without removing anything. git found it.)
+- [x] ~~Absolute paths only — no cwd / relative resolution.~~ **DONE**, but
+  deliberately NOT in the kernel: the VFS stays the one absolute-only path
+  parser and never sees a relative path. cwd is **libc state**
+  (`user/lib/syscalls.c`), which makes it per-process for free — every process
+  already has its own libc data, so there is no kernel state to leak. Not
+  inherited: a parent names `PWD` and the child's crt0 seeds from it.
+  `path_abs()` also NORMALIZES (`/a/../b` used to reach the kernel raw and die
+  on a `..` the VFS has no rule for — git walks UP to find a repo root).
+  Still open: `fchdir()` is honest `ENOSYS` — an fd does not know its own path
+  (`fd_entry` holds mnt+ino, and nothing maps an ino back to a name).
 - [ ] `vfs_mount` duplicate-mount check is a raw strcmp on `at` (not a
   normalized path). Fine for the single "/" mount.
 
@@ -402,13 +551,38 @@ interrupt-driven.
   dup'd fds) is still NOT modeled — each fd entry still owns its own
   cursor; only isolation between processes was added, not fd aliasing
   within one.
-- [ ] g_boot_fds / per-process fds arrays are unlocked mutable state — needs
-  a lock once syscalls from the same process can race (e.g. real SMP; today
-  preemption exists but a single process only runs one syscall at a time).
-- [ ] O_TRUNC reserved but not honored (blocked on the VFS truncate op above).
+- [x] ~~g_boot_fds / per-process fds arrays are unlocked mutable state — needs
+  a lock once syscalls from the same process can race.~~ **DONE**, and the race
+  was already REACHABLE, not hypothetical: the note's "a single process only
+  runs one syscall at a time" was **stale**. `sys_thread_create` (14) exists, and
+  the scheduler picks any READY thread per core (only `pinned_cpu` threads are
+  core-locked) — so two threads of one process run on two cores and race the
+  shared `fds[]`. The open path was the worst: it found a free slot, did a
+  possibly-blocking `obj_get`, and only THEN marked the slot used — a wide window
+  for two threads to claim the same slot.
+  Fix: a per-process **`struct mutex fd_lock`** (the new ksync mutex — a SLEEPING
+  lock, because obj_get/close do I/O). `fdlock(p)` keys on the process (the
+  install paths mutate a TARGET's table) and no-ops for the boot context (NULL =
+  g_boot_fds = single-threaded). Open now claims the slot atomically; close frees
+  under the lock then tears down OUTSIDE it on a snapshot (mandatory: pipe close
+  takes g_sched_lock, which the mutex is built on). The one rule — never take
+  fd_lock under g_sched_lock — holds at all five sites.
+  Verified: `test posix` ALL PASS on **smp=4** (heavy open/close/read/write, no
+  deadlock), `test thread smp` OK (8 threads/one proc — the process_alloc change).
+  - [ ] ⚠️ **The race trigger is still not covered by a test** — every suite is
+    effectively single-threaded per fd table, so the lock is never contended.
+    Same gap the bounce-buffer lock has; a concurrent open/close hammer (N
+    threads, assert no two fds alias one slot) is the shared missing harness.
+- [x] ~~O_TRUNC reserved but not honored.~~ **DONE** — `fd.c` shrinks to zero
+  through the VFS truncate op at open time.
 - [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
-  stat per write, and a TOCTOU window if writes can race. Acceptable while
-  single-threaded; revisit with concurrency.
+  stat per write, and a TOCTOU window between the stat and the write. **NOT
+  fixed by the fd_lock above** — that guards the fd TABLE, but two O_APPEND
+  writers (even in different processes, or two fds to one file) race on the
+  file's CONTENTS, not the table. A correct fix is FS-level: an atomic
+  append-at-end op (or a per-object append lock) in the write path, not fd.c.
+  A per-fd lock would give false confidence (misses the two-fds-one-file case).
+  Now genuinely reachable (threads on SMP), so no longer just theoretical.
 
 ---
 

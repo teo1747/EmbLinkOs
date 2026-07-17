@@ -1,0 +1,29 @@
+--- Python-3.14.6/Modules/timemodule.c
++++ Python-3.14.6/Modules/timemodule.c
+@@ -41,7 +41,13 @@
+ #  include <sanitizer/msan_interface.h>
+ #endif
+ 
+-#ifdef _MSC_VER
++/* newlib (EmbLinkOS) spells these the same way MSVC does: it declares
++ * _timezone/_daylight/_tzname (under __SVID_VISIBLE || __XSI_VISIBLE) and has
++ * NO plain `timezone`/`daylight` at all -- probed one symbol at a time, so this
++ * shares the MSVC branch rather than needing one of its own. (newlib does also
++ * offer plain `tzname`, but _tzname exists too, so the whole branch applies
++ * uniformly.) */
++#if defined(_MSC_VER) || defined(__NEWLIB__)
+ #  define _Py_timezone _timezone
+ #  define _Py_daylight _daylight
+ #  define _Py_tzname _tzname
+@@ -189,6 +195,11 @@
+     long long clk_id = PyLong_AsLongLong(obj);
+ #elif defined(__DragonFly__)
+     long clk_id = PyLong_AsLong(obj);
++#elif defined(__NEWLIB__)
++    /* newlib (EmbLinkOS): clockid_t is long-sized (8), not int, so the default
++     * branch trips the Py_BUILD_ASSERT below. Confirmed with a _Static_assert
++     * against the real header rather than assumed. */
++    long clk_id = PyLong_AsLong(obj);
+ #else
+     int clk_id = PyLong_AsInt(obj);
+ #endif

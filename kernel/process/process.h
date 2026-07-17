@@ -104,6 +104,25 @@ struct wait_queue {
     struct thread *head;
 };
 
+/* Sleeping synchronization primitives. The OPERATIONS live in
+ * kernel/process/ksync.{c,h}; the TYPES are here, next to wait_queue, for two
+ * reasons: struct process embeds a mutex BY VALUE (below), so process.h must see
+ * the full type; and these are scheduler primitives anyway -- built on
+ * wait_queue + g_sched_lock, which live here. See ksync.h for the contract.
+ * Zero-initialised is a valid, unlocked/zero-count state (MUTEX_INIT /
+ * SEMAPHORE_INIT(0) are all-zero), so a memset-cleared process slot is safe. */
+struct semaphore {
+    int32_t           count;
+    struct wait_queue wq;
+};
+struct mutex {
+    bool              locked;
+    struct thread    *owner;   /* holder, or NULL when free / held pre-scheduler */
+    struct wait_queue wq;
+};
+#define SEMAPHORE_INIT(n) { .count = (n), .wq = { 0 } }
+#define MUTEX_INIT        { .locked = false, .owner = 0, .wq = { 0 } }
+
 /* The schedulable unit. Everything schedule_locked() reads/writes on every
  * tick lives here: saved context, state, priority, which core (if any) it's
  * running/pinned to. `proc` is the resource owner it borrows an address
@@ -370,6 +389,13 @@ struct process {
      * §3.2 commits to). fd.c's fd_table() operates on THIS array whenever
      * this process is current_process, instead of a single shared table. */
     struct fd_entry fds[FD_MAX_OPEN];
+    /* Serialises this process's own fd-table mutations. Needed because a
+     * process's threads spread across cores (the scheduler picks any READY
+     * thread), so two of them can enter fd syscalls at once and race the shared
+     * fds[] above -- the open path's find-free-slot / fill window most of all.
+     * A MUTEX, not a spinlock: the fd paths sleep (obj_get / ops->close do I/O).
+     * See fd.c's fdlock(). Zero-init = unlocked, so a fresh slot is safe. */
+    struct mutex fd_lock;
 
     /* Per-process handle table translating a ring-3-visible handle (what
      * sys_spawn returns, what sys_wait/sys_kill take) to the real pid --

@@ -8,10 +8,11 @@
  * TARGET-ONLY (embk syscalls); the host test build's builtin_lookup_os stub
  * returns NULL for all of these.
  *
- * The WORKING DIRECTORY is a SHELL-side concept: the kernel only speaks
- * absolute paths, so `cd` just rewrites g_cwd and every path argument is
- * resolved through path_resolve() (join + "."/".." normalization) before it
- * reaches a syscall. That keeps the kernel's path model untouched.
+ * The WORKING DIRECTORY is the LIBC's (chdir/getcwd), not this file's: `cd`
+ * moves the real one and republishes PWD, which is how spawned commands learn
+ * where they were run from. The kernel only speaks absolute paths, so every
+ * path argument still goes through path_resolve() (join + "."/".."
+ * normalization) before reaching a RAW SDK call -- those bypass the libc.
  * ========================================================================== */
 #include "builtins/builtins.h"
 #include "sval/sval.h"
@@ -21,11 +22,18 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define LS_MAX_ENTRIES 128
 #define PATH_MAX_LEN   192
 
-static char g_cwd[PATH_MAX_LEN] = "/";
+/* NO g_cwd here any more. The working directory is the LIBC's (syscalls.c's
+ * g_cwd, reached via chdir/getcwd) -- ONE source of truth. This file kept its
+ * own copy back when chdir() was ENOSYS and the cwd was a shell-only fiction.
+ *
+ * The shell still resolves paths ITSELF (below) because its builtins call the
+ * RAW SDK (embk_open/embk_stat/...), which bypasses the libc and its path_abs.
+ * So: same cwd, resolved twice, deliberately -- not two different cwds. */
 
 /* -------------------------------------------------------------------------
  * Path resolution: absolute passes through, relative joins g_cwd; then the
@@ -34,10 +42,15 @@ static char g_cwd[PATH_MAX_LEN] = "/";
  * ------------------------------------------------------------------------- */
 static void path_resolve(const char *in, char *out, size_t cap) {
     char raw[PATH_MAX_LEN * 2];
-    if (in && in[0] == '/')
+    if (in && in[0] == '/') {
         snprintf(raw, sizeof raw, "%s", in);
-    else
-        snprintf(raw, sizeof raw, "%s/%s", g_cwd, in ? in : "");
+    } else {
+        /* Relative: against the REAL cwd, the one chdir() moves and every
+         * spawned child inherits via PWD. */
+        char cwd[PATH_MAX_LEN];
+        if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = '\0'; }
+        snprintf(raw, sizeof raw, "%s/%s", cwd, in ? in : "");
+    }
 
     /* normalize into out */
     size_t o = 0;
@@ -103,7 +116,8 @@ static struct value bi_ls(const struct command *cmd, struct value input,
     value_free(&input);
 
     char path[PATH_MAX_LEN];
-    if (arg_path(cmd, 0, g_cwd, path, sizeof path) != 0)
+    /* No argument -> "." -> path_resolve joins the real cwd. */
+    if (arg_path(cmd, 0, ".", path, sizeof path) != 0)
         return value_error("ls: path must be a plain word or string");
 
     struct embk_dirent *ents =
@@ -148,6 +162,18 @@ static struct value bi_ls(const struct command *cmd, struct value input,
 /* -------------------------------------------------------------------------
  * cd [dir] / pwd -- the shell-side working directory.
  * ------------------------------------------------------------------------- */
+/* Keep PWD in step with the real cwd.
+ *
+ * This is not bookkeeping -- it is HOW a child learns where it was run from.
+ * EmbLink inherits nothing: eval_extern hands `environ` to every external
+ * command, crt0 seeds the child's cwd from PWD, and that chain is the whole
+ * mechanism. Without this, `cd /proj` then `git status` would run git at "/".
+ * Public so main.c can publish the startup directory too. */
+void shell_cwd_publish(void) {
+    char buf[PATH_MAX_LEN];
+    if (getcwd(buf, sizeof buf)) setenv("PWD", buf, 1);
+}
+
 static struct value bi_cd(const struct command *cmd, struct value input,
                           struct scope *env) {
     (void)env;
@@ -155,11 +181,16 @@ static struct value bi_cd(const struct command *cmd, struct value input,
     char path[PATH_MAX_LEN];
     if (arg_path(cmd, 0, "/", path, sizeof path) != 0)
         return value_error("cd: path must be a plain word");
-    struct embk_stat st;
-    int rc = embk_stat(path, &st);
-    if (rc != 0) return err_os("cd: no such directory", path, rc);
-    if (st.type != EMBK_DT_DIR) return err_os("cd: not a directory", path, 0);
-    snprintf(g_cwd, sizeof g_cwd, "%s", path);
+
+    /* chdir() does the verifying (exists + is a directory) -- no need to stat
+     * first, and no window where we could disagree with it. */
+    if (chdir(path) != 0) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "cd: %s: %s", path,
+                 errno == ENOTDIR ? "not a directory" : "no such directory");
+        return value_error(msg);
+    }
+    shell_cwd_publish();
     return value_null();
 }
 
@@ -167,7 +198,9 @@ static struct value bi_pwd(const struct command *cmd, struct value input,
                            struct scope *env) {
     (void)cmd; (void)env;
     value_free(&input);
-    return value_path(g_cwd);
+    char buf[PATH_MAX_LEN];
+    if (!getcwd(buf, sizeof buf)) return value_error("pwd: cannot read the cwd");
+    return value_path(buf);
 }
 
 /* -------------------------------------------------------------------------

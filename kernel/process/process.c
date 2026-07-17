@@ -15,6 +15,7 @@
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 
 #include <stdint.h>
 
@@ -124,6 +125,12 @@ static struct process *process_alloc(void) {
              * 0 for the first time (see the field's comment), but starting
              * unambiguous costs nothing. */
             process_table[i].running_cpu = -1;
+            /* Reset like `cancelled`: slots are REUSED, and a fresh process must
+             * start with an unlocked fd table. (Safe under g_sched_lock --
+             * mutex_init only zeroes fields; it takes no lock. No thread can be
+             * blocked on the old occupant's fd_lock: a slot is reused only after
+             * every thread of the previous process is gone.) */
+            mutex_init(&process_table[i].fd_lock);
             spin_unlock(&g_sched_lock);
             return &process_table[i];
         }

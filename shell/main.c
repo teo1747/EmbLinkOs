@@ -175,9 +175,15 @@ static int read_line(char *buf, size_t cap) {
  * HOME exists because tools look there for their config (git wants
  * ~/.gitconfig). PATH is "/" because that is where the flat EMBKFS root puts
  * every executable today. */
+extern void shell_cwd_publish(void);   /* builtins_os.c */
+
 static void seed_default_env(void) {
     setenv("HOME", "/", 0);
     setenv("PATH", "/", 0);
+    /* Publish the directory we STARTED in (crt0 already seeded our cwd from an
+     * inherited PWD, if our own spawner named one), so the first external
+     * command runs where the user thinks it does -- not at "/". */
+    shell_cwd_publish();
 }
 
 int main(int argc, char **argv) {

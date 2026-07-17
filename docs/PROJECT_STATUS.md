@@ -531,7 +531,9 @@ Phase 4/5, §4.1/§6/§13/§16).
 
 ### Phase 21 — EMBKFS v2: Compression, Encryption, Snapshots, OS-Native Features ✅
 Full spec (byte-exact structs, every design decision, all known
-limitations stated plainly): `docs/EMBKFS_spec_v2.2.md`. Beginner-friendly
+limitations stated plainly): `docs/EMBKFS_spec_v2.2.md`, then
+`docs/EMBKFS_spec_v2.3.md` for what landed after it (atomic rename, bounded
+extents, the ~140x read-path rebuild). Beginner-friendly
 guide also published. Plan executed in one extended pass with standing
 autonomous-execution authorization; every phase has its own permanent
 selftest, all green in `test embkfs all`.
@@ -898,11 +900,19 @@ the full scheduler + SMP + thread/process split + ring-3 threads, EMBKFS
 v2's full feature set, **and** the newlib port, dynamic linking, the window
 compositor, and the EmUI GUI stack — all of which landed *ahead of* the
 self-hosting-first ordering originally sketched in `docs/ARCHITECTURE.md`)
-is now done. What's left before self-hosting:
+is now done — **and so is self-hosting for C**: TCC compiles, assembles, links
+and runs a program entirely on the OS (`test tcc link` → `exit=42`). The OS also
+hosts C++/libstdc++, CPython 3.14 and git 2.49; see [PORTS.md](PORTS.md).
 
-1. **Native shell/coreutils**, built on top of the kernel's own interactive
-   process-control commands (`run`/`ps`/`kill`/`wait`/`nice`) rather than
-   from scratch, then a self-hosting toolchain (tcc first). The GUI stack
+**Honest scope of that claim:** the OS can compile and run C *on itself*. It
+cannot yet rebuild *itself* — that needs a make-equivalent and a real TTY, and
+the kernel build wants GCC (whose driver fork/execs `cc1`/`as`/`ld`, which this
+OS structurally cannot do). "Self-hosting for C" is the accurate phrase.
+
+What's left:
+
+1. **Native shell/coreutils** — the structured shell has shipped
+   ([SHELL.md](SHELL.md)); coreutils and a real TTY remain. The GUI stack
    landing first means a native *editor* is now also plausible as an EmUI
    app before a text shell exists — worth reconsidering that ordering. See
    `docs/ARCHITECTURE.md` §5 for the current critical-path roadmap.

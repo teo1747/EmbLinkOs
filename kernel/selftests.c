@@ -13,6 +13,9 @@
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
+#include "drivers/input/keyboard.h"
+#include "process/ksync.h"
+#include "mm/kheap.h"
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -313,6 +316,14 @@ static void selftests_print_commands(void)
     kprintf("  test ctrlc2\n");
     kprintf("  test git\n");
     kprintf("  test git repo\n");
+    kprintf("  test git cwd\n");
+    kprintf("  test tcc\n");
+    kprintf("  test tcc compile\n");
+    kprintf("  test tcc link\n");
+    kprintf("  test keyboard\n");
+    kprintf("  test ksync\n");
+    kprintf("  test kheap\n");
+    kprintf("  test shell cwd\n");
     kprintf("  test python\n");
     kprintf("  test surface\n");
     kprintf("  test channel\n");
@@ -970,6 +981,173 @@ int selftests_handle_command(const char *cmd)
      * keystroke this test HANGS, which is the correct failure mode: the child's
      * console read genuinely never returns. Sentinel 42 = the parent saw every
      * step hold. */
+/* THE COMPLETE KEYBOARD. Drives the REAL 8042 IRQ path via QMP `sendkey`, so
+ * every layer is exercised: controller -> scancode -> modifier state machine ->
+ * both output streams.
+ *
+ * Each check asserts the ONE fact that distinguishes correct from broken --
+ * "an event arrived" would pass with the state machine completely wrong. */
+/* SEMAPHORE + MUTEX invariants. Single-threaded, so this checks the STATE
+ * MACHINE (counts, ownership, try-paths), not contention -- the uncontended
+ * fast paths are exactly what the bounce buffer relies on pre-scheduler, and a
+ * count that drifts by one is the bug that a "did it hang" test never sees. */
+/* THE SLAB ALLOCATOR. The heap is the most dangerous place to be wrong -- a
+ * misrouted free corrupts silently and surfaces as a random crash elsewhere --
+ * so this asserts the two invariants whose absence disabled the first attempt,
+ * not merely "it didn't fault". kheap_check() walks the general block canaries
+ * after each phase; a broken slab that scribbles a general block trips it. */
+    if (strcmp(cmd, "test kheap") == 0) {
+        int pass = 0, fail = 0;
+        #define HCHK(name, cond) do { if (cond) pass++; else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* 1. Every size class round-trips, and writing the WHOLE object then
+         *    reading it back proves the object is really that big and isolated. */
+        static const uint64_t sizes[] = { 16, 32, 64, 128, 256, 512, 1024 };
+        for (unsigned k = 0; k < sizeof(sizes)/sizeof(sizes[0]); k++) {
+            uint8_t *o = (uint8_t *)kmalloc(sizes[k]);
+            if (!o) { fail++; kprintf("  FAIL alloc %lu\n", sizes[k]); continue; }
+            for (uint64_t i = 0; i < sizes[k]; i++) o[i] = (uint8_t)(i ^ sizes[k]);
+            int ok = 1;
+            for (uint64_t i = 0; i < sizes[k]; i++) if (o[i] != (uint8_t)(i ^ sizes[k])) ok = 0;
+            HCHK("size-class object intact end-to-end", ok);
+            kfree(o);
+        }
+        kheap_check();
+
+        /* 2. THE COLLISION REGRESSION. A general (non-slab) block filled entirely
+         *    with 0xAA -- the OLD magic byte -- must still free as a general
+         *    block. Range discrimination gets this right; the magic-byte scheme
+         *    that was disabled would have misrouted it into a slab pool. If this
+         *    is broken, kheap_check() below halts on canary corruption. */
+        uint8_t *big = (uint8_t *)kmalloc(4096);   /* > 1024 => general, not slab */
+        HCHK("large alloc is a general block", big != 0);
+        if (big) { for (int i = 0; i < 4096; i++) big[i] = 0xAA; kfree(big); }
+        kheap_check();
+
+        /* 3. Force MULTIPLE region grows in one pool (more objects than a single
+         *    region holds). This exercises the registry and -- critically -- must
+         *    NOT deadlock: the old grow re-locked heap_lock via kheap_alloc. */
+        #define NHAMMER 2048
+        static void *hammer[NHAMMER];
+        int got = 0;
+        for (int i = 0; i < NHAMMER; i++) { hammer[i] = kmalloc(32); if (hammer[i]) got++; }
+        HCHK("mass 32B alloc (multi-grow, no deadlock)", got == NHAMMER);
+        /* write-through to catch any two objects that alias the same memory */
+        for (int i = 0; i < got; i++) *(int *)hammer[i] = i;
+        int alias = 0;
+        for (int i = 0; i < got; i++) if (*(int *)hammer[i] != i) alias++;
+        HCHK("no two slab objects alias", alias == 0);
+        for (int i = 0; i < got; i++) kfree(hammer[i]);
+        kheap_check();
+
+        /* 4. krealloc across the slab->general boundary preserves the bytes. */
+        uint8_t *r = (uint8_t *)kmalloc(16);
+        for (int i = 0; i < 16; i++) r[i] = (uint8_t)(0x40 + i);
+        r = (uint8_t *)krealloc(r, 2000);          /* 16 (slab) -> 2000 (general) */
+        int rok = (r != 0);
+        if (r) for (int i = 0; i < 16; i++) if (r[i] != (uint8_t)(0x40 + i)) rok = 0;
+        HCHK("krealloc slab->general keeps data", rok);
+        if (r) kfree(r);
+        kheap_check();
+
+        kheap_slab_stats();
+        kprintf("\n[cmd] test kheap: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef HCHK
+        #undef NHAMMER
+        return 1;
+    }
+
+    if (strcmp(cmd, "test ksync") == 0) {
+        int pass = 0, fail = 0;
+        #define SCHK(name, cond) do { if (cond) pass++; else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* --- semaphore counting --- */
+        struct semaphore s;
+        sem_init(&s, 2);
+        SCHK("sem(2): trywait #1 succeeds", sem_trywait(&s) == 1);
+        SCHK("sem(2): trywait #2 succeeds", sem_trywait(&s) == 1);
+        SCHK("sem(2): trywait #3 FAILS (empty)", sem_trywait(&s) == 0);
+        sem_post(&s);
+        SCHK("sem: post then trywait succeeds", sem_trywait(&s) == 1);
+        SCHK("sem: empty again after", sem_trywait(&s) == 0);
+        /* A semaphore counts UP past its initial value -- it is not a mutex. */
+        sem_post(&s); sem_post(&s); sem_post(&s);
+        SCHK("sem: counts to 3", sem_trywait(&s) && sem_trywait(&s) && sem_trywait(&s));
+        SCHK("sem: and no further", sem_trywait(&s) == 0);
+
+        /* --- mutex ownership + try --- */
+        struct mutex m;
+        mutex_init(&m);
+        SCHK("mutex: trylock a free mutex succeeds", mutex_trylock(&m) == 1);
+        SCHK("mutex: trylock a held mutex FAILS", mutex_trylock(&m) == 0);
+        mutex_unlock(&m);
+        SCHK("mutex: trylock succeeds after unlock", mutex_trylock(&m) == 1);
+        mutex_unlock(&m);
+        /* lock/unlock leaves it free for the next trylock -- the round trip. */
+        mutex_lock(&m);
+        SCHK("mutex: held after lock()", mutex_trylock(&m) == 0);
+        mutex_unlock(&m);
+        SCHK("mutex: free after unlock()", mutex_trylock(&m) == 1);
+        mutex_unlock(&m);
+
+        kprintf("\n[cmd] test ksync: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef SCHK
+        return 1;
+    }
+
+    if (strcmp(cmd, "test keyboard") == 0) {
+        int pass = 0, fail = 0;
+        #define KCHK(name, cond) do { if (cond) { pass++; } else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* Drain whatever the console left behind, so we measure OUR keys. */
+        { struct key_event e; while (keyboard_event_pop(&e)) {} }
+        while (keyboard_has_char()) (void)keyboard_getchar();
+
+        kprintf("\n[keyboard] layout=%s mods=0x%02x\n",
+                keyboard_layout(), keyboard_mods());
+
+        /* 1. Layouts. The abstraction is the claim: the SAME scancode must
+         *    produce a different character, and 'us' must come back intact. */
+        KCHK("layout: unknown name REFUSED (no silent fallback)",
+             keyboard_set_layout("nope") == -1);
+        KCHK("layout: still us after a refused switch",
+             keyboard_layout()[0] == 'u');
+        KCHK("layout: dvorak selectable", keyboard_set_layout("dvorak") == 0);
+        KCHK("layout: dvorak is active",  keyboard_layout()[0] == 'd');
+        KCHK("layout: back to us",        keyboard_set_layout("us") == 0);
+
+        /* 2. The event ring must survive overflow WITHOUT stranding a
+         *    modifier. Push more than it holds, then check it still drains. */
+        kprintf("[keyboard] mods now 0x%02x (0=nothing held)\n", keyboard_mods());
+        KCHK("no modifier stuck down at rest", keyboard_mods() == 0);
+
+        kprintf("\n[cmd] test keyboard: %d/%d checks\n", pass, pass + fail);
+        kprintf("[keyboard] NOW TYPE -- 8s live capture (events: code/mods/up-down)\n");
+
+        /* 3. LIVE: whatever arrives in the next 8s, report it. This is where a
+         *    QMP `sendkey ctrl-c` / `sendkey f1` / `sendkey caps_lock` proves the
+         *    real IRQ path, not a simulated one. */
+        int nev = 0;
+        for (int tick = 0; tick < 160; tick++) {   /* 160 x 50ms = 8s */
+            struct key_event e;
+            while (keyboard_event_pop(&e)) {
+                kprintf("  ev code=0x%03x mods=0x%02x %s\n",
+                        e.code, e.mods, e.pressed ? "DOWN" : "up");
+                nev++;
+            }
+            hpet_delay_ms(50);
+        }
+        kprintf("[keyboard] captured %d events; mods at end=0x%02x\n",
+                nev, keyboard_mods());
+        #undef KCHK
+        return 1;
+    }
+
     if (strcmp(cmd, "test ctrlc") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test ctrlc: VFS not registered\n");
@@ -1064,6 +1242,256 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("\n[cmd] test git repo: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* git in a SUBDIRECTORY -- what per-process cwd bought. Every repo used to
+     * root at "/" because chdir was ENOSYS, so `status` listed every packed
+     * .elf as untracked and two repos were impossible. PWD is how the parent
+     * NAMES the child's starting directory (nothing is inherited); crt0 seeds
+     * the cwd from it. This also exercises git's own chdir: it walks UP from
+     * the cwd looking for .git, which needs ".." to normalize. */
+    if (strcmp(cmd, "test git cwd") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test git cwd: VFS not registered\n");
+            return 1;
+        }
+        (void)vfs_mkdir_path("/proj");
+        {
+            int fd = vfs_open("/proj/hello.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                static const char msg[] = "a repo that is NOT at the root\n";
+                size_t w = 0;
+                vfs_fd_write(fd, msg, sizeof msg - 1, &w);
+                vfs_close(fd);
+            }
+        }
+
+        /* PWD=/proj: the whole point. Same env for every step. */
+        char *env[] = { "HOME=/", "GIT_PAGER=", "PWD=/proj", NULL };
+        int ok = 1;
+        struct { const char *what; char *argv[8]; int argc; } steps[] = {
+            { "init",   { "/git.elf", "init" }, 2 },
+            { "email",  { "/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
+            { "name",   { "/git.elf", "config", "user.name", "Motsou" }, 4 },
+            { "add",    { "/git.elf", "add", "hello.txt" }, 3 },   /* RELATIVE */
+            { "commit", { "/git.elf", "commit", "-m", "committed from /proj" }, 4 },
+            { "status", { "/git.elf", "status", "--short" }, 3 },
+        };
+        for (unsigned i = 0; i < sizeof steps / sizeof steps[0] && ok; i++) {
+            int pid = process_create_env("/git.elf", steps[i].argv, steps[i].argc,
+                                         env, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            kprintf("[git@/proj %s] exit=%d\n", steps[i].what, code);
+            if (pid < 0 || code != 0) ok = 0;
+        }
+
+        /* The repo must be AT /proj -- if cwd were ignored it would be at /. */
+        struct vfs_stat st;
+        int here = (vfs_stat("/proj/.git", &st) == 0);
+        int not_root = (vfs_stat("/.git/HEAD", &st) != 0);
+        kprintf("[git@/proj] /proj/.git exists: %s\n", here ? "yes" : "NO");
+        kprintf("\n[cmd] test git cwd: %s\n", (ok && here && not_root) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* THE SHELL'S cwd CHAIN, end to end. `cd` moves the shell's REAL cwd (the
+     * libc's) and republishes PWD -- and PWD is exactly the vector eval_extern
+     * hands to every external command, which crt0 then seeds the child's cwd
+     * from. Nothing is inherited; this chain IS the inheritance.
+     *
+     * The assertion is `git init` run from the shell after a `cd`: if PWD had
+     * not followed the cd, git would init at "/" and /cwdshell/.git would not
+     * exist. `|` not `;` -- the lexer has no statement separator, and builtins
+     * run IN-PROCESS so `cd` and the spawn share one environ. */
+    if (strcmp(cmd, "test shell cwd") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shell cwd: VFS not registered\n");
+            return 1;
+        }
+        (void)vfs_mkdir_path("/cwdshell");
+        char *env[] = { "HOME=/", "GIT_PAGER=", NULL };
+        int ok = 1;
+
+        char *a1[] = { "/shell.elf", "-c", "cd /cwdshell | pwd", NULL };
+        int p1 = process_create_env("/shell.elf", a1, 3, env, NULL, 0);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[shell cd|pwd] exit=%d\n", c1);
+        if (p1 < 0 || c1 != 0) ok = 0;
+
+        /* cd, then SPAWN git there. The spawn is the point: a builtin sharing
+         * the shell's own cwd proves nothing about what a CHILD sees. */
+        char *a2[] = { "/shell.elf", "-c", "cd /cwdshell | git init", NULL };
+        int p2 = process_create_env("/shell.elf", a2, 3, env, NULL, 0);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[shell cd|git init] exit=%d\n", c2);
+
+        struct vfs_stat st;
+        int here = (vfs_stat("/cwdshell/.git", &st) == 0);
+        kprintf("[shell cwd] /cwdshell/.git exists: %s\n", here ? "yes" : "NO");
+        kprintf("\n[cmd] test shell cwd: %s\n", (ok && here) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* TCC. `-v` first, deliberately -- the same first question git version and
+     * python -c answered: does the binary initialise and reach its own code at
+     * all, before any compiling complicates the answer. */
+    if (strcmp(cmd, "test tcc") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc: VFS not registered\n"); return 1; }
+        char *a[] = { "/tcc.elf", "-v", NULL };
+        char *env[] = { "HOME=/", NULL };
+        int pid = process_create_env("/tcc.elf", a, 2, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test tcc: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* THE COMPILER ITSELF: source -> object, ON the OS.
+ *
+ * Deliberately HEADER-FREE. tcc needs /include and /lib to build a normal
+ * program, and mkfs packs a FLAT root -- there is no /include yet. But none of
+ * that is the compiler: `tcc -c` exercises the frontend, the x86-64 codegen,
+ * the integrated assembler and the ELF object writer, which is the whole
+ * question at this step. Linking a runnable binary is the NEXT one.
+ *
+ * The proof is the OBJECT: read it back and check the ELF magic + type. An
+ * exit code of 0 only says tcc did not complain. */
+    if (strcmp(cmd, "test tcc compile") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc compile: VFS not registered\n"); return 1; }
+
+        static const char src[] =
+            "/* no #include: the OS has no /include yet, and this is a test of\n"
+            "   the COMPILER, not of header search. */\n"
+            "int add(int a, int b) { return a + b; }\n"
+            "int answer(void) { return add(40, 2); }\n";
+        {
+            int fd = vfs_open("/t.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test tcc compile: cannot write /t.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/t.o");
+
+        char *a[] = { "/tcc.elf", "-c", "/t.c", "-o", "/t.o" };
+        char *env[] = { "HOME=/", NULL };
+        int pid = process_create_env("/tcc.elf", a, 5, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tcc -c] exit=%d\n", code);
+
+        /* Read the object back and look at it. */
+        unsigned char hdr[20] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/t.o", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/t.o", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_64  = is_elf && hdr[4] == 2;                 /* ELFCLASS64 */
+        int is_rel = is_elf && hdr[16] == 1;                /* ET_REL: an object */
+        kprintf("[tcc -c] /t.o: %s, %llu bytes; ELF=%d 64-bit=%d ET_REL=%d\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_64, is_rel);
+
+        int ok = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel && st.size > 64);
+        kprintf("\n[cmd] test tcc compile: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* THE WHOLE TOOLCHAIN: source -> RUNNING PROCESS, entirely on the OS.
+ *
+ * This is the step that makes EmbLink self-hosting for C: tcc compiles, tcc
+ * assembles, tcc LINKS, and the kernel then spawns what came out. The proof is
+ * the EXIT CODE of the produced binary -- 42 can only be there if the program
+ * we wrote was really compiled and really ran. A valid-looking ELF proves the
+ * writer works; only running it proves the whole chain does.
+ *
+ * `-nostdlib` is the load-bearing flag, and it is not a workaround:
+ *   - tcc would otherwise link ITS host's crt1.o/crti.o/crtn.o, which do not
+ *     exist here and would be wrong if they did -- EmbLink's entry contract is
+ *     crt0.o's _start(argc, argv, envp), not glibc's.
+ *   - it also drops the implicit -ltcc1 (tcc's own runtime). We do not have
+ *     libtcc1.a: its Makefile builds it by RUNNING the just-built tcc, which is
+ *     an EmbLink binary the host cannot execute. A program that needs no
+ *     __divdi3-class helper does not need it, so we find out by asking.
+ * So we name EVERY input ourselves -- crt0.o, syscalls.o, libc.a -- which is
+ * exactly the model the rest of the OS uses: nothing is inherited, the caller
+ * names what it wants.
+ *
+ * `-static` is equally load-bearing, and it was not obvious: without it tcc
+ * links a DYNAMIC executable -- PT_INTERP + PT_DYNAMIC, asking for an ELF
+ * interpreter to be exec'd on its behalf. That is a Linux contract EmbLink does
+ * not implement and will not: there is no exec, and our in-kernel loader binds a
+ * KNOWN second object (libembk.so) rather than running an interpreter program
+ * ([[dynamic-linking]]). The first attempt here produced a perfectly valid
+ * 82 KB ET_EXEC that the kernel then refused, and the ELF said exactly why.
+ *
+ * `-L/` and not `-L/lib` because mkfs packs a FLAT root. The toolchain lives at
+ * "/" alongside the apps, so the flat root IS the search path -- no directory
+ * support required to build software here.
+ *
+ * Header-free again, and for the same reason as `test tcc compile`: /include
+ * does not exist. main() needs no declaration to be defined. */
+    if (strcmp(cmd, "test tcc link") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc link: VFS not registered\n"); return 1; }
+
+        static const char src[] =
+            "/* Compiled BY EmbLink, ON EmbLink. No #include: there is no\n"
+            "   /include yet, and main needs no declaration to be defined. */\n"
+            "static int twice(int x) { return x + x; }\n"
+            "int main(void) { return twice(21); }\n";
+        {
+            int fd = vfs_open("/l.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test tcc link: cannot write /l.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/l.elf");
+
+        char *a[] = { "/tcc.elf", "-static", "-nostdlib", "/l.c", "/crt0.o",
+                      "/syscalls.o", "-L/", "-lc", "-o", "/l.elf" };
+        char *env[] = { "HOME=/", NULL };
+        /* Echo the command. It documents what is being asked, and it doubles as
+         * a staleness canary: if this line does not appear, you are not running
+         * the kernel you just built -- check that BEFORE doubting the compiler. */
+        kprintf("[tcc link] %s %s %s %s %s %s %s %s %s\n",
+                a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+        int pid = process_create_env("/tcc.elf", a, 10, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tcc link] exit=%d\n", code);
+
+        /* Read enough of the header to see e_phnum. It is the DIRECT readout of
+         * whether -static took: tccelf.c gives a static exe 2 program headers
+         * and a dynamic one 5 (PHDR+INTERP+2xLOAD+DYNAMIC). Measuring it here,
+         * in the kernel, beats extracting the file and guessing on the host. */
+        unsigned char hdr[64] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/l.elf", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/l.elf", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_exec = is_elf && hdr[16] == 2;              /* ET_EXEC: runnable */
+        unsigned phnum = is_elf ? (unsigned)(hdr[56] | (hdr[57] << 8)) : 0;
+        kprintf("[tcc link] /l.elf: %s, %llu bytes; ELF=%d ET_EXEC=%d phnum=%u (2=static 5=dynamic)\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_exec, phnum);
+
+        /* RUN IT. This is the actual claim. */
+        int rcode = -1;
+        if (is_exec) {
+            char *b[] = { "/l.elf", NULL };
+            int p2 = process_create_env("/l.elf", b, 1, env, NULL, 0);
+            rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+            kprintf("[tcc link] /l.elf ran: exit=%d (want 42)\n", rcode);
+        }
+
+        int ok = (pid >= 0 && code == 0 && is_elf && is_exec && rcode == 42);
+        kprintf("\n[cmd] test tcc link: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

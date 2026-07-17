@@ -1,0 +1,27 @@
+# config.site — pre-cached autoconf answers for CPython on EmbLinkOS.
+#
+# WHY THIS FILE EXISTS: EmbLink binaries cannot execute on the build host (they
+# need crt0 + the EmbLink syscall layer), so autoconf cannot RUN any probe. Every
+# check that would answer itself by running a test program must be answered here
+# instead. This is the same shape the WASI and VxWorks CPython builds use.
+#
+# RULE: each answer states what is actually true of EmbLinkOS today. Never set a
+# probe to "yes" to get past configure — a false yes compiles a call to something
+# that does not exist, and the failure resurfaces later as a link error or, worse,
+# as silent wrong behaviour at runtime.
+
+# --- device files -----------------------------------------------------------
+# No pty layer. The console is the compositor/terminal, not a Unix tty pair.
+ac_cv_file__dev_ptmx=no
+ac_cv_file__dev_ptc=no
+
+# --- headers that exist but are hollow ---------------------------------------
+# newlib DOES ship <sys/resource.h>, so the naive answer is yes -- but all it
+# declares is getrusage() and struct rusage. It has NO rlimits: no RLIMIT_*, no
+# getrlimit, no setrlimit, and libc.a defines no such symbols. CPython treats
+# HAVE_SYS_RESOURCE_H as "this platform has rlimits" (Modules/faulthandler.c
+# includes it solely for setrlimit()), so a truthful-looking "yes" produces an
+# implicit-declaration build failure. Answering no is the conservative
+# direction: it disables rlimit code we genuinely cannot back, and EmbLink has
+# no resource limits to report. It costs nothing we have.
+ac_cv_header_sys_resource_h=no

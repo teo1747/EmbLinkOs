@@ -22,7 +22,7 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 
 **Definition of "understand":** every line of the *contract* EmbLinkOS presents (syscall ABI, libc surface, ELF loader, process model, filesystem) is understood completely. Large ported dependencies (a C compiler, later a full libc) are integrated deliberately — we understand *what they do as a whole and how to use them, and why they need what they ask of us*, not every internal line. The understanding lives at the seam.
 
-**North star — self-hosting:** a compiler running on the metal, so the OS can be developed from inside itself. Honest scope: the near-term target is **TCC compiling a real program on bare metal** (C, single self-contained binary, unoptimized) — legitimate self-hosting, and a realistic stretch goal. Full GCC/C++ self-hosting is a later, multi-stage effort, not an end-of-2026 goal for a solo hand-built project.
+**North star — self-hosting:** a compiler running on the metal, so the OS can be developed from inside itself. **The near-term target — TCC compiling a real program on bare metal — is DONE** (`test tcc link` → `exit=42`; [`PORTS.md`](PORTS.md)): C, single self-contained binary, unoptimized. That is legitimate self-hosting for C, and it is the honest scope of the claim — the OS can compile and run C on itself, but it cannot yet rebuild *itself* (no make, no TTY, and the kernel build wants GCC). Full GCC/C++ self-hosting is a later, multi-stage effort, not an end-of-2026 goal for a solo hand-built project.
 
 ---
 
@@ -65,7 +65,9 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | 8 | Core userspace (personality) | Native shell — structured; minimal runner first, ported dash for Linux scripts | 🎯 Designed |
 | | | Coreutils (downstream of shell builtins-vs-separate — see §6) | 🔓 Open |
 | | | TTY + terminal emulator | 🔓 Open |
-| | | Toolchain (TCC → GCC/LLVM, linker, build tool) | 🎯 Roadmap |
+| | | Toolchain — **TCC (compiler+assembler+linker) runs ON the OS** | ✅ Done |
+| | | Toolchain — GCC/LLVM (needs a subprocess model; see §5.9) | 🎯 Roadmap |
+| | | Build tool on the OS (make-equivalent) | 🔓 Open |
 | | | Package manager | 🔓 Open |
 | | | Editor / IDE (native) | 🔓 Open |
 | 9 | Compatibility | Linux-compat mechanism | 🔓 Open |
@@ -143,7 +145,7 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 - **Memory:** bitmap PMM, higher-half VMM (kernel @ `0xFFFFFFFF80100000`), per-process address spaces. *Known limits: hardcoded stack size, no COW/NX yet.*
 - **Process & scheduling:** preemptive SMP scheduler (priority-band round-robin + aging), ring-3 processes and threads, `spawn()`/`wait()`/`kill()` via capability handles, uncatchable kernel-level kill. See [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
 - **Storage:** ATA + AHCI drivers (LBA48 read/write), block layer with DMA bounce buffers, MBR partitioning, USB mass storage as an alternate block-device backend.
-- **Filesystems:** VFS (filesystem-neutral mount registry, `vfs_resolve` with `.`/`..` breadcrumb stack, `vget` op, `ls`). FAT32 (file write, `mkdir`, LFN, FSInfo). **EMBKFS** — the primary filesystem: CoW B-tree on-disk format, checksums, AES-256-XTS encryption, compression, snapshots, self-heal, provenance, verified boot; a Python reference implementation (`tools/embkfs_mkfs/`) builds and independently verifies images. See [`EMBKFS_spec_v2.2.md`](EMBKFS_spec_v2.2.md).
+- **Filesystems:** VFS (filesystem-neutral mount registry, `vfs_resolve` with `.`/`..` breadcrumb stack, `vget` op, `ls`). FAT32 (file write, `mkdir`, LFN, FSInfo). **EMBKFS** — the primary filesystem: CoW B-tree on-disk format, checksums, AES-256-XTS encryption, compression, snapshots, self-heal, provenance, verified boot, **atomic rename** (git's lockfile protocol depends on it), chmod/ftruncate; a Python reference implementation (`tools/embkfs_mkfs/`) builds and independently verifies images. Spec: [`v2.3`](EMBKFS_spec_v2.3.md) (latest additions) layered on [`v2.2`](EMBKFS_spec_v2.2.md) (the v2 format).
 - **File layer:** fd table (base 3, stdio reserved), create-on-open, `kcontext` setjmp/longjmp so `sys_exit` unwinds to kernel. Unlink-while-open safety via `g_open_refs` + deferred-free. *Known limit: no on-disk orphan list; mount-time sweep planned.*
 - **USB:** all four host-controller generations (xHCI, EHCI, UHCI, OHCI) — keyboard, mouse, mass storage.
 - **Display:** GPU driver (virtio-gpu → Bochs DISPI → VBE fallback), a framebuffer console, and an in-kernel **window compositor** (z-order, kernel or app-owned chrome, zero-copy shared-memory windows, resizable windows, desktop widgets in a dedicated z-band, pointer capture).
@@ -165,10 +167,10 @@ Ordered by dependency. Fine-grained tasks live in `TODO.md`.
 6. **newlib** ✅ — full port, including a C99-format-enabled rebuild (`%z`/`%ll` support the stock toolchain newlib lacks) — see [`user/README.md`](../user/README.md) and [`BUILD_SETUP.md`](BUILD_SETUP.md#the-newlib-c99-rebuild-why-there-are-two-newlibs).
 7. **Display + GUI** ✅ *(landed ahead of the shell, not blocking it)* — GPU driver, window compositor, and **EmUI** (a from-scratch declarative UI toolkit) all shipped; the OS boots straight into a graphical home launcher rather than a text shell. See [`EMUI_GUIDE.md`](EMUI_GUIDE.md) / [`EMUI_INTERNALS.md`](EMUI_INTERNALS.md).
 8. **TTY/console** *(partially built)* — the framebuffer console + keyboard input exist; a real scrollback/line-editing TTY for a text shell is still open.
-9. **Toolchain port — TCC first.** Single self-contained binary (built-in assembler + linker, no subprocess spawning), so it runs before a full `fork`/`exec`/pipe process model exists. GCC/LLVM later, once the subprocess-spawning model is in place.
+9. **Toolchain port — TCC first.** ✅ **DONE** — `test tcc link` compiles, assembles, links and **runs** a program entirely on the OS (`exit=42`). Single self-contained binary (built-in assembler + linker, no subprocess spawning), so it runs without a `fork`/`exec` model — which is the whole reason it, and not GCC, was the target: GCC's driver fork/execs `cc1`/`as`/`ld` and is **structurally impossible** here, not merely harder. See [`PORTS.md`](PORTS.md). GCC/LLVM remain deferred, and would need a subprocess model this OS does not intend to grow.
 10. **Shell + editor** — the last mile to a livable environment. (A native *editor* could plausibly be built as an EmUI app before a text shell exists, now that the GUI stack is ahead of it — worth reconsidering the ordering here.)
 
-Steps 1–7 are done. Step 9 (TCC on metal) is the flag for "true self-hosting achieved" — note that GUI landed well ahead of self-hosting rather than after it, which is a deliberate reordering from this doc's original "later, post-self-hosting" framing (§1's "understand every seam" principle applied fine to a UI stack too, and having a working desktop made every other subsystem easier to demo and debug live).
+Steps 1–7 are done, and **step 9 — the flag for "true self-hosting achieved" — is now up**: a C compiler runs on the metal and produces running programs (`test tcc link` → `exit=42`, [`PORTS.md`](PORTS.md)). Steps 8 and 10 are what remain: a real TTY, and an editor. Note that GUI landed well ahead of self-hosting rather than after it, which is a deliberate reordering from this doc's original "later, post-self-hosting" framing (§1's "understand every seam" principle applied fine to a UI stack too, and having a working desktop made every other subsystem easier to demo and debug live).
 
 ---
 

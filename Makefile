@@ -62,6 +62,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/usermode.c \
              kernel/arch/x86_64/syscall/elf.c \
              kernel/process/process.c \
+             kernel/process/ksync.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \
@@ -164,6 +165,14 @@ build/init.elf: build/init.o user/lib/user.ld
 # fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
 # toolchain newlib (and re-lose %z/%ll). See user/README.md.
 NEWLIB_PREFIX ?= /home/motsou/cross/newlib-c99
+
+# Let scripts ask the Makefile where newlib is, so NEWLIB_PREFIX stays the ONE
+# source of truth and tools/tcc/build-tcc-emblink.sh cannot drift from the build.
+.PHONY: print-newlib-prefix print-cxx-prefix
+print-newlib-prefix:
+	@echo '$(NEWLIB_PREFIX)'
+print-cxx-prefix:
+	@echo '$(if $(HAVE_CXX),$(CXX_PREFIX),)'
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
@@ -234,7 +243,21 @@ HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
 
 # git, same shape as HAVE_PY: absent cross-built binary == GIT_APPS empty ==
 # the tree still builds. Build it with /home/motsou/cross/build-git-emblink.sh.
-GIT_BIN  ?= /home/motsou/cross/git-2.49.1/git
+# The build script now lives IN THE REPO (tools/git/), so a teammate's checkout
+# can rebuild git without a copy of the author's home directory. It takes the
+# source tree as an argument and needs a cross-built zlib -- both overridable.
+GIT_SRC  ?= /home/motsou/cross/git-2.49.1
+GIT_BIN  ?= $(GIT_SRC)/git
+ZLIB_BUILD ?= /home/motsou/cross/build-zlib
+GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
+
+# TCC -- a C compiler that RUNS ON the OS. Chosen because it is compiler +
+# assembler + linker in ONE binary: EmbLink has no exec, so GCC's driver (which
+# fork/execs cc1, as, ld) is structurally impossible here, while `tcc a.c -o a`
+# is a single process start to finish.
+TCC_SRC ?= /home/motsou/cross/tcc-0.9.27
+TCC_BIN ?= $(TCC_SRC)/tcc
+HAVE_TCC := $(if $(wildcard $(TCC_BIN)),yes,)
 HAVE_GIT := $(if $(wildcard $(GIT_BIN)),yes,)
 
 PY_SRC   ?= /home/motsou/cross/Python-3.14.6
@@ -250,8 +273,24 @@ PY_APPS = build/python.elf build/python314.zip build/python.elf._pth
 # it debug_info) and 7.5 MB stripped. The 64 MB volume would not hold the former
 # alongside cxxdemo.elf's 9.4 MB. Keep the unstripped original in $(PY_BUILD) --
 # that's what addr2line needs when the thing faults.
-build/python.elf: $(PY_BIN) | $(BUILD)
-	cp -f $< $@
+# DEPENDS ON THE LIBC, and that is the whole point of this rule's complexity:
+# python EMBEDS build/crt0.o + build/syscalls.o (they are in its LDFLAGS). But
+# CPython's own Makefile has them as RAW PATHS, not prerequisites, so its `make`
+# reports "up to date" however much our libc changed -- it cannot know. That is
+# not hypothetical: python.elf once sat 15 HOURS stale, passing `test python`
+# against a frozen copy of an old libc. Green, and true of a binary nobody
+# builds any more.
+#
+# So WE track it. Relink only when the libc is genuinely NEWER than the
+# interpreter -- a blind `rm && make` would relink on every single build.
+build/python.elf: $(PY_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(PY_BIN) ] || [ build/crt0.o -nt $(PY_BIN) ]; then \
+	    echo "  RELINK   python  (libc changed under it)"; \
+	    rm -f $(PY_BIN); \
+	    $(MAKE) -s -C $(PY_BUILD) python || \
+	      { echo "*** python relink FAILED -- see $(PY_BUILD)"; exit 1; }; \
+	 fi
+	cp -f $(PY_BIN) $@
 	$(STRIP) $@
 
 # The stdlib as ONE zip: importlib+zipimport are frozen into the interpreter, so
@@ -566,14 +605,41 @@ GIT_APPS = build/git.elf
 
 # Same reasoning as python.elf: 4.7 MB unstripped, 3.5 MB stripped; keep the
 # unstripped original next to the source tree for addr2line when it faults.
-build/git.elf: $(GIT_BIN) | $(BUILD)
-	cp -f $< $@
+# Same libc-embedding problem as python.elf above (see that rule for why git's
+# own Makefile cannot catch this): git links build/crt0.o + build/syscalls.o via
+# LDFLAGS, so a libc change silently leaves the packed git.elf on the old one.
+# Relink only when the libc is actually newer.
+build/git.elf: $(GIT_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(GIT_BIN) ] || [ build/crt0.o -nt $(GIT_BIN) ]; then \
+	    echo "  RELINK   git     (libc changed under it)"; \
+	    rm -f $(GIT_BIN); \
+	    ZLIB_BUILD=$(ZLIB_BUILD) $(GIT_BUILD_SH) $(GIT_SRC) >/dev/null 2>&1 || \
+	      { echo "*** git relink FAILED -- run: ZLIB_BUILD=$(ZLIB_BUILD) $(GIT_BUILD_SH) $(GIT_SRC)"; exit 1; }; \
+	 fi
+	cp -f $(GIT_BIN) $@
+	$(STRIP) $@
+endif
+
+ifeq ($(HAVE_TCC),yes)
+TCC_APPS = build/tcc.elf
+
+# Same libc-embedding problem as python.elf/git.elf (see those rules): tcc links
+# build/crt0.o + build/syscalls.o via LDFLAGS, which its own Makefile treats as
+# raw paths. Relink only when the libc is genuinely newer.
+build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(TCC_BIN) ] || [ build/crt0.o -nt $(TCC_BIN) ]; then \
+	    echo "  RELINK   tcc     (libc changed under it)"; \
+	    rm -f $(TCC_BIN); \
+	    $(MAKE) -s -C $(TCC_SRC) CONFIG_ldl=no tcc || \
+	      { echo "*** tcc relink FAILED -- see $(TCC_SRC)"; exit 1; }; \
+	 fi
+	cp -f $(TCC_BIN) $@
 	$(STRIP) $@
 endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
-               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(EMUI_APPS)
+               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
@@ -591,7 +657,11 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) bu
 	       echo "***          NOT rebuild the image. Add it to EMBKFS_APPS."; ;; \
 	  esac; \
 	done
-	python3 tools/embkfs_mkfs/mkfs_embkfs.py
+	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs at the image root
+	@# for tcc to link against ON the OS. Derived from the ONE NEWLIB_PREFIX so a
+	@# checkout on another machine needs no mkfs edit -- see docs/BUILD_SETUP.md.
+	EMBK_NEWLIB_LIBC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libc.a,)" \
+	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
 # Create a 64MB AHCI test disk (separate from disk.img)
@@ -738,6 +808,26 @@ part_embkfs.img: embkfs_tree.img
 	dd if=/dev/zero of=part_embkfs.img bs=1M count=16 status=none
 	printf 'label: dos\nstart=2048, type=83\n' | sfdisk part_embkfs.img
 	dd if=embkfs_tree.img of=part_embkfs.img bs=512 seek=2048 conv=notrunc status=none
+
+# A real GPT disk, written by sfdisk -- the INDEPENDENT oracle. We are not
+# grading our own homework: if our reader disagrees with the tool that wrote it,
+# our reader is wrong. Three partitions so the entry walk is exercised, not just
+# entry 0, and one of them lands past index 9 territory for the name check.
+part_gpt.img:
+	dd if=/dev/zero of=part_gpt.img bs=1M count=32 status=none
+	printf 'label: gpt\nstart=2048, size=8192, type=linux\nstart=10240, size=8192, type=linux\nstart=18432, size=8192, type=linux\n' | sfdisk part_gpt.img
+
+# An MBR disk with an EXTENDED partition holding logical partitions (sda5+).
+# The EBR chain is a linked list whose two link fields use DIFFERENT bases --
+# the thing most likely to be wrong, so make the chain long enough to catch it.
+part_ext.img:
+	dd if=/dev/zero of=part_ext.img bs=1M count=32 status=none
+	printf 'label: dos\nstart=2048, size=4096, type=83\nstart=6144, size=51200, type=5\nstart=8192, size=8192, type=83\nstart=18432, size=8192, type=83\nstart=28672, size=8192, type=83\n' | sfdisk part_ext.img
+
+run-part-gpt: $(IMG) part_gpt.img
+	qemu-system-x86_64 -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=part_gpt.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
 
 run-part-fat: $(IMG) $(DISK) part_fat.img
 	qemu-system-x86_64 \

@@ -70,6 +70,44 @@ So when you add a feature, ask: *what is the one fact that distinguishes correct
 from broken?* Then write the test that checks that fact, and watch it be green
 for the right reason.
 
+Worked example: the compiler port's test does not check that `tcc` exits 0, or
+that it emits a valid-looking ELF — either can be true of a broken compiler.
+It **runs the produced binary and checks it returns 42**. That number can only
+appear if the program was really compiled and really executed.
+
+### Two ways a green test lies, both of which have bitten this repo
+
+- **The binary under test was stale.** `python.elf` sat **15 hours** out of
+  date, passing `test python` against a frozen copy of an old libc — green, and
+  true of a binary nobody builds any more. The ports statically link
+  `build/syscalls.o` via a raw path their own build systems treat as a file, not
+  a prerequisite, so `make python` says *"up to date"* however much our libc
+  changed. Our Makefile now forces the relink; check mkfs's `src fingerprint`
+  line if you are unsure what got packed.
+- **Your code never ran at all.** Put a marker (a `kprintf` naming what you are
+  testing) in any new selftest. If the marker does not appear, you are not
+  running the kernel you just built — check *that* before doubting the code.
+  A `pkill -f` pattern once matched its own shell's command line and killed two
+  QEMU runs before they started; the `>` redirect left the *previous* log in
+  place, so the stale output read as fresh and sent a debugging session chasing
+  a result that never happened.
+
+### Live tests worth knowing
+
+At the serial prompt after boot (**one `test` per boot** — the console drops
+serial input while a spawned process runs):
+
+| Command | Proves |
+|---|---|
+| `test posix` | the libc/POSIX surface, incl. cwd and rename |
+| `test tcc link` | the OS compiles+links+**runs** C (`exit=42`) |
+| `test python` / `test git repo` | the interpreter / git (need `-cpu max`) |
+| `test shell` / `test ctrlc` | structured pipelines / interruption |
+
+The port tests need their toolchain built — see
+[docs/PORTS.md](docs/PORTS.md) and
+[docs/BUILD_SETUP.md](docs/BUILD_SETUP.md#tldr--the-exact-order-on-a-fresh-machine).
+
 ## Docs are part of the change
 
 Documentation drift is the default failure mode. Update, in the same change:

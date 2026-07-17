@@ -93,6 +93,8 @@
 #define EMBK_SYS_rename       62
 #define EMBK_SYS_ftruncate    63
 #define EMBK_SYS_chmod        64
+#define EMBK_SYS_key_event_poll 65
+#define EMBK_SYS_key_mods       66
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

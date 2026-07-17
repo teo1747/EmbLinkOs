@@ -4,6 +4,7 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/ksync.h"            /* per-process fd-table mutex (fdlock/fdunlock) */
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
 #include "ipc/pipe.h"                 /* pipe fd backing: pipe_read/write + ref/unref */
@@ -35,6 +36,25 @@ static struct fd_entry *fd_table(void)
 {
     return current_thread ? current_process->fds : g_boot_fds;
 }
+
+/* Guard a process's fd table across a mutation. Keyed on the process, not on
+ * `current`, because the install paths (fd_open_into / fd_install_pipe) mutate a
+ * TARGET process's table, which may or may not be self.
+ *
+ * NULL (== the boot context, which uses g_boot_fds) is a no-op: pre-scheduler is
+ * single-threaded, so g_boot_fds has no concurrent writer -- the same
+ * by-construction argument the mutex itself rests on. This mirrors fd_table()'s
+ * own current_thread check exactly, so lock scope and table selection never
+ * disagree.
+ *
+ * ⚠️ NEVER call an ops->close or obj_get while HOLDING this if that callee takes
+ * g_sched_lock (pipe_fd_close does): the mutex is built on g_sched_lock, and
+ * though mutex_lock releases it before returning, a close run *inside* the
+ * critical section would still be re-entering fd state under a held table.
+ * The rule here is simpler and stricter -- do blocking teardown OUTSIDE the
+ * lock, on a snapshot. Every site below follows it. */
+static inline void fdlock(struct process *p)   { if (p) mutex_lock(&p->fd_lock); }
+static inline void fdunlock(struct process *p) { if (p) mutex_unlock(&p->fd_lock); }
 
 void vfs_fd_init(void)
 {
@@ -305,7 +325,10 @@ int vfs_open(const char *path, int flags, uint32_t mode)
      * not special-case it yet -- add it there when a spawn wants to silence a
      * child's stdio.) */
     if (strcmp(path, "/dev/null") == 0) {
+        struct process *p = current_process;
         struct fd_entry *fds = fd_table();
+        int rfd = -EMBK_EMFILE;
+        fdlock(p);              /* same find-free-slot race as vfs_open, no I/O here */
         for (int i = 0; i < FD_MAX_OPEN; i++) {
             if (!fds[i].used) {
                 struct fd_entry *e = &fds[i];
@@ -314,10 +337,12 @@ int vfs_open(const char *path, int flags, uint32_t mode)
                 e->backing = FD_BACKING_NULLDEV;
                 e->ops = &nulldev_fd_ops;
                 e->flags = flags;
-                return i + FD_BASE;
+                rfd = i + FD_BASE;
+                break;
             }
         }
-        return -EMBK_EMFILE;
+        fdunlock(p);
+        return rfd;
     }
 
     struct vnode vn;
@@ -358,7 +383,16 @@ int vfs_open(const char *path, int flags, uint32_t mode)
             return err;
     }
 
+    /* Find a free slot and claim it ATOMICALLY. Before the lock, the find and
+     * the fill were separated by obj_get -- so two threads of one process could
+     * both see the same slot free, and both fill it: two fds aliasing one entry,
+     * and a leaked obj_get. obj_get can do I/O, so the lock has to be a sleeping
+     * one (it is), and it is held across obj_get on purpose: obj_get never takes
+     * fd_lock, so there is no cycle, and holding it just serialises this one
+     * process's concurrent opens -- opens are not a hot path. */
+    struct process *p = current_process;
     struct fd_entry *fds = fd_table();
+    fdlock(p);
     int fd = -1;
     for (int i = 0; i < FD_MAX_OPEN; i++) {
         if (!fds[i].used) {
@@ -366,21 +400,29 @@ int vfs_open(const char *path, int flags, uint32_t mode)
             break;
         }
     }
-    if (fd < 0)
-        return -EMBK_EMFILE;
+    if (fd < 0) { fdunlock(p); return -EMBK_EMFILE; }
+
+    /* Claim the slot BEFORE the (possibly blocking) obj_get, so a concurrent
+     * open scanning for a free slot skips it. `used` with backing==NONE is never
+     * observable elsewhere: the fd number is not returned to userland until this
+     * function succeeds, so no other call can look it up by number. */
+    fds[fd - FD_BASE].used = true;
 
     if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
         err = vn.mnt->ops->obj_get(vn.mnt, vn.ino);
-        if (err)
+        if (err) {
+            fds[fd - FD_BASE].used = false;   /* release the claim on failure */
+            fdunlock(p);
             return err;
+        }
     }
 
-    fds[fd - FD_BASE].used = true;
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
     fds[fd - FD_BASE].u.file.vn = vn;
     fds[fd - FD_BASE].u.file.pos = 0;
     fds[fd - FD_BASE].flags = flags;
+    fdunlock(p);
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
@@ -457,15 +499,30 @@ int vfs_fd_inherit(int fd, struct fd_entry *dst)
 
 int vfs_close(int fd)
 {
-    struct fd_entry *e = fd_lookup(fd);
-    if (!e)
+    if (fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN)
         return -EMBK_EBADF;
 
-    if (!e->ops || !e->ops->close)
-        return -EMBK_ENOSYS;
+    struct process *p = current_process;
 
-    e->ops->close(e);
-    memset(e, 0, sizeof(*e));
+    /* Free the slot UNDER the lock, then tear down OUTSIDE it, working from a
+     * snapshot. Two reasons this order is mandatory, not stylistic:
+     *   1. ops->close can take g_sched_lock (pipe_fd_close does), and the fd
+     *      mutex is itself built on g_sched_lock -- so close must not run while
+     *      the table is logically held.
+     *   2. It closes the double-close / close-races-open window: the first
+     *      closer flips `used` false under the lock, so a racing second close
+     *      re-checks and sees EBADF, and a racing open can immediately reuse the
+     *      freed slot. A snapshot is safe because no close op depends on the
+     *      entry's ADDRESS -- they all read e->u.* by value. */
+    fdlock(p);
+    struct fd_entry *e = &fd_table()[fd - FD_BASE];
+    if (!e->used)                    { fdunlock(p); return -EMBK_EBADF; }
+    if (!e->ops || !e->ops->close)   { fdunlock(p); return -EMBK_ENOSYS; }
+    struct fd_entry snap = *e;       /* by-value copy for teardown */
+    memset(e, 0, sizeof(*e));        /* slot is free the instant we unlock */
+    fdunlock(p);
+
+    snap.ops->close(&snap);
     return EMBK_OK;
 }
 
@@ -546,6 +603,12 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
             return err;
     }
 
+    /* Lock the TARGET's table, not current's. At spawn time target is the child,
+     * not yet running, so this is uncontended -- but it makes the redirect atomic
+     * for the dup2-into-self case, and keeps every fds[] mutation under one rule.
+     * ops->close inside is fine: it takes g_sched_lock fresh, not nested under
+     * this mutex (mutex_lock released g_sched_lock before returning). */
+    fdlock(target);
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -565,6 +628,7 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         if (err == EMBK_OK)
             e->u.file.pos = st.size;
     }
+    fdunlock(target);
 
     return target_fd;
  }
@@ -874,6 +938,7 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
     if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
         return -EMBK_EBADF;
 
+    fdlock(target);             /* same rule as fd_open_into: target's table, atomic redirect */
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -889,8 +954,10 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
     sched_lock();
     pipe_ref_locked(p, side);   /* the child is a NEW reference to this end --
                                  * bump before it ever runs, so its close can't
-                                 * drop the count below the parent's own hold */
+                                 * drop the count below the parent's own hold.
+                                 * Fresh g_sched_lock, not nested under fd_lock. */
     sched_unlock();
+    fdunlock(target);
     return EMBK_OK;
 }
 

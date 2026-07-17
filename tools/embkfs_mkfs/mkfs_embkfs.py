@@ -58,6 +58,18 @@ import layout as L
 # population would look (everything created "at format time").
 NOW_NS = int(time.time() * 1_000_000_000)
 
+# The libc tcc links against ON the OS -- the SAME archive the cross-build uses,
+# so a program built on EmbLink and one built for it are the same program.
+#
+# The PATH COMES FROM THE MAKEFILE (EMBK_NEWLIB_LIBC, derived from its single
+# NEWLIB_PREFIX). Never hardcode a developer's home directory here: NEWLIB_PREFIX
+# is `?=` precisely so a second machine can point it elsewhere, and a literal
+# path silently defeats that -- mkfs would skip libc.a on a machine that HAS one,
+# and `test tcc link` would fail for a reason nothing on screen explains.
+# Empty (env unset -> no libc.a packed) is honest: tcc can still compile (-c),
+# it just cannot link, which is exactly the truth of that image.
+NEWLIB_LIBC = os.environ.get("EMBK_NEWLIB_LIBC", "")
+
 
 # --- helper: CRC32C-based name hash for directory-entry keys (spec §7.2/§9.2) ---
 def name_hash(name: bytes) -> int:
@@ -657,6 +669,24 @@ def discover_userland_objects(build_dir="build"):
     # import encodings module"), and the zip without the ._pth is never
     # consulted. Both are optional: a tree with no CPython built simply has
     # neither (Makefile's HAVE_PY gate).
+    # THE TOOLCHAIN, at the FLAT ROOT. tcc.elf can compile+link a program ON the
+    # OS, but only if the things a link needs are reachable: crt0.o (_start),
+    # syscalls.o (the newlib retargeting layer) and libc.a. mkfs has no
+    # directory support -- the root is flat -- so rather than invent /lib and
+    # /include, they simply live at "/" and tcc is told `-L/`. A flat root is not
+    # a limitation here; it is the whole path search.
+    #
+    # libc.a is ~6.6 MB, by far the biggest single object on the image. It earns
+    # it: without it `tcc t.c -o t.elf` cannot resolve exit(), and the OS cannot
+    # build its own software.
+    for tc in ("crt0.o", "syscalls.o"):
+        blob = _read_file(f"{build_dir}/{tc}")
+        if blob is not None:
+            objects.append((tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+    libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
+    if libc is not None:
+        objects.append((b"libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
+
     pyzip = _read_file(f"{build_dir}/python314.zip")
     if pyzip is not None:
         objects.append((b"python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
