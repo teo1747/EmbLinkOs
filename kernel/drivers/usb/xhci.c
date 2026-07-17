@@ -960,11 +960,39 @@ static const char g_hid_usage_to_ascii[256] = {
     ']',  '\\', 0,    ';',  '\'', '`',  ',',  '.',  // 30-37
     '/',  0,    0,    0,    0,    0,    0,    0,    // 38-3F  CapsLock, F-keys
     0,    0,    0,    0,    0,    0,    0,    0,    // 40-47
-    0,    0,    0,    0,    0,    0,    0,    0,    // 48-4F  arrows/ins/del/…
-    0,    0,    0,    0,    '/',  '*',  '-',  '+',  // 50-57  numpad
+    0,    0,    0,    0,    0,    0,    0,    0,    // 48-4F  arrows/ins/del -> hid_nav_key()
+    0,    0,    0,    0,    '/',  '*',  '-',  '+',  // 50-57  arrows -> hid_nav_key(); numpad
     '\n', '1',  '2',  '3',  '4',  '5',  '6',  '7',  // 58-5F  numpad
     '8',  '9',  '0',  '.', /* rest zero */
 };
+
+// --------------------------------------------------------------------------
+// The HID navigation cluster (usages 0x4A-0x52), mapped to the same private
+// EK_* codes the PS/2 driver emits for its 0xE0-prefixed scancodes -- so the
+// shell's Up/Down history recall and the terminal's PgUp/PgDn scrollback work
+// identically on a USB keyboard. Until this existed the whole cluster was
+// zero in the table above ("arrows/ins/del/…"), i.e. USB keyboards had NO
+// arrows -- harmless until those features shipped.
+//
+// Kept OUT of g_hid_usage_to_ascii deliberately: that table's values get run
+// through the shift mapping below, and a navigation code must never be
+// shifted. Same split the PS/2 driver uses (extended branch vs ascii table).
+// Insert (0x49) is omitted -- there is no EK_ for it yet.
+// --------------------------------------------------------------------------
+static char hid_nav_key(uint8_t usage) {
+    switch (usage) {
+    case 0x4A: return EK_HOME;
+    case 0x4B: return EK_PGUP;
+    case 0x4C: return EK_DEL;     // "Delete Forward"
+    case 0x4D: return EK_END;
+    case 0x4E: return EK_PGDN;
+    case 0x4F: return EK_RIGHT;
+    case 0x50: return EK_LEFT;
+    case 0x51: return EK_DOWN;
+    case 0x52: return EK_UP;
+    default:   return 0;
+    }
+}
 
 // --------------------------------------------------------------------------
 // Interrupt-IN endpoint ring helper — mirrors xhci_ep0_enqueue_trb but
@@ -1188,6 +1216,10 @@ static void xhci_process_hid_report(struct xhci_runtime_state *rt, uint32_t idx,
             if (rt->prev_keys[idx][p] == usage) { already = true; break; }
         }
         if (already) { continue; }
+
+        /* Navigation cluster FIRST: never shift-mapped (see hid_nav_key). */
+        char nav = hid_nav_key(usage);
+        if (nav != 0) { keyboard_inject_char(nav); continue; }
 
         char ch = g_hid_usage_to_ascii[usage];
         if (ch == 0) { continue; }

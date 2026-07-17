@@ -4,6 +4,7 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/ksync.h"            /* per-process fd-table mutex (fdlock/fdunlock) */
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
 #include "ipc/pipe.h"                 /* pipe fd backing: pipe_read/write + ref/unref */
@@ -36,6 +37,25 @@ static struct fd_entry *fd_table(void)
     return current_thread ? current_process->fds : g_boot_fds;
 }
 
+/* Guard a process's fd table across a mutation. Keyed on the process, not on
+ * `current`, because the install paths (fd_open_into / fd_install_pipe) mutate a
+ * TARGET process's table, which may or may not be self.
+ *
+ * NULL (== the boot context, which uses g_boot_fds) is a no-op: pre-scheduler is
+ * single-threaded, so g_boot_fds has no concurrent writer -- the same
+ * by-construction argument the mutex itself rests on. This mirrors fd_table()'s
+ * own current_thread check exactly, so lock scope and table selection never
+ * disagree.
+ *
+ * ⚠️ NEVER call an ops->close or obj_get while HOLDING this if that callee takes
+ * g_sched_lock (pipe_fd_close does): the mutex is built on g_sched_lock, and
+ * though mutex_lock releases it before returning, a close run *inside* the
+ * critical section would still be re-entering fd state under a held table.
+ * The rule here is simpler and stricter -- do blocking teardown OUTSIDE the
+ * lock, on a snapshot. Every site below follows it. */
+static inline void fdlock(struct process *p)   { if (p) mutex_lock(&p->fd_lock); }
+static inline void fdunlock(struct process *p) { if (p) mutex_unlock(&p->fd_lock); }
+
 void vfs_fd_init(void)
 {
     struct fd_entry *fds = fd_table();
@@ -53,6 +73,7 @@ void vfs_fd_init(void)
  * forward-declared so the open + stdio-init paths can point new fds at them. */
 static const struct fd_ops vnode_fd_ops;
 static const struct fd_ops console_fd_ops;
+static const struct fd_ops nulldev_fd_ops;
 
 /* Map an fd to its live table entry (in the CALLING process's own table). */
 static struct fd_entry *fd_lookup(int fd)
@@ -130,6 +151,98 @@ static int fd_unlink_path(const char *path)
     return parent.mnt->ops->unlink(&parent, leaf, leaf_len);
 }
 
+/* Public path-level twins, for sys_unlink/sys_mkdir (the shell's rm/mkdir).
+ * Same split-parent + per-fs-op dispatch fd_open_into's O_CREAT path uses. */
+int vfs_unlink_path(const char *path)
+{
+    return fd_unlink_path(path);
+}
+
+int vfs_mkdir_path(const char *path)
+{
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+
+    int rc = fd_split_parent(path, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->mkdir)
+        return -EMBK_ENOSYS;
+
+    struct vnode made;
+    return parent.mnt->ops->mkdir(&parent, leaf, leaf_len, &made);
+}
+
+int vfs_rename_path(const char *old_path, const char *new_path)
+{
+    struct vnode old_parent, new_parent;
+    const char *old_leaf = NULL, *new_leaf = NULL;
+    size_t old_len = 0, new_len = 0;
+
+    int rc = fd_split_parent(old_path, &old_parent, &old_leaf, &old_len);
+    if (rc != EMBK_OK)
+        return rc;
+    rc = fd_split_parent(new_path, &new_parent, &new_leaf, &new_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    /* One mount today, but say it anyway: a cross-mount rename is a copy, not
+     * a rename, and must be refused rather than half-done. */
+    if (old_parent.mnt != new_parent.mnt)
+        return -EMBK_EXDEV;
+
+    if (!old_parent.mnt || !old_parent.mnt->ops || !old_parent.mnt->ops->rename)
+        return -EMBK_ENOSYS;
+
+    return old_parent.mnt->ops->rename(&old_parent, old_leaf, old_len,
+                                       &new_parent, new_leaf, new_len);
+}
+
+/* ftruncate: fd -> vnode -> the per-fs truncate op that already exists (EMBKFS
+ * wires it). Only a VNODE-backed fd can be truncated -- truncating a pipe or
+ * the console has no meaning, and EINVAL is what POSIX says for those. */
+int vfs_fd_truncate(int fd, uint64_t size)
+{
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e)
+        return -EMBK_EBADF;
+    if (e->backing != FD_BACKING_VNODE)
+        return -EMBK_EINVAL;
+    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->truncate)
+        return -EMBK_ENOSYS;
+
+    return e->u.file.vn.mnt->ops->truncate(&e->u.file.vn, size);
+}
+
+int vfs_chmod_path(const char *path, uint32_t mode)
+{
+    struct vnode vn;
+    int rc = vfs_resolve(path, &vn);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->chmod)
+        return -EMBK_ENOSYS;
+    return vn.mnt->ops->chmod(&vn, mode);
+}
+
+int vfs_rmdir_path(const char *path)
+{
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+
+    int rc = fd_split_parent(path, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->rmdir)
+        return -EMBK_ENOSYS;
+
+    return parent.mnt->ops->rmdir(&parent, leaf, leaf_len);
+}
+
 static bool fd_readable(int flags)
 {
     int acc = flags & O_ACCMODE;
@@ -205,6 +318,33 @@ int vfs_open(const char *path, int flags, uint32_t mode)
     if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
         return -EMBK_EINVAL;
 
+    /* /dev/null: the one special name (see nulldev_fd_ops above). Checked
+     * BEFORE VFS resolution -- there is no /dev directory to resolve through,
+     * and creating one on disk to host a fake file would be the dishonest
+     * version of this. (fd_open_into, the spawn file-action twin below, does
+     * not special-case it yet -- add it there when a spawn wants to silence a
+     * child's stdio.) */
+    if (strcmp(path, "/dev/null") == 0) {
+        struct process *p = current_process;
+        struct fd_entry *fds = fd_table();
+        int rfd = -EMBK_EMFILE;
+        fdlock(p);              /* same find-free-slot race as vfs_open, no I/O here */
+        for (int i = 0; i < FD_MAX_OPEN; i++) {
+            if (!fds[i].used) {
+                struct fd_entry *e = &fds[i];
+                memset(e, 0, sizeof(*e));
+                e->used = true;
+                e->backing = FD_BACKING_NULLDEV;
+                e->ops = &nulldev_fd_ops;
+                e->flags = flags;
+                rfd = i + FD_BASE;
+                break;
+            }
+        }
+        fdunlock(p);
+        return rfd;
+    }
+
     struct vnode vn;
     int err = vfs_resolve(path, &vn);
     if (err == EMBK_OK) {
@@ -227,7 +367,32 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         return err;
     }
 
+    /* O_TRUNC has teeth now (was reserved): shrink to zero through the
+     * per-fs truncate op BEFORE the fd is installed. Requires writable
+     * access; a filesystem without the op fails LOUD (-ENOSYS) rather than
+     * silently keeping stale bytes past the new writer's data -- the
+     * save/cp tail-corruption trap this closes. Truncating a just-created
+     * empty file is a cheap no-op, so no created-vs-resolved split. */
+    if ((flags & O_TRUNC) && vn.type != VFS_DT_DIR) {
+        if (!fd_writable(flags))
+            return -EMBK_EINVAL;
+        if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->truncate)
+            return -EMBK_ENOSYS;
+        err = vn.mnt->ops->truncate(&vn, 0);
+        if (err != EMBK_OK)
+            return err;
+    }
+
+    /* Find a free slot and claim it ATOMICALLY. Before the lock, the find and
+     * the fill were separated by obj_get -- so two threads of one process could
+     * both see the same slot free, and both fill it: two fds aliasing one entry,
+     * and a leaked obj_get. obj_get can do I/O, so the lock has to be a sleeping
+     * one (it is), and it is held across obj_get on purpose: obj_get never takes
+     * fd_lock, so there is no cycle, and holding it just serialises this one
+     * process's concurrent opens -- opens are not a hot path. */
+    struct process *p = current_process;
     struct fd_entry *fds = fd_table();
+    fdlock(p);
     int fd = -1;
     for (int i = 0; i < FD_MAX_OPEN; i++) {
         if (!fds[i].used) {
@@ -235,21 +400,29 @@ int vfs_open(const char *path, int flags, uint32_t mode)
             break;
         }
     }
-    if (fd < 0)
-        return -EMBK_EMFILE;
+    if (fd < 0) { fdunlock(p); return -EMBK_EMFILE; }
+
+    /* Claim the slot BEFORE the (possibly blocking) obj_get, so a concurrent
+     * open scanning for a free slot skips it. `used` with backing==NONE is never
+     * observable elsewhere: the fd number is not returned to userland until this
+     * function succeeds, so no other call can look it up by number. */
+    fds[fd - FD_BASE].used = true;
 
     if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
         err = vn.mnt->ops->obj_get(vn.mnt, vn.ino);
-        if (err)
+        if (err) {
+            fds[fd - FD_BASE].used = false;   /* release the claim on failure */
+            fdunlock(p);
             return err;
+        }
     }
 
-    fds[fd - FD_BASE].used = true;
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
     fds[fd - FD_BASE].u.file.vn = vn;
     fds[fd - FD_BASE].u.file.pos = 0;
     fds[fd - FD_BASE].flags = flags;
+    fdunlock(p);
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
@@ -326,16 +499,40 @@ int vfs_fd_inherit(int fd, struct fd_entry *dst)
 
 int vfs_close(int fd)
 {
+    if (fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EBADF;
+
+    struct process *p = current_process;
+
+    /* Free the slot UNDER the lock, then tear down OUTSIDE it, working from a
+     * snapshot. Two reasons this order is mandatory, not stylistic:
+     *   1. ops->close can take g_sched_lock (pipe_fd_close does), and the fd
+     *      mutex is itself built on g_sched_lock -- so close must not run while
+     *      the table is logically held.
+     *   2. It closes the double-close / close-races-open window: the first
+     *      closer flips `used` false under the lock, so a racing second close
+     *      re-checks and sees EBADF, and a racing open can immediately reuse the
+     *      freed slot. A snapshot is safe because no close op depends on the
+     *      entry's ADDRESS -- they all read e->u.* by value. */
+    fdlock(p);
+    struct fd_entry *e = &fd_table()[fd - FD_BASE];
+    if (!e->used)                    { fdunlock(p); return -EMBK_EBADF; }
+    if (!e->ops || !e->ops->close)   { fdunlock(p); return -EMBK_ENOSYS; }
+    struct fd_entry snap = *e;       /* by-value copy for teardown */
+    memset(e, 0, sizeof(*e));        /* slot is free the instant we unlock */
+    fdunlock(p);
+
+    snap.ops->close(&snap);
+    return EMBK_OK;
+}
+
+int64_t vfs_fd_avail(int fd) {
     struct fd_entry *e = fd_lookup(fd);
     if (!e)
         return -EMBK_EBADF;
-
-    if (!e->ops || !e->ops->close)
+    if (!e->ops || !e->ops->avail)
         return -EMBK_ENOSYS;
-
-    e->ops->close(e);
-    memset(e, 0, sizeof(*e));
-    return EMBK_OK;
+    return e->ops->avail(e);
 }
 
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
@@ -394,6 +591,24 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         return err;
     }
 
+    /* Same O_TRUNC hook as vfs_open() -- this is the spawn-file-action /
+     * redirect path, where a shell's `> file` shape lands. */
+    if ((flags & O_TRUNC) && vn.type != VFS_DT_DIR) {
+        if (!fd_writable(flags))
+            return -EMBK_EINVAL;
+        if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->truncate)
+            return -EMBK_ENOSYS;
+        err = vn.mnt->ops->truncate(&vn, 0);
+        if (err != EMBK_OK)
+            return err;
+    }
+
+    /* Lock the TARGET's table, not current's. At spawn time target is the child,
+     * not yet running, so this is uncontended -- but it makes the redirect atomic
+     * for the dup2-into-self case, and keeps every fds[] mutation under one rule.
+     * ops->close inside is fine: it takes g_sched_lock fresh, not nested under
+     * this mutex (mutex_lock released g_sched_lock before returning). */
+    fdlock(target);
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -413,6 +628,7 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         if (err == EMBK_OK)
             e->u.file.pos = st.size;
     }
+    fdunlock(target);
 
     return target_fd;
  }
@@ -543,7 +759,11 @@ static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *ou
      * without a line discipline; real canonical mode (echo, backspace
      * handling, line buffering) is a named gap, not built here. */
     char *cbuf = (char *)buf;
-    cbuf[0] = keyboard_getchar_blocking();
+    /* Cancellation-aware (docs/INTERRUPTION.md): a console read blocked for input
+     * must wake with -ECANCELED when this process is cancelled -- otherwise a
+     * program sitting at a prompt could never be ^C'd. */
+    int rc = keyboard_getchar_blocking_cancelable(&cbuf[0]);
+    if (rc != EMBK_OK) return rc;
     size_t n = 1;
     while (n < len && keyboard_has_char()) {
         cbuf[n++] = keyboard_getchar();         // buffer is non-empty, won't spin
@@ -593,6 +813,11 @@ static void console_fd_close(struct fd_entry *e) {
      * meaningless -- the console remains open for everyone. */
 }
 
+static int64_t console_fd_avail(struct fd_entry *e) {
+    (void)e;
+    return keyboard_has_char() ? 1 : 0;
+}
+
 static const struct fd_ops console_fd_ops = {
     .read = console_fd_read,
     .write = console_fd_write,
@@ -601,6 +826,55 @@ static const struct fd_ops console_fd_ops = {
     .inherit = console_fd_inherit,
     .close = console_fd_close,
     .close_locked = NULL,
+    .avail = console_fd_avail,
+};
+
+/* -------------------------------------------------------------------------
+ * /dev/null -- a REAL null device, not a shim. EmbLink has no /dev tree; this
+ * one name is special-cased in vfs_open() because a discard-sink/EOF-source is
+ * a genuine OS primitive that portable software assumes exists (git's
+ * sanitize_stdfds() opens it before doing anything at all; shell redirects
+ * want it too). Stateless, like the console backing: reads are instant EOF,
+ * writes vanish and report success -- which here is the TRUTH of the object,
+ * not a stub pretending. FD_BACKING_NULLDEV, so nothing mistakes it for a file.
+ * ------------------------------------------------------------------------- */
+static int nulldev_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
+    (void)e; (void)buf; (void)len;
+    *out = 0;                      /* always EOF */
+    return EMBK_OK;
+}
+static int nulldev_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
+    (void)e; (void)buf;
+    *out = len;                    /* swallowed, by definition */
+    return EMBK_OK;
+}
+static int nulldev_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
+    (void)e; (void)delta; (void)whence;
+    *out_offset = 0;
+    return EMBK_OK;
+}
+static int nulldev_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e;
+    out->size = 0;
+    out->type = VFS_DT_CHAR;
+    return EMBK_OK;
+}
+static int nulldev_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    *dst = *src;                   /* stateless singleton: a struct copy IS the inherit */
+    return EMBK_OK;
+}
+static void nulldev_fd_close(struct fd_entry *e) { (void)e; }
+static int64_t nulldev_fd_avail(struct fd_entry *e) { (void)e; return 0; }
+
+static const struct fd_ops nulldev_fd_ops = {
+    .read = nulldev_fd_read,
+    .write = nulldev_fd_write,
+    .seek = nulldev_fd_seek,
+    .fstat = nulldev_fd_fstat,
+    .inherit = nulldev_fd_inherit,
+    .close = nulldev_fd_close,
+    .close_locked = NULL,
+    .avail = nulldev_fd_avail,
 };
 
 static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
@@ -637,10 +911,17 @@ static void pipe_fd_close_locked(struct fd_entry *e) {
     pipe_unref_locked(e->u.pipe.p, e->u.pipe.side);
 }
 
+static int64_t pipe_fd_avail(struct fd_entry *e) {
+    /* read end: bytes readable; write end: space writable -- both are the
+     * same question ("how much moves without blocking?"). */
+    return pipe_avail(e->u.pipe.p, e->u.pipe.side);
+}
+
 static const struct fd_ops pipe_fd_ops = {
     .read = pipe_fd_read, .write = pipe_fd_write, .seek = pipe_fd_seek,
     .fstat = pipe_fd_fstat, .inherit = pipe_fd_inherit,
     .close = pipe_fd_close, .close_locked = pipe_fd_close_locked,
+    .avail = pipe_fd_avail,
 };
 
 /* See fd.h. Mirrors fd_open_into's close-then-install redirect idiom: the
@@ -657,6 +938,7 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
     if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
         return -EMBK_EBADF;
 
+    fdlock(target);             /* same rule as fd_open_into: target's table, atomic redirect */
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -672,8 +954,10 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
     sched_lock();
     pipe_ref_locked(p, side);   /* the child is a NEW reference to this end --
                                  * bump before it ever runs, so its close can't
-                                 * drop the count below the parent's own hold */
+                                 * drop the count below the parent's own hold.
+                                 * Fresh g_sched_lock, not nested under fd_lock. */
     sched_unlock();
+    fdunlock(target);
     return EMBK_OK;
 }
 
@@ -809,6 +1093,67 @@ int vfs_fd_run_selftests(void)
         return rc;
     }
 
-    kprintf("FD: selftest: OK\n");
+    /* --- the small-batch trio: O_TRUNC, mtime, rmdir ------------------- */
+
+    /* O_TRUNC: write a LONG payload, reopen with O_TRUNC, write a SHORT
+     * one, and assert the file is exactly the short one -- the old tail
+     * must be gone (the save/cp corruption this feature closes). */
+    const char longp[]  = "AAAAAAAAAAAAAAAA";
+    const char shortp[] = "BB";
+    fd = vfs_open(path, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) { kprintf("FD: selftest fail: trunc setup open\n"); return fd; }
+    rc = vfs_fd_write(fd, longp, sizeof(longp) - 1, &n);
+    vfs_close(fd);
+    if (rc != EMBK_OK) { kprintf("FD: selftest fail: trunc setup write\n"); return rc; }
+
+    fd = vfs_open(path, O_WRONLY | O_TRUNC, 0);
+    if (fd < 0) { kprintf("FD: selftest fail: O_TRUNC open -> %s\n", embk_strerror(fd)); return fd; }
+    rc = vfs_fd_write(fd, shortp, sizeof(shortp) - 1, &n);
+    vfs_close(fd);
+    if (rc != EMBK_OK) { kprintf("FD: selftest fail: post-trunc write\n"); return rc; }
+
+    rc = vfs_stat(path, &st);
+    if (rc != EMBK_OK || st.size != sizeof(shortp) - 1) {
+        kprintf("FD: selftest fail: O_TRUNC left size=%lu (want %u) -- stale tail!\n",
+                (unsigned long)st.size, (unsigned)(sizeof(shortp) - 1));
+        return rc != EMBK_OK ? rc : -EMBK_EIO;
+    }
+
+    /* mtime: a just-written file must carry a nonzero last-modified. */
+    if (st.mtime == 0) {
+        kprintf("FD: selftest fail: mtime is 0 on a fresh write\n");
+        return -EMBK_EIO;
+    }
+    (void)vfs_unlink_path(path);
+
+    /* rmdir: mkdir -> rmdir succeeds; rmdir of a NON-EMPTY dir refuses;
+     * after cleanup the name resolves to nothing. */
+    const char *dpath = "/fd_selftest_dir";
+    rc = vfs_mkdir_path(dpath);
+    if (rc != EMBK_OK) { kprintf("FD: selftest fail: mkdir -> %s\n", embk_strerror(rc)); return rc; }
+
+    fd = vfs_open("/fd_selftest_dir/inner.tmp", O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) { kprintf("FD: selftest fail: create-in-dir\n"); return fd; }
+    vfs_close(fd);
+
+    rc = vfs_rmdir_path(dpath);
+    if (rc == EMBK_OK) {
+        kprintf("FD: selftest fail: rmdir removed a NON-EMPTY dir\n");
+        return -EMBK_EIO;
+    }
+    rc = vfs_unlink_path("/fd_selftest_dir/inner.tmp");
+    if (rc != EMBK_OK) { kprintf("FD: selftest fail: unlink inner\n"); return rc; }
+    rc = vfs_rmdir_path(dpath);
+    if (rc != EMBK_OK) {
+        kprintf("FD: selftest fail: rmdir of empty dir -> %s\n", embk_strerror(rc));
+        return rc;
+    }
+    struct vnode gone;
+    if (vfs_resolve(dpath, &gone) != -EMBK_ENOENT) {
+        kprintf("FD: selftest fail: rmdir'd dir still resolves\n");
+        return -EMBK_EIO;
+    }
+
+    kprintf("FD: selftest: OK (incl. O_TRUNC + mtime + rmdir)\n");
     return EMBK_OK;
 }

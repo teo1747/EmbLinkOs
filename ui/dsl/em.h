@@ -457,6 +457,18 @@ typedef struct {
     int         pace_ms;         /* loop pace while active; default 10 */
 } EmApp;
 
+/* ---- terminal-shaped runtime hooks (V8) --------------------------------- *
+ * For apps whose real input/output is a byte stream (the Terminal hosting
+ * the shell), not toolkit widgets:
+ *   - key hook: sees every key BEFORE the toolkit (and before the runtime's
+ *     ESC-quits default). Return 1 = consumed, 0 = pass through.
+ *   - idle hook: runs EVERY loop iteration, even on untouched frames --
+ *     poll external state (embk_fd_avail on a pipe) and em_request_frame()
+ *     when something arrived. Keep it cheap; it runs at loop pace.
+ * Both are target-runtime features (em_app.c); NULL = off (the default). */
+void em_set_key_hook(int (*fn)(int ch));
+void em_set_idle_hook(void (*fn)(void));
+
 /* ---- desktop widgets (V5) ----------------------------------------------- *
  * A widget is a small always-on-desktop window: chromeless, z-banded ABOVE
  * the desktop but BELOW every app window. No keyboard, no close button --

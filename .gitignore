@@ -15,3 +15,8 @@
 # Python tooling caches
 __pycache__/
 *.pyc
+
+# clangd index database -- machine-specific absolute paths; regenerate with
+# `make compile-commands` (tools/gen_compile_commands.py)
+/compile_commands.json
+/.cache/

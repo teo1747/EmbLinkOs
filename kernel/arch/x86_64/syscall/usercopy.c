@@ -13,6 +13,40 @@
 // actually mapped, not just numerically plausible.
 #define USER_VA_LIMIT 0x0000800000000000ULL
 
+/* Read THIS thread's address-space root atomically w.r.t. preemption.
+ *
+ * THE TRANSIENT-EFAULT ROOT CAUSE (was open; this is the fix). Both
+ * `current_thread` and `current_process` expand to PER-CPU state reached
+ * through this_cpu(), which resolves the core by reading the LAPIC ID:
+ *
+ *     #define current_thread  (this_cpu()->current_thread)
+ *     #define current_process (current_thread->proc)
+ *
+ * A syscall runs with IF=1 (syscall_dispatch sti's, deliberately -- see its
+ * comment). So a timer IRQ could land BETWEEN this_cpu() resolving a core
+ * and the dereference of what it returned. If the scheduler then resumed
+ * this thread ON A DIFFERENT CORE, the already-computed &cpu_table[old]
+ * still sat in a register -- and the deref read whatever OTHER thread was
+ * by then running on the old core, yielding a FOREIGN pml4. access_ok then
+ * validated our pointer against someone else's address space and reported a
+ * genuinely-mapped page as absent: a spurious EFAULT.
+ *
+ * That is exactly why the symptom was SMP-ONLY (one core can't migrate) and
+ * "transient" -- it needs a preemption inside a few-instruction window. It
+ * is the same root cause as the ledgered sys_read byte-drop (copy_to_user's
+ * false EFAULT after the fs already consumed bytes).
+ *
+ * The fix is to make the per-CPU read atomic (IF=0 across it) and then keep
+ * only its RESULT. pml4_phys is a property of the PROCESS, not of the core,
+ * so once captured it stays valid for the whole walk even if this thread
+ * migrates a microsecond later. Returns 0 if there's no process context. */
+static uint64_t current_pml4_atomic(void) {
+    /* The IF=0 per-CPU read now lives in process.h, shared with every other
+     * site that needs it (sys_sbrk hit the identical bug). */
+    struct process *proc = current_process_atomic();
+    return proc ? proc->pml4_phys : 0;
+}
+
 bool access_ok(const void *user_ptr, size_t len) {
     if (len == 0) {
         return true;   // nothing to touch, vacuously fine
@@ -26,14 +60,17 @@ bool access_ok(const void *user_ptr, size_t len) {
     if (end > USER_VA_LIMIT) {
         return false;   // spills into (or sits entirely in) kernel VA space
     }
-    if (!current_thread) {
+
+    /* Capture ONCE, atomically -- never re-read per-CPU state per page. */
+    uint64_t pml4 = current_pml4_atomic();
+    if (!pml4) {
         return false;   // no process context to validate against
     }
 
     uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t last_page = (end - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     for (; page <= last_page; page += PAGE_SIZE) {
-        if (!vmm_get_phys_in(current_process->pml4_phys, page)) {
+        if (!vmm_get_phys_in(pml4, page)) {
             return false;   // a page in range isn't mapped in this process
         }
     }

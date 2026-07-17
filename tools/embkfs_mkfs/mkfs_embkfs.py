@@ -58,6 +58,18 @@ import layout as L
 # population would look (everything created "at format time").
 NOW_NS = int(time.time() * 1_000_000_000)
 
+# The libc tcc links against ON the OS -- the SAME archive the cross-build uses,
+# so a program built on EmbLink and one built for it are the same program.
+#
+# The PATH COMES FROM THE MAKEFILE (EMBK_NEWLIB_LIBC, derived from its single
+# NEWLIB_PREFIX). Never hardcode a developer's home directory here: NEWLIB_PREFIX
+# is `?=` precisely so a second machine can point it elsewhere, and a literal
+# path silently defeats that -- mkfs would skip libc.a on a machine that HAS one,
+# and `test tcc link` would fail for a reason nothing on screen explains.
+# Empty (env unset -> no libc.a packed) is honest: tcc can still compile (-c),
+# it just cannot link, which is exactly the truth of that image.
+NEWLIB_LIBC = os.environ.get("EMBK_NEWLIB_LIBC", "")
+
 
 # --- helper: CRC32C-based name hash for directory-entry keys (spec §7.2/§9.2) ---
 def name_hash(name: bytes) -> int:
@@ -168,6 +180,73 @@ def build_data_blocks(data: bytes) -> list:
     return blocks
 
 
+# An extent's checksum covers the WHOLE extent, so NOTHING in it can be served
+# until ALL of it has been read and CRC'd. One extent per file therefore made a
+# single 8 KB read cost O(filesize): the 10.3 MB python314.zip cost 443% read
+# amplification cold (measured -- `test ioperf`), and a 2 GB file would mean
+# reading and CRC'ing 2 GB before byte 0. Capping extent size makes that cost
+# BOUNDED and independent of file size, which is the whole point.
+#
+# MUST be a multiple of BLOCK_SIZE: chunks start on block boundaries, and the
+# disk_block of chunk N is derived as blk + offset // BLOCK_SIZE.
+#
+# WHY 1 MiB, AND WHY NOT SMALLER -- this was A/B'd. Don't re-tune it from theory.
+#
+# Read amplification for extent size E against the kernel's read-ahead window W
+# (EMBKFS_WCACHE_WIN, 64 KiB) is (2E - W)/E: a first touch verifies ALL of E but
+# copies out only W, then the remaining E/W - 1 windows re-read those same blocks.
+# Predicted 193.75% at E=1MiB, measured 194% -- the model is exact. It also says
+# E <= W would give 100%, and E=64KiB duly measured 101%.
+#
+# SHIPPING 64 KiB ON THAT REASONING WOULD HAVE BEEN A MISTAKE. Same kernel,
+# `test posix`, only this constant changed:
+#
+#                    device reads   B-tree node reads   time in dev->read
+#      E = 64 KiB           8535                8336            10860 ms
+#      E =  1 MiB           5401                5152             5886 ms
+#
+# The entire +3134 device reads is +3184 B-TREE NODE READS. ~95% of all device
+# reads on that workload are tree nodes, and more extents = more items = a bigger
+# tree = every COW rebuild (70 mkdirs there) reads more of it. Buying cold read
+# amplification 194% -> 101% cost ~85% MORE device time system-wide: the read path
+# is not the B-tree's only customer.
+#
+# (`ecache 48 hit / 1 miss` and `23 prefix calls` came out IDENTICAL under both,
+# which is what killed the "ecache thrashes" and "prefix rescans" explanations.)
+#
+# So: 1 MiB. It removes the O(filesize) pathology (443% -> 194%), keeps the tree
+# small, and a 2 GB file needs 2048 extents / ~98 KB of cached extent map instead
+# of 32768 / ~1.5 MB. Revisit only WITH NUMBERS from `test posix` + `test ioperf`.
+EXTENT_MAX_BYTES = 1024 * 1024
+assert EXTENT_MAX_BYTES % L.BLOCK_SIZE == 0
+
+
+def build_extent_items(oid: int, blk: int, data: bytes, gen: int) -> list:
+    """Extent items for one file, capped at EXTENT_MAX_BYTES each.
+
+    The kernel takes an extent's LOGICAL offset from the ITEM KEY
+    (`out[*n].offset = it->key.offset` in embkfs_collect_extents), not from the
+    packed struct -- which is why the key's third field is the file offset here.
+
+    Satisfies the kernel's two checks verbatim:
+      - embkfs_extent_validate: length != 0, logical_size != 0 and
+        logical_size <= length * BLOCK_SIZE.
+      - embkfs_validate_extent_map: extents contiguous from offset 0, each
+        starting exactly where the previous ended, summing to the inode size.
+    Empty files yield no extents (range() is empty), matching the old
+    `if nblocks > 0` guard.
+    """
+    out = []
+    for off in range(0, len(data), EXTENT_MAX_BYTES):
+        chunk = data[off:off + EXTENT_MAX_BYTES]
+        out.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, off),
+                    L.pack_extent(disk_block=blk + off // L.BLOCK_SIZE,
+                                  length_blocks=(len(chunk) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE,
+                                  logical_size=len(chunk),
+                                  data_checksum=crc32c(chunk), generation=gen)))
+    return out
+
+
 def build_superblock(total_blocks: int, free_blocks: int, generation: int,
                      uuid16: bytes, root_block: int, root_csum: int) -> bytes:
     """
@@ -197,7 +276,16 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 4 * 1024 * 1024):
+def make_image(path: str, size_bytes: int = 64 * 1024 * 1024):
+    # 64 MB (was 8, was 4). Each bump had the same trigger: one binary grew
+    # past the volume and free_blocks went NEGATIVE -- struct.pack('Q') then
+    # refuses it, which is the (cryptic) way this failure announces itself.
+    #   4 -> 8 MB: shell.elf (~410 KB static-newlib)
+    #   8 -> 64 MB: cxxdemo.elf is ~9.4 MB ON ITS OWN -- <iostream> pulls in
+    #               locales + the whole ios/facet machinery (it was 903 KB
+    #               before that one #include). CPython will be bigger again.
+    # The kernel reads total_blocks from the superblock, so growing is safe;
+    # the image is sparse-ish on disk and QEMU only reads what's used.
     bs = L.BLOCK_SIZE
     total_blocks = size_bytes // bs
     gen = 1
@@ -271,8 +359,15 @@ def make_image(path: str, size_bytes: int = 4 * 1024 * 1024):
               f"(blocks {META_START + 1}..{META_START + n_leaves}), {len(items)} items total")
     for name, start, nblocks, logical_size, data_csum in file_layouts:
         where = f"block {start}" if nblocks == 1 else f"blocks {start}..{start + nblocks - 1}"
+        # n_ext, not a whole-file checksum: with bounded extents the image stores
+        # one checksum PER EXTENT, so a single file-wide csum corresponds to
+        # nothing on disk. Printing it as though it did is how you get someone
+        # verifying against a field that isn't there. It stays as a build-time
+        # fingerprint of the source bytes, labelled as such.
+        n_ext = (logical_size + EXTENT_MAX_BYTES - 1) // EXTENT_MAX_BYTES
         print(f"  file data       : {where}  (\"{name.decode()}\", {logical_size} bytes,"
-              f" {nblocks} blocks, data csum 0x{data_csum:08X})")
+              f" {nblocks} blocks, {n_ext} extent{'s' if n_ext != 1 else ''},"
+              f" src fingerprint 0x{data_csum:08X})")
     print(f"  backup superblk : block {BACKUP_BLOCK} (last block)")
     print(f"  free_blocks hint: {free_blocks}")
 
@@ -563,6 +658,44 @@ def discover_userland_objects(build_dir="build"):
     font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     if font is not None:
         objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
+    # The terminal's MONOSPACE face (same DejaVu family, so the same
+    # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
+    mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    if mono is not None:
+        objects.append((b"mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+    # CPython's standard library, as one zip, plus the ._pth that points sys.path
+    # at it. Neither is a *.elf, so the glob above misses them -- and they are
+    # useless apart: python.elf without the zip dies at startup ("Failed to
+    # import encodings module"), and the zip without the ._pth is never
+    # consulted. Both are optional: a tree with no CPython built simply has
+    # neither (Makefile's HAVE_PY gate).
+    # THE TOOLCHAIN, at the FLAT ROOT. tcc.elf can compile+link a program ON the
+    # OS, but only if the things a link needs are reachable: crt0.o (_start),
+    # syscalls.o (the newlib retargeting layer) and libc.a. mkfs has no
+    # directory support -- the root is flat -- so rather than invent /lib and
+    # /include, they simply live at "/" and tcc is told `-L/`. A flat root is not
+    # a limitation here; it is the whole path search.
+    #
+    # libc.a is ~6.6 MB, by far the biggest single object on the image. It earns
+    # it: without it `tcc t.c -o t.elf` cannot resolve exit(), and the OS cannot
+    # build its own software.
+    for tc in ("crt0.o", "syscalls.o"):
+        blob = _read_file(f"{build_dir}/{tc}")
+        if blob is not None:
+            objects.append((tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+    libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
+    if libc is not None:
+        objects.append((b"libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
+
+    pyzip = _read_file(f"{build_dir}/python314.zip")
+    if pyzip is not None:
+        objects.append((b"python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
+    # NOTE the name keeps the ".elf": getpath.py appends "._pth" to the
+    # executable path verbatim on non-Windows, so it looks for exactly
+    # "/python.elf._pth".
+    pth = _read_file(f"{build_dir}/python.elf._pth")
+    if pth is not None:
+        objects.append((b"python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
     return objects
 
 
@@ -588,11 +721,7 @@ def build_root_items(objects, gen, data_start):
                                    uid=0, gid=0,
                                    atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
                                    generation=gen)))
-        if nblocks > 0:
-            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
-                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
-                                        logical_size=len(data),
-                                        data_checksum=data_csum, generation=gen)))
+        items.extend(build_extent_items(oid, blk, data, gen))
         for i, db in enumerate(build_data_blocks(data)):
             data_blocks.append((blk + i, db))
         file_layouts.append((name, blk, nblocks, len(data), data_csum))
@@ -658,11 +787,7 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
                                    uid=0, gid=0,
                                    atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
                                    generation=gen)))
-        if nblocks > 0:
-            items.append((L.pack_key(oid, L.EMBK_TYPE_EXTENT, 0),
-                          L.pack_extent(disk_block=blk, length_blocks=nblocks,
-                                        logical_size=len(data),
-                                        data_checksum=data_csum, generation=gen)))
+        items.extend(build_extent_items(oid, blk, data, gen))
         for i, db in enumerate(build_data_blocks(data)):
             data_blocks.append((blk + i, db))
         file_layouts.append((name, blk, nblocks, len(data), data_csum))

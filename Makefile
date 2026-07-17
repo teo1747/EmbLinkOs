@@ -62,6 +62,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/usermode.c \
              kernel/arch/x86_64/syscall/elf.c \
              kernel/process/process.c \
+             kernel/process/ksync.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \
@@ -164,6 +165,14 @@ build/init.elf: build/init.o user/lib/user.ld
 # fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
 # toolchain newlib (and re-lose %z/%ll). See user/README.md.
 NEWLIB_PREFIX ?= /home/motsou/cross/newlib-c99
+
+# Let scripts ask the Makefile where newlib is, so NEWLIB_PREFIX stays the ONE
+# source of truth and tools/tcc/build-tcc-emblink.sh cannot drift from the build.
+.PHONY: print-newlib-prefix print-cxx-prefix
+print-newlib-prefix:
+	@echo '$(NEWLIB_PREFIX)'
+print-cxx-prefix:
+	@echo '$(if $(HAVE_CXX),$(CXX_PREFIX),)'
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
@@ -172,6 +181,135 @@ NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLI
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
 # rebuilt libc.a wins over the stock one.
 NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
+
+# --- C++ (optional toolchain) -------------------------------------------------
+# The stock /usr/local/cross gcc is `--enable-languages=c` only, so there is no
+# x86_64-elf-g++ and no libstdc++. CXX_PREFIX points at a SECOND, user-owned
+# toolchain built with c,c++ + libstdc++ against the SAME newlib the apps link
+# (tools: /home/motsou/cross/build_gcc_cxx.sh) -- exactly the NEWLIB_PREFIX
+# pattern above: no sudo, and the stock C toolchain stays untouched.
+#
+# Everything C++ is GATED on that compiler existing, so the tree still builds
+# fine without it -- `make cxx-check` reports whether it's available.
+# Constructors are already handled: crt0.c walks .init_array AND .ctors.
+CXX_PREFIX ?= /home/motsou/cross/gcc-cxx
+USER_CXX    = $(CXX_PREFIX)/bin/x86_64-elf-g++
+HAVE_CXX   := $(if $(wildcard $(USER_CXX)),yes,)
+
+# -fno-exceptions/-fno-rtti for now: both want unwind tables + a personality
+# routine wired into the runtime, which is its own piece of work. Plain C++
+# (classes, templates, ctors, new/delete) needs neither.
+CXXFLAGS_EMBK = -mno-red-zone -fno-stack-protector -O2 -Wall \
+                -fno-exceptions -fno-rtti $(USER_INC) $(NEWLIB_INC)
+
+cxx-check:
+	@if [ -n "$(HAVE_CXX)" ]; then \
+	    echo "C++: $(USER_CXX)"; $(USER_CXX) -dumpversion; \
+	    echo -n "libstdc++: "; ls $(CXX_PREFIX)/x86_64-elf/lib/libstdc++.a 2>/dev/null || echo "MISSING"; \
+	else \
+	    echo "C++: not built. Run /home/motsou/cross/build_gcc_cxx.sh"; \
+	fi
+.PHONY: cxx-check
+
+# cxxdemo.elf -- the first C++ program (user/bin/cxxdemo.cc). A .cc extension,
+# so the user/bin/*.c EmUI auto-discovery leaves it alone. Statically linked
+# like shell.elf; the g++ driver pulls in libstdc++/libsupc++ (which
+# function-local statics need for __cxa_guard_acquire). CXX_APPS is EMPTY when
+# no C++ toolchain is installed, so the whole tree still builds without one.
+ifeq ($(HAVE_CXX),yes)
+CXX_APPS = build/cxxdemo.elf
+
+build/cxxdemo.o: user/bin/cxxdemo.cc | $(BUILD)
+	$(USER_CXX) $(CXXFLAGS_EMBK) -c $< -o $@
+
+build/cxxdemo.elf: build/cxxdemo.o build/crt0.o build/syscalls.o user/lib/newlib.ld
+	$(USER_CXX) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/cxxdemo.o \
+	    -lstdc++ -lsupc++ -lc -lgcc -o $@
+else
+CXX_APPS =
+endif
+
+# --- CPython (optional, built OUT OF TREE) ------------------------------------
+# The interpreter is cross-built in /home/motsou/cross/build-py (configure with
+# /home/motsou/cross/configure-py-emblink.sh -- it encodes the platform patches,
+# the config.site and the crt0/syscalls link line). Same gate shape as HAVE_CXX
+# above: absent toolchain == PY_APPS empty == the tree still builds.
+#
+# It links against build/crt0.o + build/syscalls.o, so the OS must be built once
+# before configuring CPython -- and a libc change means reconfiguring it.
+PY_BUILD ?= /home/motsou/cross/build-py
+PY_BIN   := $(PY_BUILD)/python
+HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
+
+# git, same shape as HAVE_PY: absent cross-built binary == GIT_APPS empty ==
+# the tree still builds. Build it with /home/motsou/cross/build-git-emblink.sh.
+# The build script now lives IN THE REPO (tools/git/), so a teammate's checkout
+# can rebuild git without a copy of the author's home directory. It takes the
+# source tree as an argument and needs a cross-built zlib -- both overridable.
+GIT_SRC  ?= /home/motsou/cross/git-2.49.1
+GIT_BIN  ?= $(GIT_SRC)/git
+ZLIB_BUILD ?= /home/motsou/cross/build-zlib
+GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
+
+# TCC -- a C compiler that RUNS ON the OS. Chosen because it is compiler +
+# assembler + linker in ONE binary: EmbLink has no exec, so GCC's driver (which
+# fork/execs cc1, as, ld) is structurally impossible here, while `tcc a.c -o a`
+# is a single process start to finish.
+TCC_SRC ?= /home/motsou/cross/tcc-0.9.27
+TCC_BIN ?= $(TCC_SRC)/tcc
+HAVE_TCC := $(if $(wildcard $(TCC_BIN)),yes,)
+HAVE_GIT := $(if $(wildcard $(GIT_BIN)),yes,)
+
+PY_SRC   ?= /home/motsou/cross/Python-3.14.6
+
+ifeq ($(HAVE_PY),yes)
+# The interpreter, the stdlib, and the file that points one at the other. All
+# three or none: python.elf without the zip dies at startup with
+# "Failed to import encodings module" (encodings is imported by Py_Initialize
+# and is NOT frozen), and the zip without the ._pth is never looked at.
+PY_APPS = build/python.elf build/python314.zip build/python.elf._pth
+
+# STRIP IS NOT COSMETIC HERE: the interpreter is 42 MB unstripped (almost all of
+# it debug_info) and 7.5 MB stripped. The 64 MB volume would not hold the former
+# alongside cxxdemo.elf's 9.4 MB. Keep the unstripped original in $(PY_BUILD) --
+# that's what addr2line needs when the thing faults.
+# DEPENDS ON THE LIBC, and that is the whole point of this rule's complexity:
+# python EMBEDS build/crt0.o + build/syscalls.o (they are in its LDFLAGS). But
+# CPython's own Makefile has them as RAW PATHS, not prerequisites, so its `make`
+# reports "up to date" however much our libc changed -- it cannot know. That is
+# not hypothetical: python.elf once sat 15 HOURS stale, passing `test python`
+# against a frozen copy of an old libc. Green, and true of a binary nobody
+# builds any more.
+#
+# So WE track it. Relink only when the libc is genuinely NEWER than the
+# interpreter -- a blind `rm && make` would relink on every single build.
+build/python.elf: $(PY_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(PY_BIN) ] || [ build/crt0.o -nt $(PY_BIN) ]; then \
+	    echo "  RELINK   python  (libc changed under it)"; \
+	    rm -f $(PY_BIN); \
+	    $(MAKE) -s -C $(PY_BUILD) python || \
+	      { echo "*** python relink FAILED -- see $(PY_BUILD)"; exit 1; }; \
+	 fi
+	cp -f $(PY_BIN) $@
+	$(STRIP) $@
+
+# The stdlib as ONE zip: importlib+zipimport are frozen into the interpreter, so
+# a zip on sys.path needs no directory tree and no CPython patch (it's CPython's
+# own ZIP_LANDMARK route, the standard embedded recipe). ~555 modules, ~2.5 MB.
+build/python314.zip: tools/mkpystdlib.py | $(BUILD)
+	python3 tools/mkpystdlib.py $(PY_SRC) $@
+
+# getpath.py reads `<executable>._pth` (verbatim on non-Windows, hence the
+# `.elf` stays in the name) and its lines TOTALLY override sys.path -- each is
+# joinpath()'d onto the file's own directory, so these resolve to /python314.zip
+# and /. It also forces isolated mode + no environment lookup, which is exactly
+# right for an OS that has no environment. This is why we don't fight configure's
+# --prefix, which otherwise sends the interpreter hunting through /usr/....
+build/python.elf._pth: | $(BUILD)
+	printf 'python314.zip\n.\n' > $@
+else
+PY_APPS =
+endif
 
 # Dynamic-link flags (Phase 2): an ET_EXEC app that imports the toolkit from
 # libembk.so. No -static / no -T (default script emits the dynamic sections).
@@ -192,6 +330,73 @@ build/hello.o: user/bin/hello.c user/lib/embk.h | $(BUILD)
 
 build/hello.elf: build/crt0.o build/syscalls.o build/hello.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/hello.o -lc -lgcc -o $@
+
+# posixdemo.elf -- ring-3 self-check for the POSIX layer in user/lib/syscalls.c
+# (dirent/clocks/cwd + the honest refusals). `test posix` spawns it. Plain C, so
+# unlike cxxdemo it needs no toolchain gate. mkfs auto-discovers build/*.elf.
+build/posixdemo.o: user/bin/posixdemo.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/posixdemo.elf: build/crt0.o build/syscalls.o build/posixdemo.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/posixdemo.o -lc -lgcc -o $@
+
+# --- shell.elf: the EmbLink structured shell (shell/) --------------------------
+# Static newlib link (hello.elf's shape, not the EmUI dynamic one -- the shell
+# has no UI dependency). Kernel-convention includes: one -Ishell root,
+# subtree-qualified paths ("value/value.h"). docs/SHELL.md is the spec.
+SHELL_INC = -Ishell
+SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
+             shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
+             shell/builtins/builtins.h shell/hist/hist.h
+
+$(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wire.o: shell/wire/wire.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_sval.o: shell/sval/sval.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_lex.o: shell/lex/lex.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_parse.o: shell/parse/parse.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_eval.o: shell/eval/eval.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_builtins.o: shell/builtins/builtins.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_hist.o: shell/hist/hist.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+
+SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
+             $(BUILD)/shobj_lex.o $(BUILD)/shobj_parse.o $(BUILD)/shobj_eval.o \
+             $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
+             $(BUILD)/shobj_eval_extern.o \
+             $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
+
+build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(SHELL_OBJS) -lc -lgcc -o $@
+
+# --- external pipeline tools (shell/tools/): NOT builtins -- each is a real
+# standalone .elf the shell spawns as a pipeline stage via the extern path
+# (fd 3 out / fd 0 in). They link the sval SDK's core objects statically,
+# same shape as shell.elf. sysinfo = the reference producer; tally = the
+# reference consumer (an external re-implementation of `count`).
+SHELL_SDK_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o
+
+$(BUILD)/shtool_sysinfo.o: shell/tools/sysinfo.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shtool_tally.o: shell/tools/tally.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+
+build/sysinfo.elf: $(BUILD)/shtool_sysinfo.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
+build/tally.elf: $(BUILD)/shtool_tally.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
 
 # --- uidemo.elf: the EmbLink UI toolkit running live in ring-3 -----------------
 # The ui/ toolkit (host-tested pure userland C) built for the OS: newlib libc +
@@ -281,7 +486,10 @@ libembk: build/libembk.so
 # `make embkfs.img` -- no per-app Makefile rule, no mkfs edit. (uidemo,
 # wmdemo, home, v4demo, clockw all previously had five copies of the same
 # two rules here; this replaces them.)
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c, $(wildcard user/bin/*.c))
+# posixdemo.c is filtered out for the same reason as hello.c: it's a plain
+# static-newlib console program with its own rule above, NOT an EmUI app to be
+# linked against libembk.so.
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -320,7 +528,11 @@ home: build/home.elf
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
          -drive format=raw,file=$(DISK),if=ide,index=1
 
-all: $(IMG)
+# `make` builds a COMPLETE, CURRENT system: the boot image AND the userland
+# image. embkfs.img was deliberately absent here before, so a plain `make` could
+# exit 0 having never built the apps it packs -- `make && make run-*` would then
+# boot an image with a stale (or entirely missing) program on it.
+all: $(IMG) embkfs.img
 
 $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
 	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
@@ -381,11 +593,75 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=64
 
+# Everything that must be BUILT before mkfs runs. mkfs itself auto-discovers
+# build/*.elf (see discover_userland_objects), so this list exists purely to tell
+# make WHEN the image is stale -- and it has to stay complete, because an app
+# missing from it is not a build error: the image just silently keeps the old
+# copy, or never gains the new app at all. EMUI_APPS is a wildcard over
+# user/bin/*.c, so EmUI apps are automatic; static console programs have bespoke
+# rules and must be named here (the check in the recipe below catches omissions).
+ifeq ($(HAVE_GIT),yes)
+GIT_APPS = build/git.elf
+
+# Same reasoning as python.elf: 4.7 MB unstripped, 3.5 MB stripped; keep the
+# unstripped original next to the source tree for addr2line when it faults.
+# Same libc-embedding problem as python.elf above (see that rule for why git's
+# own Makefile cannot catch this): git links build/crt0.o + build/syscalls.o via
+# LDFLAGS, so a libc change silently leaves the packed git.elf on the old one.
+# Relink only when the libc is actually newer.
+build/git.elf: $(GIT_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(GIT_BIN) ] || [ build/crt0.o -nt $(GIT_BIN) ]; then \
+	    echo "  RELINK   git     (libc changed under it)"; \
+	    rm -f $(GIT_BIN); \
+	    ZLIB_BUILD=$(ZLIB_BUILD) $(GIT_BUILD_SH) $(GIT_SRC) >/dev/null 2>&1 || \
+	      { echo "*** git relink FAILED -- run: ZLIB_BUILD=$(ZLIB_BUILD) $(GIT_BUILD_SH) $(GIT_SRC)"; exit 1; }; \
+	 fi
+	cp -f $(GIT_BIN) $@
+	$(STRIP) $@
+endif
+
+ifeq ($(HAVE_TCC),yes)
+TCC_APPS = build/tcc.elf
+
+# Same libc-embedding problem as python.elf/git.elf (see those rules): tcc links
+# build/crt0.o + build/syscalls.o via LDFLAGS, which its own Makefile treats as
+# raw paths. Relink only when the libc is genuinely newer.
+build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
+	@if [ build/syscalls.o -nt $(TCC_BIN) ] || [ build/crt0.o -nt $(TCC_BIN) ]; then \
+	    echo "  RELINK   tcc     (libc changed under it)"; \
+	    rm -f $(TCC_BIN); \
+	    $(MAKE) -s -C $(TCC_SRC) CONFIG_ldl=no tcc || \
+	      { echo "*** tcc relink FAILED -- see $(TCC_SRC)"; exit 1; }; \
+	 fi
+	cp -f $(TCC_BIN) $@
+	$(STRIP) $@
+endif
+
+EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
+               build/shell.elf build/sysinfo.elf build/tally.elf \
+               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
+
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf build/hello.elf $(EMUI_APPS) build/libembk.so
-	python3 tools/embkfs_mkfs/mkfs_embkfs.py
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) build/libembk.so
+	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
+	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
+	@# on the image yet never triggers a rebuild -- a stale-image bug that is
+	@# otherwise completely silent. Warn loudly rather than let it rot.
+	@for f in build/*.elf; do \
+	  case " $(EMBKFS_APPS) " in \
+	    *" $$f "*) ;; \
+	    *) echo "*** WARNING: $$f is packed onto the image but is NOT a"; \
+	       echo "***          prerequisite of embkfs.img -- changes to it will"; \
+	       echo "***          NOT rebuild the image. Add it to EMBKFS_APPS."; ;; \
+	  esac; \
+	done
+	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs at the image root
+	@# for tcc to link against ON the OS. Derived from the ONE NEWLIB_PREFIX so a
+	@# checkout on another machine needs no mkfs edit -- see docs/BUILD_SETUP.md.
+	EMBK_NEWLIB_LIBC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libc.a,)" \
+	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
 # Create a 64MB AHCI test disk (separate from disk.img)
@@ -404,12 +680,12 @@ fat32.img:
 	mcopy -i fat32.img /tmp/sub.txt ::SUBDIR/INSIDE.TXT
 
 
-embkfs.img:
-	python3 tools/embkfs_mkfs/mkfs_embkfs.py   # adjust path if mkfs writes elsewhere
-
-
-embkfs_tree.img:
-	python3 tools/embkfs_mkfs/mkfs_embkfs.py     # writes embkfs.img AND embkfs_tree.img
+# NOTE: embkfs.img / embkfs_tree.img are built by the GROUPED rule further up
+# (search "One recipe, two outputs"). Two prerequisite-less duplicates used to
+# sit here and, being later, they OVERRODE that rule -- which meant make treated
+# an existing embkfs.img as up to date forever: rebuilt apps never reached the
+# image and new ones never appeared at all. Don't re-add a bare `embkfs.img:`
+# rule; put new prerequisites on the grouped rule instead.
 
 
 # COW mutates the disk — boot a PRISTINE copy each run, then grade it.
@@ -533,6 +809,26 @@ part_embkfs.img: embkfs_tree.img
 	printf 'label: dos\nstart=2048, type=83\n' | sfdisk part_embkfs.img
 	dd if=embkfs_tree.img of=part_embkfs.img bs=512 seek=2048 conv=notrunc status=none
 
+# A real GPT disk, written by sfdisk -- the INDEPENDENT oracle. We are not
+# grading our own homework: if our reader disagrees with the tool that wrote it,
+# our reader is wrong. Three partitions so the entry walk is exercised, not just
+# entry 0, and one of them lands past index 9 territory for the name check.
+part_gpt.img:
+	dd if=/dev/zero of=part_gpt.img bs=1M count=32 status=none
+	printf 'label: gpt\nstart=2048, size=8192, type=linux\nstart=10240, size=8192, type=linux\nstart=18432, size=8192, type=linux\n' | sfdisk part_gpt.img
+
+# An MBR disk with an EXTENDED partition holding logical partitions (sda5+).
+# The EBR chain is a linked list whose two link fields use DIFFERENT bases --
+# the thing most likely to be wrong, so make the chain long enough to catch it.
+part_ext.img:
+	dd if=/dev/zero of=part_ext.img bs=1M count=32 status=none
+	printf 'label: dos\nstart=2048, size=4096, type=83\nstart=6144, size=51200, type=5\nstart=8192, size=8192, type=83\nstart=18432, size=8192, type=83\nstart=28672, size=8192, type=83\n' | sfdisk part_ext.img
+
+run-part-gpt: $(IMG) part_gpt.img
+	qemu-system-x86_64 -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=part_gpt.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown
+
 run-part-fat: $(IMG) $(DISK) part_fat.img
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
@@ -642,6 +938,30 @@ run-all: $(IMG) ahci.img fat32.img
 # its selftests are host-compiled and run natively (no QEMU / no ring-3) --
 # fast, and appropriate for a pure data-structure + traversal piece.
 HOSTCC ?= cc
+
+# --- compile_commands.json: make clangd/clang-tidy resolve this tree ---------
+# Nothing here compiles per-file into a database (the kernel is ONE gcc call
+# over $(KERNEL_SRC)), so `bear` has nothing to capture and clangd otherwise
+# can't find a single project header -- every file shows a wall of bogus
+# "file not found" that buries the real diagnostics. The generator mirrors the
+# four include worlds below (CFLAGS / NEWLIB_CFLAGS+UIDEMO_INC / SHELL_INC).
+# Output is absolute-path'd + gitignored: regenerate, don't commit.
+compile-commands:
+	python3 tools/gen_compile_commands.py
+
+.PHONY: compile-commands
+
+# The structured shell's pure pipeline (lexer -> parser -> evaluator ->
+# builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
+# external spawn) link as stubs; they get exercised live by `test shell`.
+shell-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
+	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/test/host_test.c -o $(BUILD)/shell_test
+	$(BUILD)/shell_test
+
 scene-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene \
 	    ui/scene/scene.c ui/scene/scene_test.c -o $(BUILD)/scene_test

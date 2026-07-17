@@ -1,5 +1,10 @@
 # EMBKFS Specification — Additions (v2.1 → v2.2)
 
+> **Superseded in part by [`EMBKFS_spec_v2.3.md`](EMBKFS_spec_v2.3.md)**, which
+> adds atomic `rename` (git's lockfile protocol depends on it), `chmod`,
+> `ftruncate`, bounded extents, and the rebuilt read path. v2.3 changes no
+> on-disk structure — everything in this document still stands.
+
 This document layers EMBKFS v2's new capabilities on top of v2.0
 (`EMBKFS_Specification_v2.0.pdf`) and v2.1's corrections
 (`EMBKFS_spec_v2.1.md`), following the same discipline: every structure here

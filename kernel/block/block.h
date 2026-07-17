@@ -83,6 +83,23 @@ int embk_block_write(struct embk_block_device *dev,
 // device exposes no flush op (it is then assumed to have no write-back cache).
 int embk_block_flush(struct embk_block_device *dev);
 
-
+/* Block-layer request counters, read by `test ioperf` (kernel/selftests.c).
+ *
+ * Kept permanently, and deliberately: during the I/O-path rebuild, SIX separate
+ * plans targeted layers nobody had measured, and every one of them was wrong.
+ * These three numbers -- request COUNT, total BLOCKS moved, and time spent
+ * INSIDE the driver -- settle in one boot what hours of reading the code did not:
+ *  - blocks vs bytes-asked gives read AMPLIFICATION (a whole-extent verify shows
+ *    up here as several hundred percent and nowhere else);
+ *  - read_us vs wall says whether the disk is even involved (post-rebuild it is
+ *    ~1% of wall on a warm read -- so "make the disk faster" is now a dead end).
+ * Measure before optimising this path. */
+struct embk_blkstat {
+    uint64_t reads;        /* requests that reached a driver */
+    uint64_t read_blocks;  /* 512-byte blocks those requests moved */
+    uint64_t read_us;      /* microseconds spent INSIDE dev->read */
+};
+void embk_blkstat_reset(void);
+void embk_blkstat_get(struct embk_blkstat *out);
 
 #endif /* _BLOCK_H_ */

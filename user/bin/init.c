@@ -91,6 +91,202 @@ static int spawn_test(void)
     return 1;
 }
 
+/* init.c is FREESTANDING: it defines its own _start (see the bottom of this
+ * file) and links neither crt0.c nor newlib, so nothing else here defines
+ * `environ` -- we own it. _start takes the vector the kernel delivers in RDX and
+ * assigns it below, which is exactly what crt0's start_c() does for newlib apps.
+ *
+ * No getenv() either, but `environ` is just a NULL-terminated char*[], and
+ * walking it is the whole of what getenv does. */
+char **environ;
+
+static const char *env_lookup(const char *key)
+{
+    int klen = 0;
+    while (key[klen]) klen++;
+    for (int i = 0; environ && environ[i]; i++) {
+        const char *e = environ[i];
+        int j = 0;
+        while (j < klen && e[j] && e[j] == key[j]) j++;
+        /* Require the '=' right after the key, or "HOM" would match "HOME=/". */
+        if (j == klen && e[j] == '=') return e + klen + 1;
+    }
+    return (const char *)0;
+}
+
+/* Spawn a child with an EXPLICIT environment through the SYSCALL path, and have
+ * it report back what arrived.
+ *
+ * `test env` already covers process_create_env() (a KERNEL caller). This covers
+ * the half that only userspace can reach: embk_spawn_env() -> sys_spawn's r9 ->
+ * copy_from_user of a NULL-terminated user vector -> the child's `environ`.
+ *
+ * It also pins the DEFAULT: this process was spawned by the kernel with no
+ * environment, so `environ` must be empty here -- nothing is inherited, and the
+ * child below sees variables ONLY because this call names them. */
+static int env_spawn_test(void)
+{
+    if (environ && environ[0]) {
+        embk_puts(1, "env_spawn_test: FAIL inherited an environment\n");
+        return 0;
+    }
+
+    char *argv[] = { "init", "env-child", (char *)0 };
+    char *envp[] = { "EMBK_ENV_TEST=syscall-env-ok", "HOME=/", (char *)0 };
+
+    struct embk_spawn_file_action actions[1];
+    actions[0].kind = EMBK_SPAWN_ACTION_OPEN;
+    actions[0].target_fd = 3;
+    { const char *p = "/env_test.tmp"; int i = 0;
+      while (p[i]) { actions[0].path[i] = p[i]; i++; }
+      actions[0].path[i] = '\0'; }
+    actions[0].flags = EMBK_O_CREAT | EMBK_O_WRONLY | EMBK_O_TRUNC;
+    actions[0].mode = 0644;
+
+    long handle = embk_spawn_env("/init.elf", argv, envp, actions, 1);
+    if (handle < 0) { embk_puts(1, "env_spawn_test: FAIL spawn()\n"); return 0; }
+    if (embk_wait((int)handle) != 0) {
+        embk_puts(1, "env_spawn_test: FAIL child reported bad env\n");
+        return 0;
+    }
+
+    long fd = embk_open("/env_test.tmp", EMBK_O_RDONLY, 0);
+    if (fd < 0) { embk_puts(1, "env_spawn_test: FAIL reopen\n"); return 0; }
+    char buf[64] = {0};
+    long n = embk_read((int)fd, buf, sizeof(buf) - 1);
+    embk_close((int)fd);
+
+    if (n <= 0 || !embk_streq(buf, "syscall-env-ok")) {
+        embk_puts(1, "env_spawn_test: FAIL content mismatch\n");
+        return 0;
+    }
+    embk_puts(1, "env_spawn_test: PASS\n");
+    return 1;
+}
+
+/* The argv[1]=="env-child" side of env_spawn_test(): report what the kernel
+ * actually handed us. exit(0) only if EVERY expectation holds. */
+static void env_child(void)
+{
+    const char *v = env_lookup("EMBK_ENV_TEST");
+    const char *home = env_lookup("HOME");
+    int ok = v && embk_streq((char *)v, "syscall-env-ok")
+             && home && embk_streq((char *)home, "/")
+             && env_lookup("EMBK_ABSENT") == (const char *)0;
+    if (ok) embk_write(3, v, 14);        /* "syscall-env-ok" */
+    embk_exit(ok ? 0 : 1);
+}
+
+/* CANCELLATION (docs/INTERRUPTION.md), both halves:
+ *
+ *   1. a child BLOCKED in a syscall must wake and get -ECANCELED
+ *   2. a child in a COMPUTE LOOP (no syscalls) must see embk_cancelled()
+ *
+ * The child here blocks reading a pipe nobody will ever write to -- without
+ * cancellation that read never returns, so this test hanging IS the failure
+ * signal. It then confirms the flag is visible and STICKY, and reports through
+ * an exit code the parent checks. */
+static void cancel_child(void)
+{
+    /* fd 0 was INSTALL_OBJ'd to a pipe read end whose writer the parent holds
+     * and never writes. This blocks forever unless cancellation wakes it. */
+    char b;
+    long n = embk_read(0, &b, 1);
+
+    /* -EMBK_ECANCELED (125). Not EOF (0), which is what a closed writer gives --
+     * distinguishing them is the point: EOF means "done", cancel means "stop". */
+    if (n != -125) embk_exit(1);
+
+    /* Sticky: still cancelled after observing it, so cleanup that blocks again
+     * fails fast instead of hanging. */
+    if (!embk_cancelled()) embk_exit(2);
+    if (embk_read(0, &b, 1) != -125) embk_exit(3);
+
+    embk_exit(0);
+}
+
+static int cancel_test(void)
+{
+    /* A pipe the child will block on. We keep the write end and never write. */
+    int pfd[2];
+    if (embk_pipe(pfd) != 0) { embk_puts(1, "cancel_test: FAIL pipe\n"); return 0; }
+
+    char *argv[] = { "init", "cancel-child", (char *)0 };
+    struct embk_spawn_file_action acts[1];
+    acts[0].kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;
+    acts[0].target_fd = 0;
+    acts[0].src_obj_handle = pfd[0];
+
+    long h = embk_spawn("/init.elf", argv, acts, 1);
+    if (h < 0) { embk_puts(1, "cancel_test: FAIL spawn\n"); return 0; }
+
+    /* Let it reach the blocking read. Cancelling BEFORE it blocks would still
+     * work (the flag is checked on entry, not only on wake) -- but then this
+     * would not be testing the wake, which is the half that can actually break. */
+    embk_sleep_ms(300);
+
+    if (embk_cancel((int)h) != 0) {
+        embk_puts(1, "cancel_test: FAIL cancel\n");
+        embk_kill((int)h); embk_wait((int)h);
+        return 0;
+    }
+
+    long code = embk_wait((int)h);
+    embk_close_handle(pfd[0]);
+    embk_close_handle(pfd[1]);
+
+    if (code != 0) {
+        embk_puts(1, "cancel_test: FAIL child reported bad cancel behaviour\n");
+        return 0;
+    }
+    embk_puts(1, "cancel_test: PASS\n");
+    return 1;
+}
+
+/* CONSOLE ^C ROUTING (docs/INTERRUPTION.md Phase 2) -- the full path, live:
+ *
+ *   PS/2 IRQ -> Ctrl+C -> 0x03 -> keyboard_deliver -> routed target
+ *   -> process_cancel -> the child's console read returns -ECANCELED.
+ *
+ * The parent spawns a child that blocks reading fd 0 (the CONSOLE -- inherited
+ * by default), then DELEGATES ^C to it via embk_console_interrupt_route(handle)
+ * and waits. The test harness injects a real Ctrl+C through QMP `sendkey`; the
+ * kernel cannot fake this half from software, which is the point of the test.
+ * Exit sentinel 42 = every step held. */
+static void ctrlc_child(void)
+{
+    char b;
+    long n = embk_read(0, &b, 1);           /* console read; blocks for a key */
+    if (n != -125) embk_exit(1);            /* must be -EMBK_ECANCELED, not data */
+    if (!embk_cancelled()) embk_exit(2);    /* flag visible and sticky */
+    embk_exit(0);
+}
+
+static void ctrlc_parent(void)
+{
+    char *argv[] = { "init", "ctrlc-child", (char *)0 };
+    long h = embk_spawn("/init.elf", argv, (void *)0, 0);
+    if (h < 0) { embk_puts(1, "ctrlc_test: FAIL spawn\n"); embk_exit(1); }
+
+    /* THE DELEGATION. From here a console ^C means the child, not us. */
+    if (embk_console_interrupt_route((int)h) != 0) {
+        embk_puts(1, "ctrlc_test: FAIL route\n");
+        embk_kill((int)h); embk_wait((int)h);
+        embk_exit(1);
+    }
+
+    embk_puts(1, "ctrlc_test: READY (send ^C now)\n");
+    long code = embk_wait((int)h);
+
+    /* Reclaim BEFORE judging: a route left aimed at a reaped child makes the
+     * next ^C silently vanish. */
+    (void)embk_console_interrupt_route(-1);
+
+    if (code != 0) { embk_puts(1, "ctrlc_test: FAIL child code\n"); embk_exit(1); }
+    embk_puts(1, "ctrlc_test: PASS\n");
+    embk_exit(42);
+}
+
 #define EXPECTED_HEAP_BASE 0x0000600000000000L
 
 /* Grow/shrink the heap via embk_sbrk and verify the mapping, persistence,
@@ -787,12 +983,26 @@ static void ui_proto_role(const char *scen)
 /* rdi=argc, rsi=argv -- delivered by the kernel's process_trampoline has_argv
  * path. No crt0: these C-ABI parameter registers ARE where the trampoline
  * put them. */
-void _start(long argc, char **argv)
+/* The kernel's process_trampoline enters here with rdi=argc, rsi=argv, rdx=envp
+ * -- the SysV main(argc, argv, envp) registers. This is the raw entry point, so
+ * the third parameter simply reads rdx; envp is 0 when the parent passed no
+ * environment (the default). */
+void _start(long argc, char **argv, char **envp)
 {
+    /* Before anything else: publish the environment. Freestanding, so this is
+     * the moment crt0's start_c() would have done it for a newlib app. */
+    environ = envp;
+
     /* Spawned-child role: do exactly what spawn_test() above checks, then
      * exit. Exiting HERE (not falling through) is what stops init from
      * recursively spawning itself without bound. */
     if (argc >= 2) {
+        /* Reports back what environment (if any) the kernel delivered. */
+        if (embk_streq(argv[1], "env-child"))      env_child();
+        if (embk_streq(argv[1], "cancel-child"))   cancel_child();
+        if (embk_streq(argv[1], "ctrlc-child"))    ctrlc_child();
+        if (embk_streq(argv[1], "ctrlc-parent"))   ctrlc_parent();
+
         /* EmbLink UI Piece 1 roles, selected by argv[1]. Each exits. */
         if (embk_streq(argv[1], "surface-parent")) surface_parent();
         if (embk_streq(argv[1], "surface-child"))  surface_child(argc, argv);
@@ -831,6 +1041,8 @@ void _start(long argc, char **argv)
     int ok = 1;
     ok &= thread_test();
     ok &= spawn_test();
+    ok &= env_spawn_test();
+    ok &= cancel_test();
     ok &= sbrk_test();
     embk_exit(ok ? 16 : 1);
 }

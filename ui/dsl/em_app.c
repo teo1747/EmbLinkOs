@@ -47,6 +47,12 @@ static uint8_t *emapp_load(const char *path, size_t *out_len) {
 
 static void emapp_mover(int win, int32_t x, int32_t y) { embk_win_move(win, x, y); }
 
+/* --- terminal-shaped runtime hooks (V8; see em.h) ------------------------ */
+static int  (*g_em_key_hook)(int ch)  = 0;
+static void (*g_em_idle_hook)(void)   = 0;
+void em_set_key_hook(int (*fn)(int ch)) { g_em_key_hook = fn; }
+void em_set_idle_hook(void (*fn)(void)) { g_em_idle_hook = fn; }
+
 int em_app_run(const EmApp *app) {
     if (!app || !app->view) return 1;
     const char *title = app->title ? app->title : "EmApp";
@@ -106,10 +112,13 @@ int em_app_run(const EmApp *app) {
 
     for (;;) {
         /* --- inputs (always polled; they are the retained-update triggers) --- */
+        if (g_em_idle_hook) g_em_idle_hook();   /* every iteration, even idle --
+                                                 * the terminal's pipe poll */
         struct embk_win_input in;
         embk_win_input(&in);
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {
+            if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
             if (c == 27) {
                 embk_win_destroy(win); embk_key_grab(0);
                 char b[64]; snprintf(b, sizeof b, "%s: exit\n", title); embk_puts(1, b);

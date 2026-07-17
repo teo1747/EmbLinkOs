@@ -47,4 +47,8 @@ void pipe_release_for_handle_locked(void *obj_end);
 /* Live-pipe count, for the EOF selftest's leak assertion. */
 uint32_t pipe_live_count(void);
 
+/* Non-blocking progress probe (advisory; self-locking). side 0 = bytes
+ * readable; side 1 = space writable. fd avail hook. */
+int64_t pipe_avail(struct pipe *p, int side);
+
 #endif /* __PIPE_H__ */

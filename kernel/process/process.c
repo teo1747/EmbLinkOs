@@ -11,9 +11,11 @@
 #include "include/kstring.h"
 #include "arch/x86_64/syscall/elf.h"
 #include "arch/x86_64/cpu/gdt.h"
+#include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 
 #include <stdint.h>
 
@@ -114,11 +116,21 @@ static struct process *process_alloc(void) {
             process_table[i].pid = next_pid++;
             process_table[i].live_thread_count = 0;
             process_table[i].thread_list = NULL;
+            /* MUST be reset: slots are REUSED after reaping, so a stale `true`
+             * from the previous occupant would make this process born cancelled
+             * -- every blocking syscall failing -ECANCELED before it ran a line. */
+            process_table[i].cancelled = false;
             /* -1, not the zeroed-by-memset 0: 0 is a VALID cpu_table[]
              * index (the BSP) -- meaningless until live_thread_count hits
              * 0 for the first time (see the field's comment), but starting
              * unambiguous costs nothing. */
             process_table[i].running_cpu = -1;
+            /* Reset like `cancelled`: slots are REUSED, and a fresh process must
+             * start with an unlocked fd table. (Safe under g_sched_lock --
+             * mutex_init only zeroes fields; it takes no lock. No thread can be
+             * blocked on the old occupant's fd_lock: a slot is reused only after
+             * every thread of the previous process is gone.) */
+            mutex_init(&process_table[i].fd_lock);
             spin_unlock(&g_sched_lock);
             return &process_table[i];
         }
@@ -185,6 +197,12 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->entry_point = entry_point;
     t->user_rsp = user_rsp;
     t->user_arg = user_arg;
+    /* No thread pointer until the thread asks for one (sys_set_fs_base, called
+     * from crt0 only when the program actually has a PT_TLS). Must be seeded:
+     * schedule() writes this straight into IA32_FS_BASE on every switch, so a
+     * stale value from a recycled slot would hand the thread a garbage %fs. 0 is
+     * safe -- a program without TLS never reads %fs. */
+    t->fs_base = 0;
     t->proc = proc;
     t->priority = PRIORITY_NORMAL;
     t->ticks_since_scheduled = 0;
@@ -194,6 +212,9 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->argc = 0;
     t->argv_uva = 0;
     t->has_argv = false; // true only if this thread has a valid argc/argv_uva (user-mode threads only)
+    t->envp_uva = 0;     // 0 == no environment. MUST be seeded: the trampoline loads
+                         // it into RDX unconditionally on the has_argv path, so a
+                         // stale value here would become the child's `environ`.
 
     /* Seed a valid default FXSAVE image: zeroed x87/XMM state (all zero is a
      * legitimate empty state) but MXCSR = 0x1F80 (round-nearest, all
@@ -503,6 +524,26 @@ static struct process *thread_zombie_locked(struct thread *t) {
      * decision must happen unconditionally, not gated on whether a switch
      * is about to happen, because the hand-off can WAKE a parent that's
      * BLOCKED specifically waiting for this exit. */
+
+    /* Release the fd table AT EXIT, not at reap -- Unix semantics: a ZOMBIE
+     * holds no fds. Load-bearing for pipes: the shell drains an external
+     * stage's output pipe to EOF BEFORE wait()ing it; if the dead child's
+     * write end survived until the reap loop ran (i.e. until someone
+     * wait()ed), EOF could never arrive and the reader deadlocked -- found
+     * live by `test extern`'s very first external spawn. Runs under
+     * g_sched_lock (this whole function's contract), hence close_locked.
+     * Entries are cleared so process_reap_slot's own fd loop (kept for any
+     * path that skips this transition) finds nothing to redo. */
+    for (int i = 0; i < FD_MAX_OPEN; i++) {
+        struct fd_entry *e = &proc->fds[i];
+        if (e->used) {
+            if (e->ops && e->ops->close_locked) {
+                e->ops->close_locked(e);
+            }
+            memset(e, 0, sizeof(*e));
+        }
+    }
+
     child_list_remove(proc->parent, proc);
     if (parent_is_alive(proc)) {
         /* Hand off to the parent's wait() instead of auto-reaping. This
@@ -597,6 +638,63 @@ void wait_queue_wake_all(struct wait_queue *wq) {
     while (wq->head) {
         wait_queue_wake_one(wq);
     }
+}
+
+/* --------------------------------------------------------------------
+ * Cancellation — the POLITE half of stopping a process (docs/INTERRUPTION.md).
+ *
+ * Sets the sticky `cancelled` flag and wakes every thread of the target that is
+ * currently blocked, so each re-checks the flag at its wake point and returns
+ * -EMBK_ECANCELED instead of sleeping again. That wake is the ONLY thing signals
+ * were really buying (getting a thread out of a blocking call) -- and we get it
+ * without injecting anything into user control flow.
+ *
+ * Unlike process_kill() this destroys nothing: the target keeps running and may
+ * ignore the flag forever. Escalation to the uncatchable process_kill() is the
+ * PARENT's policy, not the kernel's.
+ * -------------------------------------------------------------------- */
+int process_cancel(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+
+    struct process *proc = process_find(pid);
+    if (!proc) {
+        /* EINVAL, matching process_handle_resolve()'s answer for a handle that
+         * names nothing -- the kernel has no ESRCH. */
+        spin_unlock(&g_sched_lock);
+        return -EMBK_EINVAL;
+    }
+    if (proc->live_thread_count == 0) {
+        /* Already gone. Cancelling a corpse is not an error: the requested end
+         * state ("it is not running") already holds. */
+        spin_unlock(&g_sched_lock);
+        return EMBK_OK;
+    }
+
+    proc->cancelled = true;
+
+    /* Wake every blocked thread so it re-checks. Waking a thread that then finds
+     * its wait condition genuinely satisfied is harmless -- every sleeper here
+     * already loops on its own predicate; `cancelled` is simply one more reason
+     * to stop looping. We remove from whatever queue each thread is on rather
+     * than draining a queue, because siblings may be blocked on DIFFERENT
+     * objects (a pipe, child_wait, a sleep). */
+    for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
+        if (t->state == PROCESS_BLOCKED && t->wait_queue) {
+            wait_queue_remove(t->wait_queue, t);
+            t->state = PROCESS_READY;
+        }
+    }
+
+    spin_unlock(&g_sched_lock);
+    return EMBK_OK;
+}
+
+int process_is_cancelled(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+    struct process *proc = process_find(pid);
+    int r = proc ? (proc->cancelled ? 1 : 0) : -EMBK_EINVAL;
+    spin_unlock(&g_sched_lock);
+    return r;
 }
 
 /* --------------------------------------------------------------------
@@ -768,6 +866,16 @@ retry:
             link = &(*link)->zombie_next;
         }
 
+        /* Cancelled? Then do NOT go back to sleep -- see docs/INTERRUPTION.md.
+         * Checked HERE, after the zombie scan above: if the child has already
+         * exited, its status is a real result and the caller gets it. We only
+         * refuse to BLOCK. A cancellation must never make a completed operation
+         * report failure and lose the exit code. */
+        if (current_process->cancelled) {
+            spin_unlock(&g_sched_lock);
+            return -EMBK_ECANCELED;
+        }
+
         /* Not yet in our zombie list. Only worth blocking on if it's
          * genuinely still-live AND actually ours -- otherwise there is
          * nothing that will ever wake us for it. */
@@ -933,9 +1041,33 @@ void process_exit_self(int code) {
     }
 }
 
-/* Create a new process from an ELF executable */
+/* Create a new process from an ELF executable, with NO environment. See
+ * process_create_env(): a child gets an environment only when its parent
+ * explicitly hands one over. */
 int process_create(const char *path, char *const argv[], int argc,
                    const struct spawn_file_action *actions, int n_count) {
+    return process_create_env(path, argv, argc, NULL, actions, n_count);
+}
+
+/* Create a new process from an ELF executable */
+int process_create_env(const char *path, char *const argv[], int argc,
+                       char *const envp[],
+                       const struct spawn_file_action *actions, int n_count) {
+    /* Count + budget-check envp BEFORE any allocation, so an over-budget request
+     * costs nothing and, more importantly, is REJECTED rather than truncated:
+     * a child silently missing half its environment is a bug that surfaces far
+     * from here. */
+    int envc = 0;
+    size_t env_bytes = 0;
+    if (envp) {
+        while (envp[envc]) {
+            if (envc >= SPAWN_ENVP_MAX - 1) return -EMBK_E2BIG;  /* -1: NULL terminator */
+            env_bytes += strlen(envp[envc]) + 1;
+            if (env_bytes > SPAWN_ENVP_BYTES_MAX) return -EMBK_E2BIG;
+            envc++;
+        }
+    }
+
     struct process *proc = process_alloc();
     if (!proc) {
         return -EMBK_ENOMEM;  // No free process slots
@@ -1117,6 +1249,26 @@ int process_create(const char *path, char *const argv[], int argc,
     uint64_t child_kva = P2V(stack_phys);
     uint64_t off = PAGE_SIZE;
 
+    /* EVERYTHING below shares this ONE page: argv strings, envp strings, and
+     * both pointer arrays. `off` only ever walks DOWN from PAGE_SIZE, so the
+     * single thing that must never happen is it running past 0 -- that would
+     * write through child_kva into whatever physical page happens to precede
+     * this one. sys_spawn bounds user-supplied argv/envp, and
+     * process_create_env() bounds envp for kernel callers too, but the sizes are
+     * checked SEPARATELY there and only their SUM can overflow the page. So
+     * check the sum here, where the actual budget lives. */
+    #define STACK_ROOM_NEEDED(bytes, ptrs) ((bytes) + ((ptrs) + 1) * sizeof(uint64_t) + 16)
+    size_t argv_bytes = 0;
+    for (int i = 0; i < argc; i++) argv_bytes += strlen(argv[i]) + 1;
+    if (STACK_ROOM_NEEDED(argv_bytes, argc) + STACK_ROOM_NEEDED(env_bytes, envc)
+            > PAGE_SIZE) {
+        pmm_free_page(stack_phys);
+        vmm_destroy_address_space(pml4);
+        proc->pid = 0;
+        return -EMBK_E2BIG;
+    }
+    #undef STACK_ROOM_NEEDED
+
     uint64_t argv_child_uva[SPAWN_ARGV_MAX];
     for (int i = 0; i < argc; i++) {
         size_t slen = strlen(argv[i]) + 1;  // include null terminator
@@ -1127,6 +1279,15 @@ int process_create(const char *path, char *const argv[], int argc,
                                                                  // we just wrote through
     }
 
+    /* envp strings, same trick, same page, just below argv's. */
+    uint64_t envp_child_uva[SPAWN_ENVP_MAX];
+    for (int i = 0; i < envc; i++) {
+        size_t slen = strlen(envp[i]) + 1;
+        off -= slen;
+        memcpy((void *)(child_kva + off), envp[i], slen);
+        envp_child_uva[i] = USER_STACK_VA + off;
+    }
+
     off &= ~0x7ULL;           // 8-align before the pointer array
     off -= (argc + 1) * sizeof(uint64_t);  // space for the argv array + null terminator
     uint64_t argv_array_child_uva = USER_STACK_VA + off;
@@ -1135,6 +1296,22 @@ int process_create(const char *path, char *const argv[], int argc,
         argv_array_child_kva[i] = argv_child_uva[i];
     }
     argv_array_child_kva[argc] = 0;  // null terminator
+
+    /* envp array. Built even when envc==0 IF the parent passed a (possibly
+     * empty) envp, so the child sees a valid empty vector rather than NULL --
+     * `environ` must always be dereferenceable. envp==NULL stays 0: no
+     * environment at all, which is a different and equally honest answer. */
+    uint64_t envp_array_child_uva = 0;
+    if (envp) {
+        off &= ~0x7ULL;
+        off -= (envc + 1) * sizeof(uint64_t);
+        envp_array_child_uva = USER_STACK_VA + off;
+        uint64_t *envp_array_child_kva = (uint64_t *)(child_kva + off);
+        for (int i = 0; i < envc; i++) {
+            envp_array_child_kva[i] = envp_child_uva[i];
+        }
+        envp_array_child_kva[envc] = 0;
+    }
 
     off &= ~0xFULL;            // 16-align before the initial RSP push
 
@@ -1164,6 +1341,7 @@ int process_create(const char *path, char *const argv[], int argc,
     t->has_argv = true;
     t->argc = (uint64_t)argc;
     t->argv_uva = argv_array_child_uva;
+    t->envp_uva = envp_array_child_uva;   /* 0 == no environment; see spawn.h */
 
     t->state = PROCESS_READY;
     return (int)proc->pid;
@@ -1204,14 +1382,17 @@ static void process_trampoline(void) {
     if (current_thread->has_argv) {
        uint64_t argc = current_thread->argc;
        uint64_t argv = current_thread->argv_uva;
+       uint64_t envp = current_thread->envp_uva;   /* 0 == no environment */
 
-       /* Set up the user stack and jump to the entry point */
+       /* Set up the user stack and jump to the entry point.
+        * SysV: main(argc, argv, envp) == rdi, rsi, rdx. */
         __asm__ volatile(
-        "movq %4, %%rdi\n"      // arg -> rdi, BEFORE the pushes below (which
-                                 // must not themselves land in rdi -- see the
-                                 // "rdi" clobber forcing the compiler to pick
+        "movq %4, %%rdi\n"      // argc -> rdi, BEFORE the pushes below (which
+                                 // must not themselves land in rdi/rdx -- see the
+                                 // clobber list forcing the compiler to pick
                                  // other registers for the other operands)
-        "movq %5, %%rsi\n"       // argc -> rsi
+        "movq %5, %%rsi\n"       // argv -> rsi
+        "movq %6, %%rdx\n"       // envp -> rdx
         "pushq %0\n"            // ss = user data | 3
         "pushq %1\n"            // rsp = user stack top
         "pushq $0x202\n"        // rflags = IF=1
@@ -1220,8 +1401,8 @@ static void process_trampoline(void) {
         "iretq\n"               // return to user mode
         :
         : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(argc), "r"(argv)
-        : "rdi", "memory"
+          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(argc), "r"(argv), "r"(envp)
+        : "rdi", "rdx", "memory"
     );
     } else {
         uint64_t arg = current_thread->user_arg;
@@ -1627,7 +1808,10 @@ static void schedule_locked(void) {
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
-    current_thread = next;
+    this_cpu()->cur_thread = next;   /* WRITE the per-CPU field directly:
+                                      * `current_thread` is a read-only accessor
+                                      * now. Safe here -- g_sched_lock is held,
+                                      * so no preemption can split it. */
 
     /* Switch the incoming thread's address space + kernel stack BEFORE the
      * context switch - uniform for resumed and brand-new threads (the trampoline
@@ -1635,6 +1819,13 @@ static void schedule_locked(void) {
      * still on prev's kernel stack keeps executing fine. */
     vmm_switch_address_space(next->proc->pml4_phys);
     tss_set_rsp0(next->kstack_top);
+    /* The thread pointer is per-CPU state (an MSR), not per-thread, so it must
+     * be reinstalled here with CR3 and rsp0 -- otherwise the next thread would
+     * keep running against the PREVIOUS one's TLS block and quietly read and
+     * write another thread's variables. No matching save on the way out: ring 3
+     * cannot WRFSBASE (CR4.FSGSBASE is off), so next->fs_base is authoritative.
+     * See cpu/fsbase.h. */
+    fsbase_set(next->fs_base);
 
     kernel_ctx_switch(&prev->ctx, &current_thread->ctx,
                        prev->fpu_state, current_thread->fpu_state);
@@ -1685,7 +1876,7 @@ void process_init(void) {
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_table[i].state = PROCESS_UNUSED;
     }
-    current_thread = NULL;
+    this_cpu()->cur_thread = NULL;
 }
 
 /* ==========================================================================
@@ -2001,7 +2192,7 @@ struct thread *process_adopt_current(void) {
      * declaration, process.h). */
     self->pinned_cpu = (int)this_cpu()->cpu_index;
     self->state = PROCESS_RUNNING;
-    current_thread = self;
+    this_cpu()->cur_thread = self;   /* g_sched_lock held (unlocked below) */
     spin_unlock(&g_sched_lock);
     return self;
 }
@@ -2018,7 +2209,7 @@ static void selftest_restore_current(struct thread *self) {
     self->state = PROCESS_UNUSED;
     memset(proc, 0, sizeof(*proc));
     proc->pid = 0;
-    current_thread = NULL;
+    this_cpu()->cur_thread = NULL;
 }
 
 /* The eight selftests below were designed assuming `current_thread == NULL`

@@ -28,7 +28,11 @@ struct process;
 #define O_ACCMODE    0x0003  /* mask for the above three */
 #define O_CREAT      0x0040
 #define O_EXCL       0x0080
-#define O_TRUNC      0x0200  /* reserved (needs a truncate op)*/
+#define O_TRUNC      0x0200  /* LIVE: open() shrinks the file to 0 via the
+                              * per-fs truncate op (EMBKFS: a real COW
+                              * transaction). Needs writable access; a fs
+                              * without the op fails -ENOSYS, never silently
+                              * keeps stale bytes. */
 #define O_APPEND     0x0400  /* reserved  (write is cursor-driven for now)*/
 
 /* Fds 0/1/2 are reserved for stdin, stdout, stderr, so returned fds start at
@@ -49,6 +53,7 @@ enum fd_backing {
     FD_BACKING_VNODE,         /**< a VFS file */
     FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
     FD_BACKING_PIPE,          /**< one end of a kernel pipe (kernel/ipc/pipe.c) */
+    FD_BACKING_NULLDEV,       /**< /dev/null: EOF source / discard sink (stateless) */
 };
 
 struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
@@ -89,6 +94,13 @@ struct fd_ops {
      * that lock held, and which can be called from process_reap_slot() while
      * running R2 cleanup. */
     void (*close_locked)(struct fd_entry *e);
+
+    /* Bytes readable RIGHT NOW without blocking (pipe: buffered count;
+     * console: 1 if a key is waiting). 0 means "nothing yet", NOT EOF --
+     * EOF is still read()'s 0 return. What lets an interactive program (the
+     * terminal) poll a pipe from its render loop instead of blocking in
+     * read(). NULL = not meaningful for this backing (-EMBK_ENOSYS). */
+    int64_t (*avail)(struct fd_entry *e);
 };
 
 struct fd_entry {
@@ -114,6 +126,13 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
+int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
+int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
+int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
+int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest must not exist (POSIX replace = libc veneer) */
+int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
+int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
+int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
 
 /* Install one end of a pipe onto target_fd in `target` -- the fd-layer half

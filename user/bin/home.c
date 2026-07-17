@@ -75,7 +75,7 @@ static void home_ui(void) {
                 HStack(.spacing = 16) {
                     tile("V4 Demo",  "/v4demo.elf");
                     tile("Editor",   "/v7demo.elf");
-                    tile("About",    NULL);
+                    tile("Terminal", "/term.elf");
                 }
             }
         }
