@@ -634,30 +634,57 @@ def _read_file(path):
         return None
 
 
+# --- the userspace LAYOUT (docs/USERSPACE.md §6) --------------------------
+# The boot image is a TREE, not a flat root. Placement follows the sealed/mutable
+# boundary (D2 §3): the system's own programs + the ABI are sealed under /system;
+# installed applications (every compiler, the sval tools) are mutable state under
+# /data/apps/<name>/. Everything build_root_items can nest, so this is just a
+# name->path map applied at pack time.
+#
+# DELIBERATELY UNMOVED (checklist §6.1 names only the below): the EmUI demo apps
+# and the fonts stay at the root for now -- migrating them is an additive
+# follow-up that would also churn home.c's tiles and every app's font path. The
+# format fixtures (collision chain, symlink) stay at root too; they test the
+# on-disk format, not the layout.
+_SYSTEM_BIN = {"init.elf", "shell.elf", "home.elf"}          # -> /system/bin/
+_APPS       = {"tcc.elf", "python.elf", "git.elf",           # -> /data/apps/<name>/
+               "sysinfo.elf", "tally.elf"}
+
+def _elf_dest(name: str) -> bytes:
+    """Tree path (bytes, no leading slash) for a packed *.elf basename."""
+    if name in _SYSTEM_BIN:
+        return b"system/bin/" + name.encode()
+    if name in _APPS:
+        return f"data/apps/{name[:-4]}/{name}".encode()      # strip '.elf' for the dir
+    return name.encode()                                     # demos etc. stay at root
+
+
 def discover_userland_objects(build_dir="build"):
-    """Assemble the boot image's root-directory objects by DISCOVERING what's
-    been built, so adding a new EmUI app never needs a mkfs edit -- drop
-    user/bin/foo.c in, `make embkfs.img`, and foo.elf appears on the image:
-      - init.elf (required -- the freestanding selftest),
-      - the small on-disk fixtures (regression + collision chain + symlink),
-      - EVERY OTHER build/*.elf found (hello.elf + all EmUI apps, packed by
-        basename),
-      - libembk.so (the shared toolkit the dynamic loader needs), and
-      - a real DejaVu font the UI apps load at runtime,
-    each only if present. Returns a list of (name, dtype, mode, data)."""
+    """Assemble the boot image's objects by DISCOVERING what's been built, placed
+    into the docs/USERSPACE.md tree (see _elf_dest / the sealed-vs-mutable map
+    above). Adding a new EmUI app still needs no mkfs edit -- drop
+    user/bin/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
+    _APPS only if it belongs elsewhere. Returns a list of (name, dtype, mode,
+    data); `name` may contain '/', and build_root_items creates the dirs.
+      - system programs      -> /system/bin/
+      - the shared toolkit   -> /system/lib/libembk.so
+      - the ABI (crt0/syscalls/libc.a) -> /system/abi/
+      - installed apps       -> /data/apps/<name>/
+      - demos, fonts, fixtures -> root (unmoved, see above)
+      - empty /data/tmp and /data/users/teo."""
     init = _read_file(f"{build_dir}/init.elf")
     if init is None:
         raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
-    objects = [(b"init.elf", L.DT_REG, L.S_IFREG | 0o755, init)]
-    objects.extend(FIXTURE_OBJECTS)
-    for elf in sorted(glob.glob(f"{build_dir}/*.elf")):   # sorted -> deterministic image
+    objects = [(_elf_dest("init.elf"), L.DT_REG, L.S_IFREG | 0o755, init)]
+    objects.extend(FIXTURE_OBJECTS)                           # format fixtures, at root
+    for elf in sorted(glob.glob(f"{build_dir}/*.elf")):       # sorted -> deterministic image
         name = os.path.basename(elf)
         if name == "init.elf":
-            continue                                       # already added first
-        objects.append((name.encode(), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+            continue                                          # already added first
+        objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
-        objects.append((b"libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
+        objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
     font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     if font is not None:
         objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
@@ -666,39 +693,35 @@ def discover_userland_objects(build_dir="build"):
     mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     if mono is not None:
         objects.append((b"mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
-    # CPython's standard library, as one zip, plus the ._pth that points sys.path
-    # at it. Neither is a *.elf, so the glob above misses them -- and they are
-    # useless apart: python.elf without the zip dies at startup ("Failed to
-    # import encodings module"), and the zip without the ._pth is never
-    # consulted. Both are optional: a tree with no CPython built simply has
-    # neither (Makefile's HAVE_PY gate).
-    # THE TOOLCHAIN, at the FLAT ROOT. tcc.elf can compile+link a program ON the
-    # OS, but only if the things a link needs are reachable: crt0.o (_start),
-    # syscalls.o (the newlib retargeting layer) and libc.a. mkfs has no
-    # directory support -- the root is flat -- so rather than invent /lib and
-    # /include, they simply live at "/" and tcc is told `-L/`. A flat root is not
-    # a limitation here; it is the whole path search.
-    #
-    # libc.a is ~6.6 MB, by far the biggest single object on the image. It earns
-    # it: without it `tcc t.c -o t.elf` cannot resolve exit(), and the OS cannot
-    # build its own software.
+    # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
+    # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
+    # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into
+    # the sealed region) and links with `-L/system/abi`; it is an app in /data,
+    # not part of the contract. libc.a (~6.6 MB) is the biggest object on the
+    # image and earns it: without it `tcc t.c -o t.elf` cannot resolve exit().
     for tc in ("crt0.o", "syscalls.o"):
         blob = _read_file(f"{build_dir}/{tc}")
         if blob is not None:
-            objects.append((tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+            objects.append((b"system/abi/" + tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
     libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
     if libc is not None:
-        objects.append((b"libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
+        objects.append((b"system/abi/libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
 
+    # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
+    # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the
+    # executable's OWN directory -- so moving all three together needs no ._pth
+    # edit; getpath resolves the zip to /data/apps/python/python314.zip.
     pyzip = _read_file(f"{build_dir}/python314.zip")
     if pyzip is not None:
-        objects.append((b"python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
-    # NOTE the name keeps the ".elf": getpath.py appends "._pth" to the
-    # executable path verbatim on non-Windows, so it looks for exactly
-    # "/python.elf._pth".
+        objects.append((b"data/apps/python/python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
     pth = _read_file(f"{build_dir}/python.elf._pth")
     if pth is not None:
-        objects.append((b"python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+        objects.append((b"data/apps/python/python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+
+    # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
+    # so a session can chdir into a home and tcc has a scratch dir to write to.
+    objects.append((b"data/tmp",        L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     return objects
 
 

@@ -347,6 +347,7 @@ static void selftests_print_commands(void)
     kprintf("  test gpu\n");
     kprintf("  test tty\n");
     kprintf("  test dirtree\n");
+    kprintf("  test layout\n");
 }
 
 static void run_embkfs_all(void)
@@ -572,27 +573,27 @@ int selftests_handle_command(const char *cmd)
         // scheduled `struct process`/`struct thread` pair (thread_join()
         // blocks via the scheduler), which enter_user_mode()'s standalone
         // launch doesn't create at all. Run at the top level (argc==1),
-        // /init.elf runs the full EmbLink native-primitive suite -- a second
+        // /system/bin/init.elf runs the full EmbLink native-primitive suite -- a second
         // thread (create/join + shared-memory proof), a spawn() with argv +
         // file-actions, and an sbrk() heap exercise -- and exits 16 iff ALL
         // of them passed (see user/init.c, built on the EmbLink SDK
         // user/embk.h). 16 is a fixed success sentinel, not a computed value.
-        // Needs a real filesystem with /init.elf on it (e.g. `make
+        // Needs a real filesystem with /system/bin/init.elf on it (e.g. `make
         // run-embkfs`) -- unlike "test ring3", there's no embedded fallback
         // blob.
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test ring3 threads: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test ring3 threads: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
-        char *argv[] = { "/init.elf", NULL };
-        int pid = process_create("/init.elf", argv, 1, NULL, 0);
+        char *argv[] = { "/system/bin/init.elf", NULL };
+        int pid = process_create("/system/bin/init.elf", argv, 1, NULL, 0);
         if (pid < 0) {
             kprintf("\n[cmd] test ring3 threads: process_create failed: %s\n", embk_strerror(pid));
             return 1;
         }
 
         int code = process_wait((uint32_t)pid);
-        kprintf("\n[cmd] test ring3 threads: /init.elf exited with code %d (want 16): %s\n",
+        kprintf("\n[cmd] test ring3 threads: /system/bin/init.elf exited with code %d (want 16): %s\n",
                 code, code == 16 ? "OK" : "FAIL");
         return 1;
     }
@@ -606,15 +607,15 @@ int selftests_handle_command(const char *cmd)
      * a table full of dead-child handles frees up, and a live child is spared. */
     if (strcmp(cmd, "test handle reap") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test handle reap: VFS not registered (need /init.elf)\n");
+            kprintf("\n[cmd] test handle reap: VFS not registered (need /system/bin/init.elf)\n");
             return 1;
         }
         struct process *me = current_process;
         int ok = 1;
 
         /* (1) a LONG-LIVED child ("spin" loops forever); leak its handle. */
-        char *aspin[] = { "/init.elf", "spin", NULL };
-        int spin_pid = process_create("/init.elf", aspin, 2, NULL, 0);
+        char *aspin[] = { "/system/bin/init.elf", "spin", NULL };
+        int spin_pid = process_create("/system/bin/init.elf", aspin, 2, NULL, 0);
         int h_spin = spin_pid >= 0 ? process_handle_alloc(me, (uint32_t)spin_pid) : -1;
         if (spin_pid < 0 || h_spin < 0) {
             kprintf("\n[cmd] test handle reap: setup FAIL (spin spawn %d handle %d)\n", spin_pid, h_spin);
@@ -626,8 +627,8 @@ int selftests_handle_command(const char *cmd)
         uint32_t leaked[PROC_HANDLE_MAX];
         int n_leak = 0;
         for (;;) {
-            char *aleak[] = { "/init.elf", "leak", NULL };
-            int p = process_create("/init.elf", aleak, 2, NULL, 0);
+            char *aleak[] = { "/system/bin/init.elf", "leak", NULL };
+            int p = process_create("/system/bin/init.elf", aleak, 2, NULL, 0);
             if (p < 0) { ok = 0; break; }
             int h = process_handle_alloc(me, (uint32_t)p);
             if (h < 0) { process_kill((uint32_t)p); process_wait((uint32_t)p); break; }  /* table full */
@@ -683,7 +684,7 @@ int selftests_handle_command(const char *cmd)
      *   (5) drop every remaining ref -> the pipe slot itself is reclaimed. */
     if (strcmp(cmd, "test pipe") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test pipe: VFS not registered (need /init.elf)\n");
+            kprintf("\n[cmd] test pipe: VFS not registered (need /system/bin/init.elf)\n");
             return 1;
         }
         struct process *me = current_process;
@@ -711,8 +712,8 @@ int selftests_handle_command(const char *cmd)
         act.kind = SPAWN_ACTION_INSTALL_OBJ;
         act.target_fd = 1;
         act.src_obj_handle = wh;
-        char *aw[] = { "/init.elf", "pipewrite", NULL };
-        int wpid = process_create("/init.elf", aw, 2, &act, 1);
+        char *aw[] = { "/system/bin/init.elf", "pipewrite", NULL };
+        int wpid = process_create("/system/bin/init.elf", aw, 2, &act, 1);
         if (wpid < 0) {
             kprintf("\n[cmd] test pipe: setup FAIL (spawn %d)\n", wpid);
             vfs_close(9); obj_handle_free(me, rh); obj_handle_free(me, wh);
@@ -766,7 +767,7 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
-    /* The structured shell, end to end ON the OS: spawn /shell.elf -c "<line>"
+    /* The structured shell, end to end ON the OS: spawn /system/bin/shell.elf -c "<line>"
      * three times (its stdio is console-inherited, so results land on serial)
      * and assert the exit codes: expression evaluation, a REAL ls pipeline
      * over EMBKFS through where/sort-by/select, and the error path. The pure
@@ -774,7 +775,7 @@ int selftests_handle_command(const char *cmd)
      * spawn, console fds, readdir/stat, and the exit-status plumbing. */
     if (strcmp(cmd, "test shell") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test shell: VFS not registered (need /shell.elf)\n");
+            kprintf("\n[cmd] test shell: VFS not registered (need /system/bin/shell.elf)\n");
             return 1;
         }
         int ok = 1;
@@ -785,25 +786,25 @@ int selftests_handle_command(const char *cmd)
          * whole chain: process_create_env -> RDX -> crt0 -> environ -> builtin. */
         /* `|`, not `;` -- the lexer has no statement separator. Builtins run
          * IN-PROCESS, so the set and the listing share one `environ`. */
-        char *aenv[] = { "/shell.elf", "-c", "env set EMBK_SET fromshell | env", NULL };
+        char *aenv[] = { "/system/bin/shell.elf", "-c", "env set EMBK_SET fromshell | env", NULL };
         char *senv[] = { "EMBK_ENV_TEST=shell-ok", "HOME=/", NULL };
-        int pe = process_create_env("/shell.elf", aenv, 3, senv, NULL, 0);
+        int pe = process_create_env("/system/bin/shell.elf", aenv, 3, senv, NULL, 0);
         int ce = pe >= 0 ? process_wait((uint32_t)pe) : -1;
         if (pe < 0 || ce != 0) ok = 0;
 
-        char *a1[] = { "/shell.elf", "-c", "echo 1mb + 512kb", NULL };
-        int p1 = process_create("/shell.elf", a1, 3, NULL, 0);
+        char *a1[] = { "/system/bin/shell.elf", "-c", "echo 1mb + 512kb", NULL };
+        int p1 = process_create("/system/bin/shell.elf", a1, 3, NULL, 0);
         int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
         if (p1 < 0 || c1 != 0) ok = 0;
 
-        char *a2[] = { "/shell.elf", "-c",
+        char *a2[] = { "/system/bin/shell.elf", "-c",
                        "ls / | where size > 100kb | sort-by size | select name size", NULL };
-        int p2 = process_create("/shell.elf", a2, 3, NULL, 0);
+        int p2 = process_create("/system/bin/shell.elf", a2, 3, NULL, 0);
         int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
         if (p2 < 0 || c2 != 0) ok = 0;
 
-        char *a3[] = { "/shell.elf", "-c", "echo $nope", NULL };
-        int p3 = process_create("/shell.elf", a3, 3, NULL, 0);
+        char *a3[] = { "/system/bin/shell.elf", "-c", "echo $nope", NULL };
+        int p3 = process_create("/system/bin/shell.elf", a3, 3, NULL, 0);
         int c3 = p3 >= 0 ? process_wait((uint32_t)p3) : -1;
         if (p3 < 0 || c3 != 1) ok = 0;   /* the error path must exit 1 */
 
@@ -812,11 +813,11 @@ int selftests_handle_command(const char *cmd)
          * save -> cat -> wc -> get -> rm -> ps -> count, with a cd/pwd
          * warm-up. Exercises the cwd machinery + file round-trip + proc
          * listing in a single shell run. */
-        char *a4[] = { "/shell.elf", "-c",
+        char *a4[] = { "/system/bin/shell.elf", "-c",
                        "cd / | echo \"alpha beta\" | save st-f.txt | cat /st-f.txt "
                        "| wc | get words | rm st-f.txt | mkdir st-d | rmdir st-d "
                        "| ps | count", NULL };
-        int p4 = process_create("/shell.elf", a4, 3, NULL, 0);
+        int p4 = process_create("/system/bin/shell.elf", a4, 3, NULL, 0);
         int c4 = p4 >= 0 ? process_wait((uint32_t)p4) : -1;
         if (p4 < 0 || c4 != 0) ok = 0;
 
@@ -1156,8 +1157,8 @@ int selftests_handle_command(const char *cmd)
             kprintf("\n[cmd] test ctrlc: VFS not registered\n");
             return 1;
         }
-        char *a[] = { "/init.elf", "ctrlc-parent", NULL };
-        int pid = process_create("/init.elf", a, 2, NULL, 0);
+        char *a[] = { "/system/bin/init.elf", "ctrlc-parent", NULL };
+        int pid = process_create("/system/bin/init.elf", a, 2, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test ctrlc: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 42) ? "OK" : "FAIL");
@@ -1165,7 +1166,7 @@ int selftests_handle_command(const char *cmd)
     }
 
     /* The ESCALATION half (docs/INTERRUPTION.md §4.3), against a child that
-     * DECLINES: the shell runs `/init.elf spin` (an embk_sleep_ms loop that
+     * DECLINES: the shell runs `/system/bin/init.elf spin` (an embk_sleep_ms loop that
      * never observes cancellation), the harness injects a real Ctrl+C, and the
      * shell must cancel -> wait out its grace period -> embk_kill -> reap ->
      * exit. Before the pump was made pollable the shell sat in a blocking pipe
@@ -1176,8 +1177,8 @@ int selftests_handle_command(const char *cmd)
             kprintf("\n[cmd] test ctrlc2: VFS not registered\n");
             return 1;
         }
-        char *a[] = { "/shell.elf", "-c", "/init.elf spin", NULL };
-        int pid = process_create("/shell.elf", a, 3, NULL, 0);
+        char *a[] = { "/system/bin/shell.elf", "-c", "/system/bin/init.elf spin", NULL };
+        int pid = process_create("/system/bin/shell.elf", a, 3, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test ctrlc2: shell exit=%d -> %s (completion IS the pass)\n",
                 code, pid >= 0 ? "OK" : "FAIL");
@@ -1192,9 +1193,9 @@ int selftests_handle_command(const char *cmd)
             kprintf("\n[cmd] test git: VFS not registered\n");
             return 1;
         }
-        char *a[] = { "/git.elf", "version", NULL };
+        char *a[] = { "/data/apps/git/git.elf", "version", NULL };
         char *env[] = { "HOME=/", NULL };
-        int pid = process_create_env("/git.elf", a, 2, env, NULL, 0);
+        int pid = process_create_env("/data/apps/git/git.elf", a, 2, env, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test git: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
@@ -1228,16 +1229,16 @@ int selftests_handle_command(const char *cmd)
         }
 
         struct { const char *what; char *argv[8]; int argc; } steps[] = {
-            { "init",   { "/git.elf", "init" }, 2 },
-            { "email",  { "/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
-            { "name",   { "/git.elf", "config", "user.name", "Motsou" }, 4 },
-            { "add",    { "/git.elf", "add", "README.md" }, 3 },
-            { "commit", { "/git.elf", "commit", "-m", "first commit on EmbLinkOS" }, 4 },
-            { "log",    { "/git.elf", "log", "--oneline" }, 3 },
-            { "status", { "/git.elf", "status" }, 2 },
+            { "init",   { "/data/apps/git/git.elf", "init" }, 2 },
+            { "email",  { "/data/apps/git/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
+            { "name",   { "/data/apps/git/git.elf", "config", "user.name", "Motsou" }, 4 },
+            { "add",    { "/data/apps/git/git.elf", "add", "README.md" }, 3 },
+            { "commit", { "/data/apps/git/git.elf", "commit", "-m", "first commit on EmbLinkOS" }, 4 },
+            { "log",    { "/data/apps/git/git.elf", "log", "--oneline" }, 3 },
+            { "status", { "/data/apps/git/git.elf", "status" }, 2 },
         };
         for (unsigned i = 0; i < sizeof steps / sizeof steps[0] && ok; i++) {
-            int pid = process_create_env("/git.elf", steps[i].argv, steps[i].argc,
+            int pid = process_create_env("/data/apps/git/git.elf", steps[i].argv, steps[i].argc,
                                          env, NULL, 0);
             int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
             kprintf("[git %s] exit=%d\n", steps[i].what, code);
@@ -1274,15 +1275,15 @@ int selftests_handle_command(const char *cmd)
         char *env[] = { "HOME=/", "GIT_PAGER=", "PWD=/proj", NULL };
         int ok = 1;
         struct { const char *what; char *argv[8]; int argc; } steps[] = {
-            { "init",   { "/git.elf", "init" }, 2 },
-            { "email",  { "/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
-            { "name",   { "/git.elf", "config", "user.name", "Motsou" }, 4 },
-            { "add",    { "/git.elf", "add", "hello.txt" }, 3 },   /* RELATIVE */
-            { "commit", { "/git.elf", "commit", "-m", "committed from /proj" }, 4 },
-            { "status", { "/git.elf", "status", "--short" }, 3 },
+            { "init",   { "/data/apps/git/git.elf", "init" }, 2 },
+            { "email",  { "/data/apps/git/git.elf", "config", "user.email", "motsou@emblink" }, 4 },
+            { "name",   { "/data/apps/git/git.elf", "config", "user.name", "Motsou" }, 4 },
+            { "add",    { "/data/apps/git/git.elf", "add", "hello.txt" }, 3 },   /* RELATIVE */
+            { "commit", { "/data/apps/git/git.elf", "commit", "-m", "committed from /proj" }, 4 },
+            { "status", { "/data/apps/git/git.elf", "status", "--short" }, 3 },
         };
         for (unsigned i = 0; i < sizeof steps / sizeof steps[0] && ok; i++) {
-            int pid = process_create_env("/git.elf", steps[i].argv, steps[i].argc,
+            int pid = process_create_env("/data/apps/git/git.elf", steps[i].argv, steps[i].argc,
                                          env, NULL, 0);
             int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
             kprintf("[git@/proj %s] exit=%d\n", steps[i].what, code);
@@ -1316,16 +1317,16 @@ int selftests_handle_command(const char *cmd)
         char *env[] = { "HOME=/", "GIT_PAGER=", NULL };
         int ok = 1;
 
-        char *a1[] = { "/shell.elf", "-c", "cd /cwdshell | pwd", NULL };
-        int p1 = process_create_env("/shell.elf", a1, 3, env, NULL, 0);
+        char *a1[] = { "/system/bin/shell.elf", "-c", "cd /cwdshell | pwd", NULL };
+        int p1 = process_create_env("/system/bin/shell.elf", a1, 3, env, NULL, 0);
         int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
         kprintf("[shell cd|pwd] exit=%d\n", c1);
         if (p1 < 0 || c1 != 0) ok = 0;
 
         /* cd, then SPAWN git there. The spawn is the point: a builtin sharing
          * the shell's own cwd proves nothing about what a CHILD sees. */
-        char *a2[] = { "/shell.elf", "-c", "cd /cwdshell | git init", NULL };
-        int p2 = process_create_env("/shell.elf", a2, 3, env, NULL, 0);
+        char *a2[] = { "/system/bin/shell.elf", "-c", "cd /cwdshell | git init", NULL };
+        int p2 = process_create_env("/system/bin/shell.elf", a2, 3, env, NULL, 0);
         int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
         kprintf("[shell cd|git init] exit=%d\n", c2);
 
@@ -1341,9 +1342,9 @@ int selftests_handle_command(const char *cmd)
      * all, before any compiling complicates the answer. */
     if (strcmp(cmd, "test tcc") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test tcc: VFS not registered\n"); return 1; }
-        char *a[] = { "/tcc.elf", "-v", NULL };
+        char *a[] = { "/data/apps/tcc/tcc.elf", "-v", NULL };
         char *env[] = { "HOME=/", NULL };
-        int pid = process_create_env("/tcc.elf", a, 2, env, NULL, 0);
+        int pid = process_create_env("/data/apps/tcc/tcc.elf", a, 2, env, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test tcc: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
@@ -1369,26 +1370,26 @@ int selftests_handle_command(const char *cmd)
             "int add(int a, int b) { return a + b; }\n"
             "int answer(void) { return add(40, 2); }\n";
         {
-            int fd = vfs_open("/t.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = vfs_open("/data/tmp/t.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) { kprintf("test tcc compile: cannot write /t.c\n"); return 1; }
             size_t w = 0;
             vfs_fd_write(fd, src, sizeof src - 1, &w);
             vfs_close(fd);
         }
-        (void)vfs_unlink_path("/t.o");
+        (void)vfs_unlink_path("/data/tmp/t.o");
 
-        char *a[] = { "/tcc.elf", "-c", "/t.c", "-o", "/t.o" };
+        char *a[] = { "/data/apps/tcc/tcc.elf", "-c", "/data/tmp/t.c", "-o", "/data/tmp/t.o" };
         char *env[] = { "HOME=/", NULL };
-        int pid = process_create_env("/tcc.elf", a, 5, env, NULL, 0);
+        int pid = process_create_env("/data/apps/tcc/tcc.elf", a, 5, env, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("[tcc -c] exit=%d\n", code);
 
         /* Read the object back and look at it. */
         unsigned char hdr[20] = {0};
         struct vfs_stat st;
-        int have = (vfs_stat("/t.o", &st) == 0);
+        int have = (vfs_stat("/data/tmp/t.o", &st) == 0);
         if (have) {
-            int fd = vfs_open("/t.o", O_RDONLY, 0);
+            int fd = vfs_open("/data/tmp/t.o", O_RDONLY, 0);
             if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
         }
         int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
@@ -1446,23 +1447,23 @@ int selftests_handle_command(const char *cmd)
             "static int twice(int x) { return x + x; }\n"
             "int main(void) { return twice(21); }\n";
         {
-            int fd = vfs_open("/l.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = vfs_open("/data/tmp/l.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) { kprintf("test tcc link: cannot write /l.c\n"); return 1; }
             size_t w = 0;
             vfs_fd_write(fd, src, sizeof src - 1, &w);
             vfs_close(fd);
         }
-        (void)vfs_unlink_path("/l.elf");
+        (void)vfs_unlink_path("/data/tmp/l.elf");
 
-        char *a[] = { "/tcc.elf", "-static", "-nostdlib", "/l.c", "/crt0.o",
-                      "/syscalls.o", "-L/", "-lc", "-o", "/l.elf" };
+        char *a[] = { "/data/apps/tcc/tcc.elf", "-static", "-nostdlib", "/data/tmp/l.c", "/system/abi/crt0.o",
+                      "/system/abi/syscalls.o", "-L/system/abi", "-lc", "-o", "/data/tmp/l.elf" };
         char *env[] = { "HOME=/", NULL };
         /* Echo the command. It documents what is being asked, and it doubles as
          * a staleness canary: if this line does not appear, you are not running
          * the kernel you just built -- check that BEFORE doubting the compiler. */
         kprintf("[tcc link] %s %s %s %s %s %s %s %s %s\n",
                 a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
-        int pid = process_create_env("/tcc.elf", a, 10, env, NULL, 0);
+        int pid = process_create_env("/data/apps/tcc/tcc.elf", a, 10, env, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("[tcc link] exit=%d\n", code);
 
@@ -1472,9 +1473,9 @@ int selftests_handle_command(const char *cmd)
          * in the kernel, beats extracting the file and guessing on the host. */
         unsigned char hdr[64] = {0};
         struct vfs_stat st;
-        int have = (vfs_stat("/l.elf", &st) == 0);
+        int have = (vfs_stat("/data/tmp/l.elf", &st) == 0);
         if (have) {
-            int fd = vfs_open("/l.elf", O_RDONLY, 0);
+            int fd = vfs_open("/data/tmp/l.elf", O_RDONLY, 0);
             if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
         }
         int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
@@ -1487,8 +1488,8 @@ int selftests_handle_command(const char *cmd)
         /* RUN IT. This is the actual claim. */
         int rcode = -1;
         if (is_exec) {
-            char *b[] = { "/l.elf", NULL };
-            int p2 = process_create_env("/l.elf", b, 1, env, NULL, 0);
+            char *b[] = { "/data/tmp/l.elf", NULL };
+            int p2 = process_create_env("/data/tmp/l.elf", b, 1, env, NULL, 0);
             rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
             kprintf("[tcc link] /l.elf ran: exit=%d (want 42)\n", rcode);
         }
@@ -1554,13 +1555,13 @@ int selftests_handle_command(const char *cmd)
             return 1;
         }
         struct vfs_stat st;
-        if (vfs_stat("/python.elf", &st) != EMBK_OK) {
+        if (vfs_stat("/data/apps/python/python.elf", &st) != EMBK_OK) {
             kprintf("\n[cmd] test python: SKIP -- /python.elf not on the image "
                     "(build it: /home/motsou/cross/configure-py-emblink.sh)\n");
             return 1;
         }
-        char *a[] = { "/python.elf", "-c", "print('hello from CPython on EmbLink')", NULL };
-        int pid = process_create("/python.elf", a, 3, NULL, 0);
+        char *a[] = { "/data/apps/python/python.elf", "-c", "print('hello from CPython on EmbLink')", NULL };
+        int pid = process_create("/data/apps/python/python.elf", a, 3, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test python: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
@@ -1577,41 +1578,41 @@ int selftests_handle_command(const char *cmd)
      * ACROSS ADDRESS SPACES -- the machinery no builtin touches. */
     if (strcmp(cmd, "test extern") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test extern: VFS not registered (need /shell.elf)\n");
+            kprintf("\n[cmd] test extern: VFS not registered (need /system/bin/shell.elf)\n");
             return 1;
         }
         int ok = 1;
 
         /* (1) producer alone: spawn, collect one frame, pretty-print */
-        char *a1[] = { "/shell.elf", "-c", "sysinfo", NULL };
-        int p1 = process_create("/shell.elf", a1, 3, NULL, 0);
+        char *a1[] = { "/system/bin/shell.elf", "-c", "sysinfo", NULL };
+        int p1 = process_create("/system/bin/shell.elf", a1, 3, NULL, 0);
         int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
         if (p1 < 0 || c1 != 0) ok = 0;
 
         /* (2) producer into a builtin: the collected record flows on */
-        char *a2[] = { "/shell.elf", "-c", "sysinfo | get processes", NULL };
-        int p2 = process_create("/shell.elf", a2, 3, NULL, 0);
+        char *a2[] = { "/system/bin/shell.elf", "-c", "sysinfo | get processes", NULL };
+        int p2 = process_create("/system/bin/shell.elf", a2, 3, NULL, 0);
         int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
         if (p2 < 0 || c2 != 0) ok = 0;
 
         /* (3) builtin into a CONSUMER external and back into a builtin:
          * the full input path (serialize -> child fd 0 -> EOF -> re-emit) */
-        char *a3[] = { "/shell.elf", "-c", "ls / | tally | get rows", NULL };
-        int p3 = process_create("/shell.elf", a3, 3, NULL, 0);
+        char *a3[] = { "/system/bin/shell.elf", "-c", "ls / | tally | get rows", NULL };
+        int p3 = process_create("/system/bin/shell.elf", a3, 3, NULL, 0);
         int c3 = p3 >= 0 ? process_wait((uint32_t)p3) : -1;
         if (p3 < 0 || c3 != 0) ok = 0;
 
         /* (4) a missing external fails the pipeline cleanly (exit 1) */
-        char *a4[] = { "/shell.elf", "-c", "no-such-tool", NULL };
-        int p4 = process_create("/shell.elf", a4, 3, NULL, 0);
+        char *a4[] = { "/system/bin/shell.elf", "-c", "no-such-tool", NULL };
+        int p4 = process_create("/system/bin/shell.elf", a4, 3, NULL, 0);
         int c4 = p4 >= 0 ? process_wait((uint32_t)p4) : -1;
         if (p4 < 0 || c4 != 1) ok = 0;
 
         /* (5) extern CHAINED INTO extern (the streaming pump both ways):
          * ls's table streams into tally #1, whose record streams into
          * tally #2. */
-        char *a5[] = { "/shell.elf", "-c", "ls / | tally | tally | get rows", NULL };
-        int p5 = process_create("/shell.elf", a5, 3, NULL, 0);
+        char *a5[] = { "/system/bin/shell.elf", "-c", "ls / | tally | tally | get rows", NULL };
+        int p5 = process_create("/system/bin/shell.elf", a5, 3, NULL, 0);
         int c5 = p5 >= 0 ? process_wait((uint32_t)p5) : -1;
         if (p5 < 0 || c5 != 0) ok = 0;
 
@@ -1622,7 +1623,7 @@ int selftests_handle_command(const char *cmd)
     }
 
     /* EmbLink UI Piece 1: cross-address-space shared surfaces. Spawns
-     * /init.elf's "surface-parent" role, which runs S2/S3 (ownership +
+     * /system/bin/init.elf's "surface-parent" role, which runs S2/S3 (ownership +
      * starvation) in-process and S1 (a child inherits the surface and reads a
      * pattern the parent wrote, cross-address-space) exiting 55 iff all pass.
      * Then checks the live-surface count returned to its baseline -- proving
@@ -1630,12 +1631,12 @@ int selftests_handle_command(const char *cmd)
      * the parent and the inheriting child have exited). */
     if (strcmp(cmd, "test surface") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test surface: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test surface: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
         uint32_t live_before = surface_live_count();
-        char *argv[] = { "/init.elf", "surface-parent", NULL };
-        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        char *argv[] = { "/system/bin/init.elf", "surface-parent", NULL };
+        int pid = process_create("/system/bin/init.elf", argv, 2, NULL, 0);
         if (pid < 0) {
             kprintf("\n[cmd] test surface: process_create failed: %s\n", embk_strerror(pid));
             return 1;
@@ -1648,7 +1649,7 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
-    /* EmbLink UI Piece 1, Layer A: IPC channels. Spawns /init.elf's "chan"
+    /* EmbLink UI Piece 1, Layer A: IPC channels. Spawns /system/bin/init.elf's "chan"
      * role, which runs A1/A2/A3 (boundaries + blocking + backpressure, via two
      * threads), A4 + EMSGSIZE (peer-close / oversized recv), and S-chan-3
      * (a surface handle sent COPY then dropped undelivered), exiting 77 iff
@@ -1657,13 +1658,13 @@ int selftests_handle_command(const char *cmd)
      * in-transit ref was released -- A6, no leak). */
     if (strcmp(cmd, "test channel") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test channel: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test channel: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
         uint32_t s_before = surface_live_count();
         uint32_t c_before = channel_live_count();
-        char *argv[] = { "/init.elf", "chan", NULL };
-        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        char *argv[] = { "/system/bin/init.elf", "chan", NULL };
+        int pid = process_create("/system/bin/init.elf", argv, 2, NULL, 0);
         if (pid < 0) {
             kprintf("\n[cmd] test channel: process_create failed: %s\n", embk_strerror(pid));
             return 1;
@@ -1679,7 +1680,7 @@ int selftests_handle_command(const char *cmd)
     }
 
     /* EmbLink UI Piece 1, Layer C: the real compositor loop (spec C.5), for
-     * real. Spawns /init.elf's "compositor" role, which itself spawns a
+     * real. Spawns /system/bin/init.elf's "compositor" role, which itself spawns a
      * "compositor-client" child; the two rendezvous via chan_listen/accept/
      * connect (Layer B, /run/compositor), then the client attaches a surface
      * COPY (S-surf-1 cross-address-space, S-surf-2 ownership, S-surf-3
@@ -1691,14 +1692,14 @@ int selftests_handle_command(const char *cmd)
      * -- a full session's worth of shared state, cleaned up automatically. */
     if (strcmp(cmd, "test compositor") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test compositor: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test compositor: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
         uint32_t s_before = surface_live_count();
         uint32_t c_before = channel_live_count();
         uint32_t e_before = endpoint_live_count();
-        char *argv[] = { "/init.elf", "compositor", NULL };
-        int pid = process_create("/init.elf", argv, 2, NULL, 0);
+        char *argv[] = { "/system/bin/init.elf", "compositor", NULL };
+        int pid = process_create("/system/bin/init.elf", argv, 2, NULL, 0);
         if (pid < 0) {
             kprintf("\n[cmd] test compositor: process_create failed: %s\n", embk_strerror(pid));
             return 1;
@@ -1722,11 +1723,11 @@ int selftests_handle_command(const char *cmd)
      * dangling like a stale Unix socket file. */
     if (strcmp(cmd, "test rendezvous") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test rendezvous: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test rendezvous: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
-        char *argv1[] = { "/init.elf", "b4-listen", NULL };
-        int pid1 = process_create("/init.elf", argv1, 2, NULL, 0);
+        char *argv1[] = { "/system/bin/init.elf", "b4-listen", NULL };
+        int pid1 = process_create("/system/bin/init.elf", argv1, 2, NULL, 0);
         if (pid1 < 0) {
             kprintf("\n[cmd] test rendezvous: spawn listener failed: %s\n", embk_strerror(pid1));
             return 1;
@@ -1742,8 +1743,8 @@ int selftests_handle_command(const char *cmd)
         (void)stat_rc;   /* just proving vfs_stat itself doesn't crash on epfs; the real check is below */
         int stat_rc2 = vfs_stat("/run/b4test", &st);
 
-        char *argv2[] = { "/init.elf", "b4-connect", NULL };
-        int pid2 = process_create("/init.elf", argv2, 2, NULL, 0);
+        char *argv2[] = { "/system/bin/init.elf", "b4-connect", NULL };
+        int pid2 = process_create("/system/bin/init.elf", argv2, 2, NULL, 0);
         if (pid2 < 0) {
             kprintf("\n[cmd] test rendezvous: spawn connector failed: %s\n", embk_strerror(pid2));
             return 1;
@@ -1764,7 +1765,7 @@ int selftests_handle_command(const char *cmd)
 
     /* EmbLink UI Piece 2: the compositor PROTOCOL (message vocabulary over
      * Piece 1 channels -- no new kernel primitive). Each scenario is a ring-3
-     * /init.elf run ("ui-proto <scen>") that drives BOTH the client and
+     * /system/bin/init.elf run ("ui-proto <scen>") that drives BOTH the client and
      * compositor side of a real channel and exits 0 iff the invariant held:
      *   hs        P2-S1  handshake + request_id correlation; version mismatch
      *                    -> HELLO_ACK(-EPROTO) then peer close -> EPIPE (P3)
@@ -1780,14 +1781,14 @@ int selftests_handle_command(const char *cmd)
      *                    never broadcast to B */
     if (strcmp(cmd, "test ui") == 0) {
         if (!g_vfs_ready) {
-            kprintf("\n[cmd] test ui: VFS not registered (need /init.elf on disk)\n");
+            kprintf("\n[cmd] test ui: VFS not registered (need /system/bin/init.elf on disk)\n");
             return 1;
         }
         static const char *scen[] = { "hs", "reorder", "privilege", "pacing", "routing" };
         bool all = true;
         for (int i = 0; i < 5; i++) {
-            char *argv[] = { "/init.elf", "ui-proto", (char *)scen[i], NULL };
-            int pid = process_create("/init.elf", argv, 3, NULL, 0);
+            char *argv[] = { "/system/bin/init.elf", "ui-proto", (char *)scen[i], NULL };
+            int pid = process_create("/system/bin/init.elf", argv, 3, NULL, 0);
             if (pid < 0) {
                 kprintf("\n[cmd] test ui: %s: process_create failed: %s\n",
                         scen[i], embk_strerror(pid));
@@ -1931,6 +1932,53 @@ int selftests_handle_command(const char *cmd)
  * embkfs_lookup_path the VFS uses and asserts the exact bytes. Proves what the
  * in-process + oracle checks cannot: that a mkfs-baked multi-level tree is
  * traversable on-metal -- the prerequisite for docs/USERSPACE.md's migration. */
+/* THE USERSPACE LAYOUT (docs/USERSPACE.md §6). Asserts the derived tree is
+ * actually on the boot volume, the loader's ONE hardwired library sits at its new
+ * home, and the deliberate SCOPE decision held (demos + fonts stayed at root).
+ * The loader/boot half is doubly confirmed: home.elf booting AT ALL means the
+ * loader already resolved /system/lib/libembk.so -- if this test's paths were
+ * wrong, there would be no desktop to run it from. */
+    if (strcmp(cmd, "test layout") == 0) {
+        int pass = 0, fail = 0;
+        struct vfs_stat st;
+        #define IS_THERE(pth)  (vfs_stat((pth), &st) == EMBK_OK)
+        #define LCHK(name, cond) do { if (cond) pass++; else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* /system -- sealed region (D2): programs, the toolkit, the ABI. */
+        LCHK("/system/bin/{shell,home,init}.elf",
+             IS_THERE("/system/bin/shell.elf") && IS_THERE("/system/bin/home.elf") &&
+             IS_THERE("/system/bin/init.elf"));
+        LCHK("/system/lib/libembk.so (the loader's target)", IS_THERE("/system/lib/libembk.so"));
+        LCHK("/system/abi/{crt0.o,syscalls.o,libc.a}",
+             IS_THERE("/system/abi/crt0.o") && IS_THERE("/system/abi/syscalls.o") &&
+             IS_THERE("/system/abi/libc.a"));
+
+        /* /data -- mutable state: installed apps + user/scratch dirs. */
+        LCHK("/data/apps/{tcc,git}", IS_THERE("/data/apps/tcc/tcc.elf") &&
+             IS_THERE("/data/apps/git/git.elf"));
+        LCHK("/data/tmp and /data/users/teo exist",
+             IS_THERE("/data/tmp") && IS_THERE("/data/users/teo"));
+
+        /* THE SCOPE DECISION, asserted so a future reader knows it was deliberate:
+         * demos and fonts stayed at ROOT and did NOT move under /system. */
+        LCHK("a demo stayed at root (/uidemo.elf, not /system/bin/uidemo.elf)",
+             IS_THERE("/uidemo.elf") && !IS_THERE("/system/bin/uidemo.elf"));
+        LCHK("fonts stayed at root (/font.ttf, not /system/lib/font.ttf)",
+             IS_THERE("/font.ttf") && !IS_THERE("/system/lib/font.ttf"));
+
+        /* The OLD flat paths must be GONE -- a lingering /system/bin/shell.elf would mean the
+         * migration half-happened (dangerous: two truths for one program). */
+        LCHK("old flat /system/bin/shell.elf is gone", !IS_THERE("/system/bin/shell.elf"));
+        LCHK("old flat /libembk.so is gone", !IS_THERE("/libembk.so"));
+
+        kprintf("\n[cmd] test layout: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef IS_THERE
+        #undef LCHK
+        return 1;
+    }
+
     if (strcmp(cmd, "test dirtree") == 0) {
         if (embkfs_volume_count() < 2) {
             kprintf("\n[cmd] test dirtree: SKIP (boot the fixture as a 2nd volume: "

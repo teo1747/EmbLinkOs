@@ -89,12 +89,28 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
                               struct scope *env) {
     char msg[128];
 
-    /* --- resolve the program path: "foo" -> "/foo.elf", "/x/y.elf" as-is --- */
-    char path[128];
-    if (cmd->name[0] == '/')
+    /* --- resolve the program path (docs/USERSPACE.md D3 §4.2) ---
+     * Absolute path: used as-is. Bare name: searched against an ORDERED,
+     * shell-owned list -- /system/bin first, then /data/apps/<name>/ -- taking
+     * the FIRST that exists. There is deliberately NO PATH env var (§4.2: that is
+     * ambient authority the per-process namespace already grants); the order is
+     * policy and lives HERE, in one visible place. First-match-wins means a name
+     * present in both /system/bin and /data/apps resolves to /system/bin.
+     * 256, not 128: /data/apps/<name>/<name>.elf spells the name TWICE, so a long
+     * app name overflowed the old buffer (snprintf would truncate to a wrong,
+     * silently-different path). */
+    char path[256];
+    struct embk_stat st;
+    if (cmd->name[0] == '/') {
         snprintf(path, sizeof path, "%s", cmd->name);
-    else
-        snprintf(path, sizeof path, "/%s.elf", cmd->name);
+    } else {
+        snprintf(path, sizeof path, "/system/bin/%s.elf", cmd->name);
+        if (embk_stat(path, &st) < 0)
+            snprintf(path, sizeof path, "/data/apps/%s/%s.elf", cmd->name, cmd->name);
+        /* If neither exists, `path` holds the /data/apps candidate and the spawn
+         * below fails with an ENOENT that names it -- an honest miss, not a
+         * silent wrong-file lookup. */
+    }
 
     /* --- argv: each arg evaluated in the driver scope, formatted as text --- */
     char *argv[EXT_ARGV_MAX + 2];

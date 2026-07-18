@@ -399,6 +399,17 @@ inside SYSCALL_PATH_MAX=256 and the shell's 128-byte spawn buffer.
 
 ### 6.1 Migration checklist (one mechanical commit, per §4.4)
 
+**MIGRATED 2026-07-18.** The tree is live on the boot image; the mkfs
+directory-support prerequisite (fe19c9d) made it mechanical. Verified: boot to
+home (loader resolves /system/lib/libembk.so, kernel spawns /system/bin/home.elf),
+`test layout` 9/9 (tree present, demos+fonts deliberately left at root, old flat
+paths gone), `test tcc link` exit=42 (ABI at /system/abi, scratch at /data/tmp),
+`test extern` OK (bare `sysinfo` resolves via the /data/apps fallback), `test
+python` exit=0 (relative ._pth zip resolves after the move). SCOPE NOTE: the EmUI
+demo apps and fonts stayed at root (checklist named only the core + tools);
+migrating them is an additive follow-up.
+
+
 Derived by diffing this tree against audit §1.2 — every hardcoded path,
 accounted for:
 
