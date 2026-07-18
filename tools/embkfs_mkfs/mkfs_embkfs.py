@@ -276,7 +276,7 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 64 * 1024 * 1024):
+def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
     # 64 MB (was 8, was 4). Each bump had the same trigger: one binary grew
     # past the volume and free_blocks went NEGATIVE -- struct.pack('Q') then
     # refuses it, which is the (cryptic) way this failure announces itself.
@@ -297,8 +297,11 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024):
 
     # AUTO-DISCOVER the userland: init.elf + fixtures + every build/*.elf +
     # libembk.so + the font. Adding a new app needs no edit here (see
-    # discover_userland_objects).
-    objects = discover_userland_objects()
+    # discover_userland_objects). A caller may override `objects` to bake a
+    # DIFFERENT tree (make_dirtree_image does, for the nested-directory fixture);
+    # everything downstream is name-agnostic, so nested names just work.
+    if objects is None:
+        objects = discover_userland_objects()
 
     # --- build the metadata B-tree (auto multi-leaf) ---
     # Root lives at META_START (the block right after the superblock); file data
@@ -701,19 +704,84 @@ def discover_userland_objects(build_dir="build"):
 
 def build_root_items(objects, gen, data_start):
     """Build the key-sorted metadata items + data-block list + file layout for a
-    root directory holding `objects` (each `(name, dtype, mode, data)`), with
-    file data laid out contiguously starting at block `data_start`. Shared by
-    make_image so its item-building and leaf-packing aren't duplicated.
+    directory TREE holding `objects` (each `(name, dtype, mode, data)`).
+
+    `name` may contain '/' to place the object in a subdirectory; EVERY
+    intermediate directory is created automatically (S_IFDIR | PERM_DIR). A
+    caller can also pass an explicit directory object (dtype == DT_DIR, data
+    ignored) to create an EMPTY directory -- e.g. /data/tmp with nothing in it.
+
+    Backward compatibility is the contract: an all-flat object list (no '/' in
+    any name) produces BYTE-IDENTICAL output to the pre-directory formatter --
+    the root inode is the only directory, file oids run FIRST_USER_OBJID.. in
+    object order, and every entry lands in the root. That is why the default
+    boot image is unaffected until the layout migration commit changes the names.
+
     Returns (items_sorted, data_blocks, file_layouts, dir_entries)."""
-    items = [(L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
-              L.pack_inode(size=0, blocks=0, links=2, mode=L.S_IFDIR | L.PERM_DIR,
-                           uid=0, gid=0,
-                           atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
-                           generation=gen))]
-    dir_entries, data_blocks, file_layouts = [], [], []
-    oid, blk = L.FIRST_USER_OBJID, data_start
+    def split_path(name: bytes):
+        return tuple(p for p in name.split(b"/") if p)   # drop empty (// or leading /)
+
+    # --- discover the tree, PRESERVING object order for oid + block assignment
+    # so the flat case is unchanged. A node's identity is its component tuple;
+    # the root is the empty tuple (). ---
+    file_objs = []              # (comps, dtype, mode, data) for DT_REG/DT_LNK, in order
+    dir_mode = {(): L.S_IFDIR | L.PERM_DIR}   # component-tuple -> mode (root default)
+    all_dirs = {()}            # every directory that must exist (root + ancestors + explicit)
+    order = []                 # component tuples in CALLER order (for flat-compatible oids)
+
     for name, dtype, mode, data in objects:
-        dir_entries.append((name, oid, dtype))
+        comps = split_path(name)
+        if not comps:
+            raise SystemExit("mkfs: empty object name")
+        order.append(comps)
+        if dtype == L.DT_DIR:
+            dir_mode[comps] = mode
+            all_dirs.add(comps)
+        else:
+            file_objs.append((comps, dtype, mode, data))
+        for i in range(1, len(comps)):          # every ancestor is a directory
+            all_dirs.add(comps[:i])
+
+    # --- assign oids: caller objects in ORDER first (flat byte-identity), then
+    # any auto-created intermediate dirs (sorted, deterministic). ---
+    oid_of = {(): L.OBJID_ROOT}
+    next_oid = L.FIRST_USER_OBJID
+    for comps in order:
+        oid_of[comps] = next_oid
+        next_oid += 1
+    for comps in sorted(all_dirs - set(order) - {()}):
+        oid_of[comps] = next_oid
+        next_oid += 1
+
+    # --- parent -> [(leaf, child_oid, dtype)] for every non-root node ---
+    children = {d: [] for d in all_dirs}
+    for comps in order:                          # caller objects (files, links, explicit dirs)
+        dtype = L.DT_DIR if comps in dir_mode else next(
+            (dt for (c, dt, _m, _d) in file_objs if c == comps), L.DT_REG)
+        children[comps[:-1]].append((comps[-1], oid_of[comps], dtype))
+    for comps in (all_dirs - set(order) - {()}):  # auto-created intermediate dirs
+        children[comps[:-1]].append((comps[-1], oid_of[comps], L.DT_DIR))
+
+    items, dir_entries, data_blocks, file_layouts = [], [], [], []
+
+    # --- directory inodes + their entry items ---
+    for comps in sorted(all_dirs):
+        oid = oid_of[comps]
+        subdirs = sum(1 for (_n, _o, dt) in children[comps] if dt == L.DT_DIR)
+        items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
+                      L.pack_inode(size=0, blocks=0, links=2 + subdirs,
+                                   mode=dir_mode.get(comps, L.S_IFDIR | L.PERM_DIR),
+                                   uid=0, gid=0,
+                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                                   generation=gen)))
+        items.extend(build_dir_entry_items(oid, children[comps]))
+        if comps == ():
+            dir_entries = children[comps]        # returned for compat (unused by callers)
+
+    # --- file/symlink inodes, extents, data (object order -> contiguous blocks) ---
+    blk = data_start
+    for comps, dtype, mode, data in file_objs:
+        oid = oid_of[comps]
         nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
         data_csum = crc32c(data)
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
@@ -724,10 +792,9 @@ def build_root_items(objects, gen, data_start):
         items.extend(build_extent_items(oid, blk, data, gen))
         for i, db in enumerate(build_data_blocks(data)):
             data_blocks.append((blk + i, db))
-        file_layouts.append((name, blk, nblocks, len(data), data_csum))
-        oid += 1
+        file_layouts.append((b"/".join(comps), blk, nblocks, len(data), data_csum))
         blk += nblocks
-    items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
+
     # FIELD-WISE integer key order (object_id, type, offset), matching the
     # kernel's embk_key_cmp -- not a memcmp of the raw little-endian key bytes.
     items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
@@ -843,9 +910,41 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     print(f"  leaf B        : block {LEAFB_BLOCK} ({len(leafB_items)} items, csum 0x{leafB_csum:08X})")
 
 
+# ---------------------------------------------------------------------------
+# Nested-directory fixture. Proves the formatter builds a multi-LEVEL directory
+# tree (not just a flat root) that the kernel can traverse -- the prerequisite
+# for the /system + /data layout migration (docs/USERSPACE.md). Kept small and
+# known-content so `test dirtree` can assert exact bytes at a nested path.
+#
+# Object names carry '/'; build_root_items auto-creates every intermediate
+# directory. Two entries are EXPLICIT empty directories (DT_DIR) to prove those
+# work too -- /data/tmp and /data/users/teo are the real layout's empty dirs.
+# ---------------------------------------------------------------------------
+DIRTREE_PROBE_PATH    = b"system/bin/hello.txt"
+DIRTREE_PROBE_CONTENT = b"hi from /system/bin\n"   # test dirtree asserts these exact bytes
+
+def make_dirtree_image(path: str, size_bytes: int = 1024 * 1024):
+    objects = [
+        (b"top.txt",                 L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"root still holds files beside directories\n"),
+        (DIRTREE_PROBE_PATH,         L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         DIRTREE_PROBE_CONTENT),
+        (b"system/lib/note.txt",     L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"a file two levels down\n"),
+        (b"data/apps/foo/foo.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"three levels down\n"),
+        (b"data/tmp",                L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None),
+        (b"data/users/teo",          L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None),
+    ]
+    make_image(path, size_bytes, objects=objects)
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--encrypted":
+    if len(sys.argv) > 1 and sys.argv[1] == "--dirtree":
+        # Nested-directory fixture: mkfs_embkfs.py --dirtree <path>
+        make_dirtree_image(sys.argv[2] if len(sys.argv) > 2 else "dirtree.img")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--encrypted":
         # Encrypted test fixture: mkfs_embkfs.py --encrypted <path> [passphrase]
         # (v2.2 Phase 4) -- defaults to a fixed test passphrase so automated
         # boot tests can type it via QEMU's monitor without a human present.

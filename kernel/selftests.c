@@ -346,6 +346,7 @@ static void selftests_print_commands(void)
     kprintf("  test usb\n");
     kprintf("  test gpu\n");
     kprintf("  test tty\n");
+    kprintf("  test dirtree\n");
 }
 
 static void run_embkfs_all(void)
@@ -1921,6 +1922,58 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = fat32_vfs_test_mkdir_unlink();
         kprintf("\n[cmd] test fat32 vfs: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+/* THE FORMATTER'S NESTED DIRECTORY SUPPORT, read by the real kernel. mkfs
+ * baked /system/bin/hello.txt et al. into dirtree.img (the 2nd volume via
+ * `make run-dirtree`); this resolves that nested path with the SAME
+ * embkfs_lookup_path the VFS uses and asserts the exact bytes. Proves what the
+ * in-process + oracle checks cannot: that a mkfs-baked multi-level tree is
+ * traversable on-metal -- the prerequisite for docs/USERSPACE.md's migration. */
+    if (strcmp(cmd, "test dirtree") == 0) {
+        if (embkfs_volume_count() < 2) {
+            kprintf("\n[cmd] test dirtree: SKIP (boot the fixture as a 2nd volume: "
+                    "`make run-dirtree`)\n");
+            return 1;
+        }
+        struct embkfs_volume *v = embkfs_volume_at(1);
+        int pass = 0, fail = 0;
+        #define DCHK(name, cond) do { if (cond) pass++; else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* 1. Resolve a THREE-component nested path and read its exact content. */
+        uint64_t oid = 0;
+        int rc = embkfs_lookup_path(v, EMBKFS_ROOT_OBJECT_ID,
+                                    "/system/bin/hello.txt", &oid);
+        DCHK("resolve /system/bin/hello.txt", rc == EMBK_OK && oid != 0);
+        if (rc == EMBK_OK) {
+            uint8_t buf[64]; uint64_t got = 0;
+            memset(buf, 0, sizeof buf);
+            rc = embkfs_read_object(v, oid, buf, sizeof buf, &got);
+            static const char want[] = "hi from /system/bin\n";
+            int match = (rc == EMBK_OK && got == sizeof(want) - 1 &&
+                         memcmp(buf, want, sizeof(want) - 1) == 0);
+            DCHK("content of the nested file is exact", match);
+            kprintf("  read %llu bytes: \"%s\"\n", (unsigned long long)got, (char *)buf);
+        }
+
+        /* 2. An EXPLICIT empty directory resolves (proves DT_DIR baking). */
+        uint64_t d = 0;
+        DCHK("resolve empty dir /data/tmp",
+             embkfs_lookup_path(v, EMBKFS_ROOT_OBJECT_ID, "/data/tmp", &d) == EMBK_OK && d != 0);
+        DCHK("resolve deep dir /data/apps/foo",
+             embkfs_lookup_path(v, EMBKFS_ROOT_OBJECT_ID, "/data/apps/foo", &d) == EMBK_OK && d != 0);
+
+        /* 3. Non-vacuous: a path THROUGH a non-existent directory must FAIL, not
+         *    silently succeed -- otherwise "resolves" proves nothing. */
+        uint64_t bad = 0;
+        DCHK("bogus /system/nope/x.txt is refused",
+             embkfs_lookup_path(v, EMBKFS_ROOT_OBJECT_ID, "/system/nope/x.txt", &bad) != EMBK_OK);
+
+        kprintf("\n[cmd] test dirtree: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef DCHK
         return 1;
     }
 
