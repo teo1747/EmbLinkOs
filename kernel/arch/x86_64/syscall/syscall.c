@@ -1450,9 +1450,10 @@ static int64_t sys_chan_connect(struct regs *r) {
 
 static int64_t sys_tty_mode(struct regs *r) {
     int mode = (int)r->rdi;
-    if (mode < 0 || mode > 2) return -EMBK_EINVAL;
-    tty_set_mode(mode);
-    return 0;
+    if (mode != TTY_COOKED && mode != TTY_RAW) return -EMBK_EINVAL;
+    enum tty_mode old = tty_get_mode();
+    tty_set_mode((enum tty_mode)mode);
+    return (uint64_t)old;
 }
 
 /* --- The table: index = syscall number --- */

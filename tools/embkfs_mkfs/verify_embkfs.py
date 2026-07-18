@@ -535,6 +535,84 @@ def main(path, passphrase=None):
         link_oid, _link_type = lookup(b"hello.lnk")
         read_object(link_oid)
 
+    # ---------------------------------------------------------------
+    # 4. WALK THE WHOLE DIRECTORY TREE (recursive)
+    # ---------------------------------------------------------------
+    # §3 resolves names in the ROOT only. That could not vet a NESTED image
+    # (docs/USERSPACE.md's /system + /data), so this descends the entire tree and
+    # verifies the structural invariants a flat check never touched:
+    #   - every directory inode is actually S_IFDIR;
+    #   - every entry resolves to an EXISTING inode whose type MATCHES the entry's
+    #     dtype (DT_DIR<->S_IFDIR, DT_REG<->S_IFREG, DT_LNK<->S_IFLNK);
+    #   - no cycles (a dir reached twice);
+    #   - no orphans (every inode is reachable from root -- a file with no path
+    #     is corruption the root-only check could never surface).
+    # Structure only, deliberately: content/extent/checksum verification is §3's
+    # job and stays there (it handles encryption); the tree walk must run on every
+    # image, encrypted or not.
+    print("\n== 4. Walk the directory tree ==")
+
+    DTYPE_MODE = {L.DT_DIR: L.S_IFDIR, L.DT_REG: L.S_IFREG, L.DT_LNK: L.S_IFLNK}
+
+    def decode_dir(dir_oid):
+        """Every (name, target_oid, dtype) in dir_oid, walking each collision
+        chain -- the generalization of lookup() to a full listing."""
+        out = []
+        for (_o, _t, _off, de_data) in find_items(dir_oid, L.EMBK_TYPE_DIR_ENTRY):
+            off = 0
+            while off + L.DIR_ENTRY_FIXED_SIZE <= len(de_data):
+                tgt, ttype, nlen, _r = struct.unpack_from(L.DIR_ENTRY_FIXED_FMT, de_data, off)
+                end = off + L.DIR_ENTRY_FIXED_SIZE + nlen
+                if end > len(de_data):
+                    die(f"dir {dir_oid}: a record name runs past its item")
+                out.append((de_data[off + L.DIR_ENTRY_FIXED_SIZE:end], tgt, ttype))
+                off = end
+            if off != len(de_data):
+                die(f"dir {dir_oid}: trailing bytes after last dir-entry record")
+        return out
+
+    def inode_mode_of(oid):
+        fi = find_item(oid, L.EMBK_TYPE_INODE, 0)
+        if not fi:
+            die(f"dir entry points at object {oid}, which has no inode (dangling)")
+        return struct.unpack(L.INODE_FMT, fi[3])[3]
+
+    reached = {L.OBJID_ROOT}
+    counts = {"dir": 1, "file": 0, "link": 0}   # root pre-counted
+
+    def walk(dir_oid, path, stack):
+        if dir_oid in stack:
+            die(f"directory cycle: object {dir_oid} reached twice (at {path or '/'})")
+        stack = stack | {dir_oid}
+        for name, toid, ttype in sorted(decode_dir(dir_oid)):
+            childpath = f"{path}/{name.decode(errors='replace')}"
+            mode = inode_mode_of(toid) & L.S_IFMT
+            want = DTYPE_MODE.get(ttype)
+            if want is None:
+                die(f"{childpath}: dir entry has unknown dtype {ttype}")
+            if mode != want:
+                die(f"{childpath}: entry dtype {ttype} but inode mode is 0o{mode:o}")
+            reached.add(toid)
+            if ttype == L.DT_DIR:
+                counts["dir"] += 1
+                print(f"  DIR  {childpath}/  (object {toid})")
+                walk(toid, childpath, stack)
+            elif ttype == L.DT_LNK:
+                counts["link"] += 1
+                print(f"  LNK  {childpath}  (object {toid})")
+            else:
+                counts["file"] += 1
+                print(f"  file {childpath}  (object {toid})")
+
+    walk(L.OBJID_ROOT, "", set())
+
+    all_inodes = {oid for (oid, typ, _off, _d) in items if typ == L.EMBK_TYPE_INODE}
+    orphans = all_inodes - reached
+    if orphans:
+        die(f"unreachable inode(s) with no directory entry: {sorted(orphans)}")
+    print(f"  tree OK: {counts['dir']} dir(s), {counts['file']} file(s), "
+          f"{counts['link']} symlink(s); all {len(all_inodes)} inodes reachable")
+
     print("\nALL CHECKS PASSED — image is a valid EMBKFS volume.")
 
 
