@@ -1969,7 +1969,7 @@ int selftests_handle_command(const char *cmd)
 
         /* The OLD flat paths must be GONE -- a lingering /system/bin/shell.elf would mean the
          * migration half-happened (dangerous: two truths for one program). */
-        LCHK("old flat /system/bin/shell.elf is gone", !IS_THERE("/system/bin/shell.elf"));
+        LCHK("old flat /shell.elf is gone", !IS_THERE("/shell.elf"));
         LCHK("old flat /libembk.so is gone", !IS_THERE("/libembk.so"));
 
         kprintf("\n[cmd] test layout: %s (%d/%d)\n",

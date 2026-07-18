@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define INIT_PROGRAM_PATH "/init.elf"
+#define INIT_PROGRAM_PATH "/system/bin/init.elf"
 
 /* the new user_stub — runs in ring 3, calls write then exit.
  *

@@ -262,7 +262,7 @@ static void test_dir_errors(void) {
 
     /* A FILE is not a directory: this must be ENOTDIR, not ENOENT. */
     CK_FAILS("opendir(a file) -> ENOTDIR",
-             (d = opendir("/init.elf")) ? 0 : -1, ENOTDIR);
+             (d = opendir("/posixdemo.elf")) ? 0 : -1, ENOTDIR);
     if (d) closedir(d);
 }
 
@@ -325,9 +325,9 @@ static void test_relative_paths(void) {
     printf("relative paths (resolve against the fixed root):\n");
 
     struct stat a, b;
-    int ra = stat("/init.elf", &a);
-    int rb = stat("init.elf", &b);          /* the SAME file, named relatively */
-    ck("stat(\"init.elf\") == stat(\"/init.elf\")",
+    int ra = stat("/posixdemo.elf", &a);
+    int rb = stat("posixdemo.elf", &b);          /* the SAME file, named relatively */
+    ck("stat(\"posixdemo.elf\") == stat(\"/posixdemo.elf\")",
        ra == 0 && rb == 0 && a.st_size == b.st_size);
 
     /* The exact shape getpath.py needs: a MISSING relative file must be ENOENT
@@ -337,9 +337,9 @@ static void test_relative_paths(void) {
     CK_FAILS("missing relative open -> ENOENT", open("pyvenv.cfg", O_RDONLY), ENOENT);
 
     /* "." and ".." are the VFS path layer's job; "./x" becomes "/./x". */
-    ck("stat(\"./init.elf\") resolves", stat("./init.elf", &b) == 0);
+    ck("stat(\"./posixdemo.elf\") resolves", stat("./posixdemo.elf", &b) == 0);
 
-    int fd = open("init.elf", O_RDONLY);
+    int fd = open("posixdemo.elf", O_RDONLY);
     ck("open(\"init.elf\") relative succeeds", fd >= 0);
     if (fd >= 0) close(fd);
 
@@ -579,12 +579,12 @@ static void test_widechar(void) {
 static void test_stat_access(void) {
     printf("stat / access:\n");
     struct stat a, b;
-    ck("stat(/init.elf)", stat("/init.elf", &a) == 0);
-    ck("lstat(/init.elf)", lstat("/init.elf", &b) == 0);
+    ck("stat(/posixdemo.elf)", stat("/posixdemo.elf", &a) == 0);
+    ck("lstat(/posixdemo.elf)", lstat("/posixdemo.elf", &b) == 0);
     /* lstat == stat is exact here: nothing follows symlinks. */
     ck("lstat agrees with stat (no link following exists)",
        a.st_size == b.st_size && a.st_mode == b.st_mode);
-    ck("access(/init.elf, F_OK)", access("/init.elf", F_OK) == 0);
+    ck("access(/posixdemo.elf, F_OK)", access("/posixdemo.elf", F_OK) == 0);
     CK_FAILS("access(missing) -> ENOENT", access("/nope-xyz", F_OK), ENOENT);
 }
 
@@ -612,7 +612,7 @@ static void test_sysparams(void) {
 static void test_fcntl(void) {
     printf("fcntl descriptor flags:\n");
 
-    int fd = open("/init.elf", O_RDONLY);
+    int fd = open("/posixdemo.elf", O_RDONLY);
     ck("open a file to test against", fd >= 0);
     if (fd < 0) return;
 

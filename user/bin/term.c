@@ -153,8 +153,8 @@ static bool term_spawn_shell(void) {
     acts[2].target_fd = 2;
     acts[2].src_obj_handle = pout[1];
 
-    char *argv[] = { "/shell.elf", NULL };
-    int64_t h = embk_spawn("/shell.elf", argv, acts, 3);
+    char *argv[] = { "/system/bin/shell.elf", NULL };
+    int64_t h = embk_spawn("/system/bin/shell.elf", argv, acts, 3);
 
     /* our copies of the CHILD's ends must go, whatever happened -- EOF
      * accounting depends on it */
