@@ -49,6 +49,7 @@
 #include "kworker/kworker.h"
 
 #include "process/process.h"
+#include "tty/tty.h"
 
 
 extern uint64_t lapic_timer_get_ticks(void);
@@ -548,7 +549,7 @@ void kernel_main(void) {
     // shell context -- the loop below keeps pumping the compositor pointer and
     // USB, and the serial/keyboard REPL stays available as a debug console.
     {
-        char *hargv[] = { (char *)"/home.elf", NULL };
+        char *hargv[] = { (char *)"/system/bin/home.elf", NULL };
         /* The desktop is about to own the framebuffer -- disable the text
          * console's on-screen half BEFORE home becomes a schedulable sibling.
          * Ordering matters: process_create() makes home RUNNABLE, and userspace
@@ -558,11 +559,11 @@ void kernel_main(void) {
          * screen. Disabling first closes that window. All kernel logging + the
          * serial debug console below stay on COM1 and never touch the fb. */
         console_set_fb_enabled(false);
-        int hpid = process_create("/home.elf", hargv, 1, NULL, 0);
+        int hpid = process_create("/system/bin/home.elf", hargv, 1, NULL, 0);
         if (hpid < 0)
-            kprintf("\nhome: failed to launch /home.elf: %s\n", embk_strerror(hpid));
+            kprintf("\nhome: failed to launch /system/bin/home.elf: %s\n", embk_strerror(hpid));
         else
-            kprintf("\nhome: launched /home.elf as pid %d\n", hpid);
+            kprintf("\nhome: launched /system/bin/home.elf as pid %d\n", hpid);
     }
 
     // Main loop (boot CPU): pump the polled drivers (legacy USB + the window

@@ -63,6 +63,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/elf.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
+			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \
@@ -895,6 +896,22 @@ run-usb-xhci: $(IMG) $(DISK) $(USB_STORAGE_IMG)
 # OHCI/EHCI path) -- proves EMBKFS mounts over USB, not just ATA/AHCI.
 usbdisk_embkfs.img: tools/embkfs_mkfs/mkfs_embkfs.py build/init.elf
 	python3 tools/embkfs_mkfs/mkfs_embkfs.py usbdisk_embkfs.img
+
+# Nested-directory fixture (needs no build/ output -- content is inline). Proves
+# the formatter builds a multi-level tree the kernel traverses; pair with
+# `test dirtree` (resolves /system/bin/hello.txt on the 2nd volume). Prerequisite
+# for the /system + /data layout migration (docs/USERSPACE.md).
+dirtree.img: tools/embkfs_mkfs/mkfs_embkfs.py
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py --dirtree dirtree.img
+
+# Boot the default volume at "/" (index 1) PLUS the nested fixture (index 2 ->
+# embkfs_volume_at(1)), so `test dirtree` can resolve nested paths on it.
+run-dirtree: $(IMG) $(DISK) embkfs.img dirtree.img
+	qemu-system-x86_64 \
+	    -drive format=raw,file=$(IMG),if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=dirtree.img,if=ide,index=2 \
+	    -serial stdio -no-reboot -no-shutdown
 
 run-usb-embkfs: $(IMG) $(DISK) usbdisk_embkfs.img
 	qemu-system-x86_64 $(DRIVES) \

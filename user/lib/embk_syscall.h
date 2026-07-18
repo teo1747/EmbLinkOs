@@ -96,6 +96,9 @@
 #define EMBK_SYS_key_event_poll 65
 #define EMBK_SYS_key_mods       66
 
+/* tty_mode(mode) -- set TTY mode; returns old mode. */
+#define EMBK_SYS_tty_mode       67
+
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back
  * in rax. r10/r8 (not rcx/r9) for args 4/5 -- rcx and r11 are clobbered by

@@ -303,9 +303,12 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
 static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
                         const struct elf64_phdr *app_ph, uint16_t app_phnum)
 {
+    /* libembk.so is the sealed ABI (docs/USERSPACE.md D2 §3.1); it lives under
+     * /system/lib now, not the old flat root. This is the loader's ONE hardwired
+     * library path -- every dynamic app resolves DT_NEEDED libembk.so here. */
     uint8_t *so_buf = 0; uint64_t so_len = 0;
-    int rc = read_file_kbuf("/libembk.so", &so_buf, &so_len);
-    if (rc < 0) { serial_write_string("ELF dynlink: /libembk.so not found\n"); return rc; }
+    int rc = read_file_kbuf("/system/lib/libembk.so", &so_buf, &so_len);
+    if (rc < 0) { serial_write_string("ELF dynlink: /system/lib/libembk.so not found\n"); return rc; }
 
     if (so_len < sizeof(struct elf64_ehdr)) { kfree(so_buf); return -EMBK_EINVAL; }
     const struct elf64_ehdr *soeh = (const struct elf64_ehdr *)so_buf;
@@ -335,7 +338,7 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
     if (rc == EMBK_OK) rc = apply_relocs(pml4, &so,  mods, 2, sj_v, sj_sz);
 
     if (rc == EMBK_OK)
-        serial_write_string("ELF dynlink: /libembk.so linked\n");
+        serial_write_string("ELF dynlink: /system/lib/libembk.so linked\n");
     kfree(so_buf);
     return rc;
 }

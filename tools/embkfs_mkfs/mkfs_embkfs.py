@@ -276,7 +276,7 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 64 * 1024 * 1024):
+def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
     # 64 MB (was 8, was 4). Each bump had the same trigger: one binary grew
     # past the volume and free_blocks went NEGATIVE -- struct.pack('Q') then
     # refuses it, which is the (cryptic) way this failure announces itself.
@@ -297,8 +297,11 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024):
 
     # AUTO-DISCOVER the userland: init.elf + fixtures + every build/*.elf +
     # libembk.so + the font. Adding a new app needs no edit here (see
-    # discover_userland_objects).
-    objects = discover_userland_objects()
+    # discover_userland_objects). A caller may override `objects` to bake a
+    # DIFFERENT tree (make_dirtree_image does, for the nested-directory fixture);
+    # everything downstream is name-agnostic, so nested names just work.
+    if objects is None:
+        objects = discover_userland_objects()
 
     # --- build the metadata B-tree (auto multi-leaf) ---
     # Root lives at META_START (the block right after the superblock); file data
@@ -631,30 +634,57 @@ def _read_file(path):
         return None
 
 
+# --- the userspace LAYOUT (docs/USERSPACE.md §6) --------------------------
+# The boot image is a TREE, not a flat root. Placement follows the sealed/mutable
+# boundary (D2 §3): the system's own programs + the ABI are sealed under /system;
+# installed applications (every compiler, the sval tools) are mutable state under
+# /data/apps/<name>/. Everything build_root_items can nest, so this is just a
+# name->path map applied at pack time.
+#
+# DELIBERATELY UNMOVED (checklist §6.1 names only the below): the EmUI demo apps
+# and the fonts stay at the root for now -- migrating them is an additive
+# follow-up that would also churn home.c's tiles and every app's font path. The
+# format fixtures (collision chain, symlink) stay at root too; they test the
+# on-disk format, not the layout.
+_SYSTEM_BIN = {"init.elf", "shell.elf", "home.elf"}          # -> /system/bin/
+_APPS       = {"tcc.elf", "python.elf", "git.elf",           # -> /data/apps/<name>/
+               "sysinfo.elf", "tally.elf"}
+
+def _elf_dest(name: str) -> bytes:
+    """Tree path (bytes, no leading slash) for a packed *.elf basename."""
+    if name in _SYSTEM_BIN:
+        return b"system/bin/" + name.encode()
+    if name in _APPS:
+        return f"data/apps/{name[:-4]}/{name}".encode()      # strip '.elf' for the dir
+    return name.encode()                                     # demos etc. stay at root
+
+
 def discover_userland_objects(build_dir="build"):
-    """Assemble the boot image's root-directory objects by DISCOVERING what's
-    been built, so adding a new EmUI app never needs a mkfs edit -- drop
-    user/bin/foo.c in, `make embkfs.img`, and foo.elf appears on the image:
-      - init.elf (required -- the freestanding selftest),
-      - the small on-disk fixtures (regression + collision chain + symlink),
-      - EVERY OTHER build/*.elf found (hello.elf + all EmUI apps, packed by
-        basename),
-      - libembk.so (the shared toolkit the dynamic loader needs), and
-      - a real DejaVu font the UI apps load at runtime,
-    each only if present. Returns a list of (name, dtype, mode, data)."""
+    """Assemble the boot image's objects by DISCOVERING what's been built, placed
+    into the docs/USERSPACE.md tree (see _elf_dest / the sealed-vs-mutable map
+    above). Adding a new EmUI app still needs no mkfs edit -- drop
+    user/bin/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
+    _APPS only if it belongs elsewhere. Returns a list of (name, dtype, mode,
+    data); `name` may contain '/', and build_root_items creates the dirs.
+      - system programs      -> /system/bin/
+      - the shared toolkit   -> /system/lib/libembk.so
+      - the ABI (crt0/syscalls/libc.a) -> /system/abi/
+      - installed apps       -> /data/apps/<name>/
+      - demos, fonts, fixtures -> root (unmoved, see above)
+      - empty /data/tmp and /data/users/teo."""
     init = _read_file(f"{build_dir}/init.elf")
     if init is None:
         raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
-    objects = [(b"init.elf", L.DT_REG, L.S_IFREG | 0o755, init)]
-    objects.extend(FIXTURE_OBJECTS)
-    for elf in sorted(glob.glob(f"{build_dir}/*.elf")):   # sorted -> deterministic image
+    objects = [(_elf_dest("init.elf"), L.DT_REG, L.S_IFREG | 0o755, init)]
+    objects.extend(FIXTURE_OBJECTS)                           # format fixtures, at root
+    for elf in sorted(glob.glob(f"{build_dir}/*.elf")):       # sorted -> deterministic image
         name = os.path.basename(elf)
         if name == "init.elf":
-            continue                                       # already added first
-        objects.append((name.encode(), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+            continue                                          # already added first
+        objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
-        objects.append((b"libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
+        objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
     font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     if font is not None:
         objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
@@ -663,57 +693,118 @@ def discover_userland_objects(build_dir="build"):
     mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     if mono is not None:
         objects.append((b"mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
-    # CPython's standard library, as one zip, plus the ._pth that points sys.path
-    # at it. Neither is a *.elf, so the glob above misses them -- and they are
-    # useless apart: python.elf without the zip dies at startup ("Failed to
-    # import encodings module"), and the zip without the ._pth is never
-    # consulted. Both are optional: a tree with no CPython built simply has
-    # neither (Makefile's HAVE_PY gate).
-    # THE TOOLCHAIN, at the FLAT ROOT. tcc.elf can compile+link a program ON the
-    # OS, but only if the things a link needs are reachable: crt0.o (_start),
-    # syscalls.o (the newlib retargeting layer) and libc.a. mkfs has no
-    # directory support -- the root is flat -- so rather than invent /lib and
-    # /include, they simply live at "/" and tcc is told `-L/`. A flat root is not
-    # a limitation here; it is the whole path search.
-    #
-    # libc.a is ~6.6 MB, by far the biggest single object on the image. It earns
-    # it: without it `tcc t.c -o t.elf` cannot resolve exit(), and the OS cannot
-    # build its own software.
+    # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
+    # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
+    # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into
+    # the sealed region) and links with `-L/system/abi`; it is an app in /data,
+    # not part of the contract. libc.a (~6.6 MB) is the biggest object on the
+    # image and earns it: without it `tcc t.c -o t.elf` cannot resolve exit().
     for tc in ("crt0.o", "syscalls.o"):
         blob = _read_file(f"{build_dir}/{tc}")
         if blob is not None:
-            objects.append((tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+            objects.append((b"system/abi/" + tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
     libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
     if libc is not None:
-        objects.append((b"libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
+        objects.append((b"system/abi/libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
 
+    # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
+    # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the
+    # executable's OWN directory -- so moving all three together needs no ._pth
+    # edit; getpath resolves the zip to /data/apps/python/python314.zip.
     pyzip = _read_file(f"{build_dir}/python314.zip")
     if pyzip is not None:
-        objects.append((b"python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
-    # NOTE the name keeps the ".elf": getpath.py appends "._pth" to the
-    # executable path verbatim on non-Windows, so it looks for exactly
-    # "/python.elf._pth".
+        objects.append((b"data/apps/python/python314.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pyzip))
     pth = _read_file(f"{build_dir}/python.elf._pth")
     if pth is not None:
-        objects.append((b"python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+        objects.append((b"data/apps/python/python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+
+    # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
+    # so a session can chdir into a home and tcc has a scratch dir to write to.
+    objects.append((b"data/tmp",        L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     return objects
 
 
 def build_root_items(objects, gen, data_start):
     """Build the key-sorted metadata items + data-block list + file layout for a
-    root directory holding `objects` (each `(name, dtype, mode, data)`), with
-    file data laid out contiguously starting at block `data_start`. Shared by
-    make_image so its item-building and leaf-packing aren't duplicated.
+    directory TREE holding `objects` (each `(name, dtype, mode, data)`).
+
+    `name` may contain '/' to place the object in a subdirectory; EVERY
+    intermediate directory is created automatically (S_IFDIR | PERM_DIR). A
+    caller can also pass an explicit directory object (dtype == DT_DIR, data
+    ignored) to create an EMPTY directory -- e.g. /data/tmp with nothing in it.
+
+    Backward compatibility is the contract: an all-flat object list (no '/' in
+    any name) produces BYTE-IDENTICAL output to the pre-directory formatter --
+    the root inode is the only directory, file oids run FIRST_USER_OBJID.. in
+    object order, and every entry lands in the root. That is why the default
+    boot image is unaffected until the layout migration commit changes the names.
+
     Returns (items_sorted, data_blocks, file_layouts, dir_entries)."""
-    items = [(L.pack_key(L.OBJID_ROOT, L.EMBK_TYPE_INODE, 0),
-              L.pack_inode(size=0, blocks=0, links=2, mode=L.S_IFDIR | L.PERM_DIR,
-                           uid=0, gid=0,
-                           atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
-                           generation=gen))]
-    dir_entries, data_blocks, file_layouts = [], [], []
-    oid, blk = L.FIRST_USER_OBJID, data_start
+    def split_path(name: bytes):
+        return tuple(p for p in name.split(b"/") if p)   # drop empty (// or leading /)
+
+    # --- discover the tree, PRESERVING object order for oid + block assignment
+    # so the flat case is unchanged. A node's identity is its component tuple;
+    # the root is the empty tuple (). ---
+    file_objs = []              # (comps, dtype, mode, data) for DT_REG/DT_LNK, in order
+    dir_mode = {(): L.S_IFDIR | L.PERM_DIR}   # component-tuple -> mode (root default)
+    all_dirs = {()}            # every directory that must exist (root + ancestors + explicit)
+    order = []                 # component tuples in CALLER order (for flat-compatible oids)
+
     for name, dtype, mode, data in objects:
-        dir_entries.append((name, oid, dtype))
+        comps = split_path(name)
+        if not comps:
+            raise SystemExit("mkfs: empty object name")
+        order.append(comps)
+        if dtype == L.DT_DIR:
+            dir_mode[comps] = mode
+            all_dirs.add(comps)
+        else:
+            file_objs.append((comps, dtype, mode, data))
+        for i in range(1, len(comps)):          # every ancestor is a directory
+            all_dirs.add(comps[:i])
+
+    # --- assign oids: caller objects in ORDER first (flat byte-identity), then
+    # any auto-created intermediate dirs (sorted, deterministic). ---
+    oid_of = {(): L.OBJID_ROOT}
+    next_oid = L.FIRST_USER_OBJID
+    for comps in order:
+        oid_of[comps] = next_oid
+        next_oid += 1
+    for comps in sorted(all_dirs - set(order) - {()}):
+        oid_of[comps] = next_oid
+        next_oid += 1
+
+    # --- parent -> [(leaf, child_oid, dtype)] for every non-root node ---
+    children = {d: [] for d in all_dirs}
+    for comps in order:                          # caller objects (files, links, explicit dirs)
+        dtype = L.DT_DIR if comps in dir_mode else next(
+            (dt for (c, dt, _m, _d) in file_objs if c == comps), L.DT_REG)
+        children[comps[:-1]].append((comps[-1], oid_of[comps], dtype))
+    for comps in (all_dirs - set(order) - {()}):  # auto-created intermediate dirs
+        children[comps[:-1]].append((comps[-1], oid_of[comps], L.DT_DIR))
+
+    items, dir_entries, data_blocks, file_layouts = [], [], [], []
+
+    # --- directory inodes + their entry items ---
+    for comps in sorted(all_dirs):
+        oid = oid_of[comps]
+        subdirs = sum(1 for (_n, _o, dt) in children[comps] if dt == L.DT_DIR)
+        items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
+                      L.pack_inode(size=0, blocks=0, links=2 + subdirs,
+                                   mode=dir_mode.get(comps, L.S_IFDIR | L.PERM_DIR),
+                                   uid=0, gid=0,
+                                   atime=NOW_NS, mtime=NOW_NS, ctime=NOW_NS, btime=NOW_NS,
+                                   generation=gen)))
+        items.extend(build_dir_entry_items(oid, children[comps]))
+        if comps == ():
+            dir_entries = children[comps]        # returned for compat (unused by callers)
+
+    # --- file/symlink inodes, extents, data (object order -> contiguous blocks) ---
+    blk = data_start
+    for comps, dtype, mode, data in file_objs:
+        oid = oid_of[comps]
         nblocks = (len(data) + L.BLOCK_SIZE - 1) // L.BLOCK_SIZE
         data_csum = crc32c(data)
         items.append((L.pack_key(oid, L.EMBK_TYPE_INODE, 0),
@@ -724,10 +815,9 @@ def build_root_items(objects, gen, data_start):
         items.extend(build_extent_items(oid, blk, data, gen))
         for i, db in enumerate(build_data_blocks(data)):
             data_blocks.append((blk + i, db))
-        file_layouts.append((name, blk, nblocks, len(data), data_csum))
-        oid += 1
+        file_layouts.append((b"/".join(comps), blk, nblocks, len(data), data_csum))
         blk += nblocks
-    items.extend(build_dir_entry_items(L.OBJID_ROOT, dir_entries))
+
     # FIELD-WISE integer key order (object_id, type, offset), matching the
     # kernel's embk_key_cmp -- not a memcmp of the raw little-endian key bytes.
     items.sort(key=lambda it: struct.unpack(L.KEY_FMT, it[0]))
@@ -843,9 +933,41 @@ def make_tree_image(path: str, size_bytes: int = 1024 * 1024):
     print(f"  leaf B        : block {LEAFB_BLOCK} ({len(leafB_items)} items, csum 0x{leafB_csum:08X})")
 
 
+# ---------------------------------------------------------------------------
+# Nested-directory fixture. Proves the formatter builds a multi-LEVEL directory
+# tree (not just a flat root) that the kernel can traverse -- the prerequisite
+# for the /system + /data layout migration (docs/USERSPACE.md). Kept small and
+# known-content so `test dirtree` can assert exact bytes at a nested path.
+#
+# Object names carry '/'; build_root_items auto-creates every intermediate
+# directory. Two entries are EXPLICIT empty directories (DT_DIR) to prove those
+# work too -- /data/tmp and /data/users/teo are the real layout's empty dirs.
+# ---------------------------------------------------------------------------
+DIRTREE_PROBE_PATH    = b"system/bin/hello.txt"
+DIRTREE_PROBE_CONTENT = b"hi from /system/bin\n"   # test dirtree asserts these exact bytes
+
+def make_dirtree_image(path: str, size_bytes: int = 1024 * 1024):
+    objects = [
+        (b"top.txt",                 L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"root still holds files beside directories\n"),
+        (DIRTREE_PROBE_PATH,         L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         DIRTREE_PROBE_CONTENT),
+        (b"system/lib/note.txt",     L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"a file two levels down\n"),
+        (b"data/apps/foo/foo.txt",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
+         b"three levels down\n"),
+        (b"data/tmp",                L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None),
+        (b"data/users/teo",          L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None),
+    ]
+    make_image(path, size_bytes, objects=objects)
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--encrypted":
+    if len(sys.argv) > 1 and sys.argv[1] == "--dirtree":
+        # Nested-directory fixture: mkfs_embkfs.py --dirtree <path>
+        make_dirtree_image(sys.argv[2] if len(sys.argv) > 2 else "dirtree.img")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--encrypted":
         # Encrypted test fixture: mkfs_embkfs.py --encrypted <path> [passphrase]
         # (v2.2 Phase 4) -- defaults to a fixed test passphrase so automated
         # boot tests can type it via QEMU's monitor without a human present.
