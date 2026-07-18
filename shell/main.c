@@ -24,8 +24,37 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+
 
 #define LINE_MAX_LEN 512
+
+/* True when THIS shell's stdin is the machine console and we've put it in raw mode
+ * -- i.e. we own the console session. False under the Terminal app or '-c'
+ * (stdin is a pipe, not the console): then the global console mode is someone
+ * else's property and we must never touch it. same fstat-shape probe as sval.c's
+ * fd_is_fifo, for the same reason: ride the standard stat shape the newlib stub 
+ *already fills. */
+static int g_console_session = 0;
+
+static bool stdin_is_console(void) {
+    struct stat st;
+    if (fstat(0, &st) != 0) return false;
+    return S_ISCHR(st.st_mode);                         /* the console fstats as a character device */
+}
+
+/* The termions dance, EmbLink edition. Suspend = hand the line discipline back to
+ * the tty (cooked) for the lifetime of a foreground child, so a child that reads
+ * stdin gets echo/editing/^D-EOF from the kernel, knowing nothing about this shell.
+ * Resume = take it back for our own editor. Both are no-ops unless we own the session,
+ * so eval_extern can call them unconditionally. */
+void shell_tty_suspend(void) {
+    if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);
+}
+
+void shell_tty_resume(void) {
+    if (g_console_session) embk_tty_mode(EMBK_TTY_RAW);
+}
 
 static void puts1(const char *s) { write(1, s, strlen(s)); }
 
@@ -152,6 +181,19 @@ static int read_line(char *buf, size_t cap) {
             }
             continue;
         }
+        if (c == 0x04) {                            /* ^D = EOF */
+            if (len == 0) return -1;             /* empty line = leave */
+            continue;                            /* non-empty line = ignore */
+        }
+        if (c == 0x03) {                            /* ^C = abandon this line, re-prompt.
+                                                     * The line is NOT hist_push'd (that is
+                                                     * the Enter path only), so a killed
+                                                     * line never enters history -- Up then
+                                                     * recalls the previous REAL command. */
+            puts1("^C\n");
+            buf[0] = '\0';
+            return 0;                            /* empty line: main loop re-prompts */
+        }
         if ((unsigned char)c < 0x20) continue;  /* ignore other control chars */
         if (len + 1 < cap) {
             buf[len++] = c;
@@ -191,6 +233,20 @@ int main(int argc, char **argv) {
     scope_init(&top, NULL);
     seed_default_env();
 
+
+    if (stdin_is_console()) {
+        embk_tty_mode(EMBK_TTY_RAW);
+        /* At OUR prompt, ^C is a LINE-EDIT key (kill the input line), NOT a
+         * cancellation -- so route it to NOBODY, which makes it arrive as the
+         * byte 0x03 that read_line handles. Routing ^C to SELF was wrong: it
+         * cancels this process, and the cancel flag is STICKY with no way to
+         * clear it, so the shell could never read again -- one ^C exited it.
+         * eval_extern hands the route to a CHILD for its lifetime (there ^C IS a
+         * real cancellation) and reclaims it -- back to this NOBODY state -- after. */
+        (void)embk_console_interrupt_route(-1);
+        g_console_session = 1;
+    }
+
     /* one-shot mode: shell.elf -c "ls | where size > 1mb" */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         int rc = run_line(argv[2], &top);
@@ -207,6 +263,7 @@ int main(int argc, char **argv) {
         if (strcmp(line, "exit") == 0) break;
         (void)run_line(line, &top);
     }
+    if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);
     scope_free(&top);
     return 0;
 }

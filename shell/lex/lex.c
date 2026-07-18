@@ -270,6 +270,26 @@ static void scan_symbol(struct lexer *L) {
 }
 
 /* -------------------------------------------------------------------------
+ * A PATH that begins with a dot: '.', '..', './x', '../x'. These must lex as a
+ * bare word (an IDENT the shell hands to `cd`/`ls`/...), NOT as the field-access
+ * DOT operator -- otherwise `cd ..` parses as `cd` then two stray DOTs. The main
+ * loop only routes here when a '.' is at a token boundary AND is followed by '/'
+ * or a non-word char; a '.' followed by a WORD char stays the DOT operator, so
+ * `$row.size` / `.field` are untouched. Consumes dots, slashes ('/' is already a
+ * word char) and word chars as one lexeme. */
+static void scan_dot_path(struct lexer *L) {
+    size_t start = L->pos, start_col = L->col;
+    while (true) {
+        char c = peek(L);
+        if (is_word(c) || c == '.') { advance(L); continue; }
+        if (c == '-' && is_word(peek2(L))) { advance(L); continue; }
+        break;
+    }
+    struct token *t = emit(L, TOK_IDENT);
+    if (t) { t->lexeme = L->src + start; t->lexeme_len = L->pos - start; t->col = start_col; }
+}
+
+/* -------------------------------------------------------------------------
  * Main loop
  * ------------------------------------------------------------------------- */
 struct token *lex(const char *src, size_t *out_n) {
@@ -294,6 +314,9 @@ struct token *lex(const char *src, size_t *out_n) {
          * is one path-ish word -- the documented gotcha). */
         else if (c == '/' && !is_word(peek2(&L))) { scan_symbol(&L); }
         else if (is_word(c))        { scan_word(&L, false); }
+        /* '.', '..', './x', '../x' -> a path IDENT, not the DOT operator. A '.'
+         * followed by a WORD char (`.field`) stays DOT below. */
+        else if (c == '.' && (peek2(&L) == '/' || !is_word(peek2(&L)))) { scan_dot_path(&L); }
         else                        { scan_symbol(&L); }
 
         if (L.oom) { lex_free_tokens(L.toks, L.count); return NULL; }

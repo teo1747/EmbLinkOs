@@ -27,6 +27,7 @@
 #include "crypto/xts.h"
 #include "fs/embkfs/embkfs_compress.h"
 #include "gfx/surface.h"
+#include "gfx/compositor.h"   /* compositor_pointer_tick: keep the desktop live while `shell` waits */
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
@@ -307,6 +308,7 @@ static void selftests_print_commands(void)
     kprintf("  test ring3\n");
     kprintf("  test ring3 threads\n");
     kprintf("  test pipe\n");
+    kprintf("  shell            (interactive: run the shell on this console)\n");
     kprintf("  test shell\n");
     kprintf("  test extern\n");
     kprintf("  test cxx\n");
@@ -767,6 +769,36 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* INTERACTIVE shell: spawn /system/bin/shell.elf on the console and wait for
+     * it to exit. Not a self-test -- a way to actually USE the shell from the
+     * kernel debug console. */
+    if (strcmp(cmd, "shell") == 0) {
+        char *sargv[] = { (char *)"/system/bin/shell.elf", NULL };
+        /* Session policy (docs/USERSPACE.md §5): the shell starts in the user's
+         * HOME because THIS spawner NAMES it -- cwd is never inherited; the parent
+         * passes PWD and the child's crt0 seeds cwd from it (HOME too, so tools
+         * resolve there). Without this the shell defaults to / and `pwd` prints /. */
+        char *senv[] = { (char *)"HOME=/data/users/teo",
+                         (char *)"PWD=/data/users/teo", NULL };
+        int pid = process_create_env("/system/bin/shell.elf", sargv, 1, senv, NULL, 0);
+        if (pid < 0) { kprintf("\n[cmd] shell: spawn failed: %s\n", embk_strerror(pid)); return 1; }
+        /* Wait for the shell, but KEEP THE DESKTOP LIVE. A plain process_wait()
+         * blocks THIS context -- the kernel main loop -- and compositor_pointer_
+         * tick() runs HERE (main.c), so a blocking wait freezes home for the
+         * shell's whole lifetime. Poll aliveness instead, pumping the compositor
+         * + USB each pass and hlt-pacing on the ~100Hz timer exactly like the main
+         * loop. We still never drain the keyboard buffer, so the shell keeps
+         * owning fd 0 -- the two-consumer coexistence is unchanged. */
+        while (process_alive((uint32_t)pid)) {
+            usb_poll();
+            compositor_pointer_tick();
+            __asm__ volatile ("hlt");
+        }
+        int code = process_wait((uint32_t)pid);   /* already a zombie -> reaps now */
+        kprintf("\n[cmd] shell: exited with code %d\n", code);
+        return 1;
+    }
+
     /* The structured shell, end to end ON the OS: spawn /system/bin/shell.elf -c "<line>"
      * three times (its stdio is console-inherited, so results land on serial)
      * and assert the exit codes: expression evaluation, a REAL ls pipeline
@@ -844,13 +876,13 @@ int selftests_handle_command(const char *cmd)
             return 1;
         }
         struct vfs_stat st;
-        if (vfs_stat("/cxxdemo.elf", &st) != EMBK_OK) {
+        if (vfs_stat("/data/apps/cxxdemo/cxxdemo.elf", &st) != EMBK_OK) {
             kprintf("\n[cmd] test cxx: SKIP -- /cxxdemo.elf not on the image "
                     "(no C++ toolchain: see `make cxx-check`)\n");
             return 1;
         }
-        char *a[] = { "/cxxdemo.elf", NULL };
-        int pid = process_create("/cxxdemo.elf", a, 1, NULL, 0);
+        char *a[] = { "/data/apps/cxxdemo/cxxdemo.elf", NULL };
+        int pid = process_create("/data/apps/cxxdemo/cxxdemo.elf", a, 1, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test cxx: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
@@ -960,7 +992,7 @@ int selftests_handle_command(const char *cmd)
             kprintf("\n[cmd] test env: VFS not registered\n");
             return 1;
         }
-        char *a[] = { "/posixdemo.elf", NULL };
+        char *a[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
         /* EMBK_EMPTY is set-but-empty on purpose: getenv() must return "" for it,
          * not NULL -- "set to nothing" and "not set" are different answers. */
         char *env[] = {
@@ -970,7 +1002,7 @@ int selftests_handle_command(const char *cmd)
             "EMBK_EMPTY=",
             NULL
         };
-        int pid = process_create_env("/posixdemo.elf", a, 1, env, NULL, 0);
+        int pid = process_create_env("/data/apps/posixdemo/posixdemo.elf", a, 1, env, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test env: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
@@ -1504,7 +1536,7 @@ int selftests_handle_command(const char *cmd)
             kprintf("\n[cmd] test posix: VFS not registered\n");
             return 1;
         }
-        char *a[] = { "/posixdemo.elf", NULL };
+        char *a[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
         /* Bracket the run with the block-layer request counters. Only
          * two numbers set throughput on this path (requests, and their average
          * size), and this is the cheapest place to read them honestly. */
@@ -1514,7 +1546,7 @@ int selftests_handle_command(const char *cmd)
         embkfs_stat_reset();
         embk_blkstat_get(&bs0);
         embkfs_stat_get(&es0);
-        int pid = process_create("/posixdemo.elf", a, 1, NULL, 0);
+        int pid = process_create("/data/apps/posixdemo/posixdemo.elf", a, 1, NULL, 0);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         embk_blkstat_get(&bs1);
         embkfs_stat_get(&es1);
@@ -1962,8 +1994,8 @@ int selftests_handle_command(const char *cmd)
 
         /* THE SCOPE DECISION, asserted so a future reader knows it was deliberate:
          * demos and fonts stayed at ROOT and did NOT move under /system. */
-        LCHK("a demo stayed at root (/uidemo.elf, not /system/bin/uidemo.elf)",
-             IS_THERE("/uidemo.elf") && !IS_THERE("/system/bin/uidemo.elf"));
+        LCHK("a demo moved to /data/apps (/data/apps/uidemo/uidemo.elf, not /uidemo.elf)",
+             IS_THERE("/data/apps/uidemo/uidemo.elf") && !IS_THERE("/uidemo.elf"));
         LCHK("fonts stayed at root (/font.ttf, not /system/lib/font.ttf)",
              IS_THERE("/font.ttf") && !IS_THERE("/system/lib/font.ttf"));
 

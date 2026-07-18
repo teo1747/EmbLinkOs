@@ -68,14 +68,14 @@ static void home_ui(void) {
             }
             VStack(.spacing = 16, .align = Center) {
                 HStack(.spacing = 16) {
-                    tile("UI Demo",  "/uidemo.elf");
-                    tile("Windows",  "/wmdemo.elf");
-                    tile("Menus",    "/v6demo.elf");
+                    tile("UI Demo",  "/data/apps/uidemo/uidemo.elf");
+                    tile("Windows",  "/data/apps/wmdemo/wmdemo.elf");
+                    tile("Menus",    "/data/apps/v6demo/v6demo.elf");
                 }
                 HStack(.spacing = 16) {
-                    tile("V4 Demo",  "/v4demo.elf");
-                    tile("Editor",   "/v7demo.elf");
-                    tile("Terminal", "/term.elf");
+                    tile("V4 Demo",  "/data/apps/v4demo/v4demo.elf");
+                    tile("Editor",   "/data/apps/v7demo/v7demo.elf");
+                    tile("Terminal", "/data/apps/term/term.elf");
                 }
             }
         }
@@ -143,7 +143,7 @@ int main(void) {
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
 
     em_set_clock(embk_uptime_ms);
-    spawn_app("/clockw.elf");   /* the desktop CLOCK widget (V5) -- fire & track */
+    spawn_app("/data/apps/clockw/clockw.elf");   /* the desktop CLOCK widget (V5) -- fire & track */
     embk_puts(1, "home: launcher up; click a tile to launch an app\n");
 
     for (;;) {

@@ -31,6 +31,9 @@
 #include <stdio.h>
 #include <unistd.h>
 
+extern void shell_tty_suspend(void);   /* main.c: cooked for the child's lifetime */
+extern void shell_tty_resume(void);
+
 /* Scratch fds for the shell's own ends of the plumbing. Above stdio+fd3,
  * below anything vfs_open would hand out mid-pipeline in practice. */
 #define EXT_FD_INPUT_WRITE 10
@@ -168,6 +171,8 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
         nact++;
     }
 
+    shell_tty_suspend();
+
     /* --- spawn ---
      * The child gets THE SHELL'S OWN environment, and gets it because this line
      * names it. Nothing is inherited on EmbLink: a child receives only what its
@@ -190,6 +195,8 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
         embk_close_handle(pa[0]); embk_close_handle(pa[1]);
         if (has_input) { embk_close_handle(pb[0]); embk_close_handle(pb[1]); }
         wire_buf_free(&inframe);
+        shell_tty_resume();   /* suspend() ran BEFORE the spawn, so undo it even
+                               * when the child never came to exist */
         snprintf(msg, sizeof msg, "%s: can't run (err %d)", cmd->name, (int)-child);
         return value_error(msg);
     }
@@ -203,6 +210,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
         embk_close_handle(pa[0]);
         if (has_input) { embk_close_handle(pb[1]); }
         wire_buf_free(&inframe);
+        shell_tty_resume();
         embk_wait((int)child);
         return value_error("fd install failed");
     }
@@ -211,8 +219,9 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     if (has_input) {
         if (embk_fd_install_obj(pb[1], EXT_FD_INPUT_WRITE) < 0) {
             embk_close_handle(pb[1]);
-            close(EXT_FD_OUTPUT_READ);
+            embk_close_handle(EXT_FD_OUTPUT_READ);
             wire_buf_free(&inframe);
+            shell_tty_resume();
             embk_wait((int)child);
             return value_error("fd install failed");
         }
@@ -246,7 +255,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
              * replaced, which fired only under scheduler pressure. */
         }
         if (off >= inframe.len) {
-            close(EXT_FD_INPUT_WRITE);           /* EOF to the child */
+            embk_close_handle(EXT_FD_INPUT_WRITE);           /* EOF to the child */
             in_open = false;
             progress = true;
         }
@@ -275,7 +284,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
             embk_yield();
         }
     }
-    if (in_open) close(EXT_FD_INPUT_WRITE);      /* error exit mid-feed */
+    if (in_open) embk_close_handle(EXT_FD_INPUT_WRITE);      /* error exit mid-feed */
     wire_buf_free(&inframe);
 
     /* --- stdin done: drain the output to EOF --- */
@@ -333,6 +342,12 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
      * unconditionally -- a route left pointing at a reaped child makes the next
      * ^C silently do nothing, which reads as a bug rather than a stale route. */
     (void)embk_console_interrupt_route(-1);
+
+    /* Console back in the shell's hands -> its own line editing resumes. One
+     * resume here covers all three returns below. Route-clear and cooked-undo
+     * are the same event ("the child no longer owns the console"), after the
+     * same reap -- which is why they sit together. */
+    shell_tty_resume();
 
     if (rc < 0) {
         value_free(&collected);

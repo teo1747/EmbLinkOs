@@ -154,7 +154,12 @@ static bool term_spawn_shell(void) {
     acts[2].src_obj_handle = pout[1];
 
     char *argv[] = { "/system/bin/shell.elf", NULL };
-    int64_t h = embk_spawn("/system/bin/shell.elf", argv, acts, 3);
+    /* Start the shell in the user's HOME (docs/USERSPACE.md §5): cwd is never
+     * inherited, so the terminal -- the session spawner here -- NAMES it via PWD,
+     * and the shell's crt0 seeds cwd from it. Without this the shell defaults to
+     * / and `pwd` prints / in the terminal. */
+    char *senv[] = { "HOME=/data/users/teo", "PWD=/data/users/teo", NULL };
+    int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
     /* our copies of the CHILD's ends must go, whatever happened -- EOF
      * accounting depends on it */

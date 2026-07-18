@@ -641,22 +641,19 @@ def _read_file(path):
 # /data/apps/<name>/. Everything build_root_items can nest, so this is just a
 # name->path map applied at pack time.
 #
-# DELIBERATELY UNMOVED (checklist §6.1 names only the below): the EmUI demo apps
-# and the fonts stay at the root for now -- migrating them is an additive
-# follow-up that would also churn home.c's tiles and every app's font path. The
-# format fixtures (collision chain, symlink) stay at root too; they test the
-# on-disk format, not the layout.
+# Only the system's own programs are sealed under /system/bin; EVERY other *.elf
+# is an installed application and lives in /data/apps/<name>/ (D2 §3.2: "all
+# installed applications" -- the EmUI demos, the sval tools, the compilers, the
+# test binaries). Fonts and the format fixtures are NOT *.elf and are placed
+# separately (fonts at root, fixtures at root -- they test the format, not the
+# layout).
 _SYSTEM_BIN = {"init.elf", "shell.elf", "home.elf"}          # -> /system/bin/
-_APPS       = {"tcc.elf", "python.elf", "git.elf",           # -> /data/apps/<name>/
-               "sysinfo.elf", "tally.elf"}
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
     if name in _SYSTEM_BIN:
         return b"system/bin/" + name.encode()
-    if name in _APPS:
-        return f"data/apps/{name[:-4]}/{name}".encode()      # strip '.elf' for the dir
-    return name.encode()                                     # demos etc. stay at root
+    return f"data/apps/{name[:-4]}/{name}".encode()          # every other app: /data/apps/<name>/
 
 
 def discover_userland_objects(build_dir="build"):
