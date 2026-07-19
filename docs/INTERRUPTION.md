@@ -136,6 +136,13 @@ and:
 - The flag is **sticky**: once cancelled, subsequent blocking calls keep failing.
   A program cannot accidentally "miss" it by being between calls, and cleanup
   code that itself blocks would deadlock if the flag auto-cleared.
+- The same stickiness is why kernel-internal sleeping locks
+  (`kernel/process/ksync.{c,h}`) keep an **uninterruptible** default:
+  `mutex_lock`/`sem_wait` ignore the flag and sleep until real release, so a
+  cleanup path can still take a lock *after* cancellation. Callers that guard a
+  long wait opt into `mutex_lock_interruptible`/`sem_wait_interruptible`, which
+  return `-ECANCELED` when cancelled while they would block — same
+  completed-op-wins ordering (an uncontended acquire always succeeds).
 
 Why `ECANCELED` and **not** `EINTR`: `EINTR` means *"restart me"*, and correct
 POSIX programs loop on it — which would defeat the cancellation entirely.
