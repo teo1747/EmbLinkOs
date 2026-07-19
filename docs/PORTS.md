@@ -68,7 +68,11 @@ needed them, not because a checklist said so:
 - **git** → `/dev/null`, **atomic `rename`** (its lockfile protocol depends on
   the victim being torn down in the *same* commit), `ftruncate`, `chmod`, and a
   real `unlink` (whose stub had been a stale lie).
-- **TCC** → `libc.a` on the image, and proof the flat root is a real search path.
+- **TCC** → `libc.a` + both header trees on the image (`/system/abi/include`,
+  `/data/apps/tcc/include`), the GCC type-macro predefines (patch 0002), and —
+  while proving the tally rebuild — a real shell bug (the extern-consumer EOF
+  close) and a real kernel bug (the IF=0 voluntary-block wake leak, ledger
+  Bug 26).
 - **All of them** → the environment (`getenv`) and per-process **cwd**, both
   passed *explicitly at spawn*: nothing is inherited here, a parent names `PWD`
   and the child's crt0 seeds from it.
@@ -231,3 +235,27 @@ our `dup2` colliding with CPython's own (fixed by making the libc's **weak** —
 libc stub must yield to an app shipping its own).
 
 When in doubt, check mkfs's `src fingerprint` line for the packed binary.
+
+## Ports considered and deliberately deferred (with the reason on record)
+
+- **GNU make** — deferred, not because recipes need `/bin/sh` here (audited:
+  every userland recipe is one argv = one `spawn()`), but because the *only*
+  thing a make port buys is compatibility with foreign trees — and the host
+  Makefile can't run on-OS regardless (cross-gcc paths, GNU-make-4.3 features,
+  host Python for mkfs). Rebuild-self goes to a **native structured build
+  tool** (targets as typed records, recipes as argv arrays, staleness by
+  content hash — the RTC's one-second mtimes against millisecond compiles make
+  timestamp staleness structurally false-fresh here). make arrives later as
+  opt-in compat when a foreign tree (rebuilding git/CPython on-OS) demands it,
+  alongside the sh/sed dragnet that story implies.
+- **clang / clangd** — unlike GCC, *not* structurally impossible: modern clang
+  runs cc1 in-process (`-fintegrated-cc1`) and lld links as a library, and
+  clangd's core is in-process too. What defers them is cost vs. value: an
+  LLVM cross-build against newlib with no mmap and a single-threaded
+  libstdc++ is a CPython-port-times-twenty effort, for C capability TCC
+  already delivers — and clangd additionally needs an LSP client that doesn't
+  exist on-OS. The one future thing that would justify the climb is **C++
+  compiled on-OS** (TCC can never do that). The near-term path to the *felt*
+  value (diagnostics while editing on-OS) is the V7 TextEditor spawning
+  `tcc -c` with piped stderr and parsing `file:line:` — every piece already
+  shipped and proven.

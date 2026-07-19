@@ -10,11 +10,15 @@ graphical desktop (`home.elf`), runs multiple windowed apps with a real
 compositor, and has a from-scratch UI toolkit (**EmUI**) that friends can
 build apps against without touching kernel code.
 
-**It also compiles C on itself.** A C compiler (TCC) runs as a normal process
-and produces working programs without ever leaving the OS — compile, assemble,
-link, run. It hosts **C++/libstdc++**, **CPython 3.14** and **git 2.49** too,
-none of them forks. All of that on an OS that is deliberately **not POSIX**:
-there is no `fork`/`exec` here, which is exactly why the compiler is TCC (one
+**It also compiles C on itself — real C, headers and all.** A C compiler (TCC)
+runs as a normal process and builds working programs without ever leaving the
+OS: `#include <stdio.h>` resolves against the on-image newlib headers, `-lc`
+links the real `libc.a`, and the result runs. The OS has even **rebuilt one of
+its own tools from source** (`tally`, compiled and linked on-OS, then run
+through the shell's live pipeline against the original as an A/B oracle). It
+hosts **C++/libstdc++**, **CPython 3.14** and **git 2.49** too, none of them
+forks. All of that on an OS that is deliberately **not POSIX**: there is no
+`fork`/`exec` here, which is exactly why the compiler is TCC (one
 self-contained binary) and not GCC (a driver that fork/execs `cc1`/`as`/`ld`,
 and so is structurally impossible here). See [docs/PORTS.md](docs/PORTS.md).
 
@@ -79,8 +83,11 @@ toolkit apps are built against.
 - A newlib-based libc port (freestanding, static-newlib, and
   dynamically-linked-against-`libembk.so` build modes) — see
   [user/README.md](user/README.md).
-- **A C compiler on the OS** — TCC compiles, assembles and links a program into
-  a running process, entirely on the metal (`test tcc link` → `exit=42`).
+- **A C compiler on the OS** — TCC compiles, assembles and links real
+  `#include`-using programs against the on-image newlib headers and `libc.a`,
+  entirely on the metal (`test tcc real` → `exit=42`, byte-exact stdio output;
+  `test tcc tally` → the OS rebuilds its own `tally` tool from source and runs
+  it through the shell's pipeline).
 - **C++/libstdc++, CPython 3.14, git 2.49** run as ordinary processes —
   see [docs/PORTS.md](docs/PORTS.md).
 - A structured, Nushell-flavored **shell** with typed pipelines —

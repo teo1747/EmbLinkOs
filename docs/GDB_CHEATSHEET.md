@@ -246,3 +246,54 @@ stepi                  ; step one instruction at a time
 x/10i $pc              ; show next 10 instructions
 info registers
 ```
+## Diagnosing a "hang" without GDB: the QEMU monitor RIP dump
+
+Often faster than a full GDB session, and it works on an already-running VM.
+Launch with a monitor socket:
+
+```bash
+qemu-system-x86_64 ... -monitor unix:/tmp/mon.sock,server,nowait
+```
+
+When the machine goes quiet:
+
+```bash
+printf "info registers\n" | nc -U /tmp/mon.sock | grep -E "RIP|RFL|HLT"
+x86_64-elf-addr2line -e kernel/kernel.elf -f 0x<RIP>
+```
+
+One command turns "silent freeze" into a file:line. Read `RFL` too:
+`RFL=00000002` means **IF=0** — combined with `HLT=1` that is a permanently
+sleeping CPU (this exact readout pinned ledger Bug 26, the IF=0
+voluntary-block wake leak, at `ata_wait_irq`'s `hlt`). Sample twice a few
+seconds apart: a *moving* RIP means the machine is alive and something
+higher-level is stuck (a process-level wedge, not a kernel hang).
+
+Two caveats learned the hard way:
+- A single sample can land inside any cli window or IRQ handler — don't
+  over-read one IF=0 sample from a *running* machine; the parked-in-HLT case
+  is the meaningful one.
+- Under TCG with the desktop compositing, the guest clock runs at a fraction
+  of wall speed — "no output for a minute" is routinely slow, not hung.
+
+## Batch GDB against the live kernel (process-table forensics)
+
+For "who is blocked on what": attach, dump the thread table, detach — no
+breakpoints needed. **Use `-nx`**: the repo's `.gdbinit` sets a breakpoint and
+continues, which hijacks batch scripts.
+
+```bash
+gdb -nx -batch kernel/kernel.elf -ex "target remote :1234" \
+  -ex "set pagination off" \
+  -ex 'p thread_table[0]@12' \
+  -ex 'detach'
+```
+
+Notes from use:
+- Attaching PAUSES the guest — that's a feature: a consistent snapshot.
+- Simple `p` expressions work well; `while`-loops over remote structs are
+  unusably slow — flatten to explicit prints or one `@N` array dump.
+- `thread_table[i].state` + `.wait_queue` + `.ctx.rip` (resolve with
+  addr2line) answer "BLOCKED on what?"; a kernel-side selftest that
+  `process_list()`s on timeout (see `test externdiag`) gets the same answer
+  without any host tooling.

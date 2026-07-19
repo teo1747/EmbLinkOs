@@ -1063,3 +1063,25 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
+- [ ] **Native build tool** (the make-equivalent — DECIDED, not yet built).
+  The fork was audited and ratified: a **native structured tool**, not a make
+  port. The deciding facts, each verified against the tree: every userland
+  recipe is one argv = one `spawn()` (no `/bin/sh` buys nothing); the host
+  Makefile cannot run on-OS regardless (no compatibility payoff); the RTC's
+  one-second mtimes against millisecond TCC compiles make timestamp staleness
+  structurally false-fresh (→ staleness by **content hash** of inputs + argv).
+  Shape: targets as typed records (name, sources, `-I`, objects, link inputs,
+  install path), recipes as argv arrays, `/data/src/<project>/` as the source
+  convention, the ABI as ambient constants — the schema `test tcc tally`
+  already executes hand-unrolled. Deliberately absent from v1: variables,
+  pattern rules, parallelism (the real graph is ~50 explicit nodes). Honest
+  rebuild-self scope with TCC: static newlib C only — no `__thread` (no
+  linker scripts/PT_TLS), no `libembk.so` apps, no C++, kernel wants GCC.
+  make itself arrives later as opt-in compat with the foreign-tree ports
+  story. Nice detail available: build it on the sval SDK, which is on-image
+  and already proven self-rebuildable.
+  - [ ] v1 staleness detail: hash file bytes in userspace; exposing a cheap
+    content identity from EMBKFS's CoW generation machinery is a later kernel
+    item, pulled by need.
+  - [ ] Prerequisite already DONE: separate compile-then-link with
+    tcc-produced objects, proven live (`test tcc tally`).
