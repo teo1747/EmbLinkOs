@@ -922,16 +922,17 @@ cannot do). "Self-hosting for C" remains the accurate phrase.
 
 What's left:
 
-1. **The build tool** — the make-equivalent, now the *last named item*
-   between "self-hosting for C" and rebuild-self. Its primitive is already
-   proven end-to-end: `test tcc tally` compiles four translation units on-OS,
-   links the tcc-produced objects in a separate invocation, installs the
-   result, and A/B-runs it against the host-built original through the live
-   shell pipeline. What remains is the orchestrator itself — decided as a
-   **native structured tool** (targets as typed records, recipes as spawn
-   argvs, staleness by content hash; rationale in TODO.md), with a make port
+1. **embbuild** — the make-equivalent, now the *last named item* between
+   "self-hosting for C" and rebuild-self, and the one with a design doc:
+   **[BUILD.md](BUILD.md)**. Its primitive is already proven end-to-end:
+   `test tcc tally` compiles four translation units on-OS, links the
+   tcc-produced objects in a separate invocation, installs the result, and
+   A/B-runs it against the host-built original through the live shell
+   pipeline. What remains is the orchestrator itself — a **native structured
+   tool** (manifest of typed targets, recipes as spawn argvs, staleness by
+   content hash, stage-then-adopt via atomic rename), with a make port
    deferred to the ports/compat story. v1 scope: rebuild tally + sysinfo
-   from `/data/src`.
+   from `/data/src`; second milestone `embbuild embbuild`.
 2. ~~**A real TTY**~~ — **shipped**: the kernel console has a cooked/raw
    line discipline with blocking reads and routed ^C ([INTERRUPTION.md]
    (INTERRUPTION.md)), the shell does its own raw-mode line editing with

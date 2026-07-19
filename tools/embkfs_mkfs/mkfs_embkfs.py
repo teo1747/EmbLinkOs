@@ -772,6 +772,20 @@ def discover_userland_objects(build_dir="build"):
             objects.append((b"data/src/shell/" + rel.encode(),
                             L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
+    # EmbBuild's world (docs/BUILD.md): the tally PROJECT (its source + the
+    # first manifest) at /data/src/tally/, and EmbBuild's own source at
+    # /data/src/embbuild/ -- the precondition for target #3, `embbuild
+    # embbuild`. tally.c appears in BOTH /data/src/shell (the test tcc tally
+    # closure, unchanged) and /data/src/tally (the manifest's project) -- a
+    # 2 KB duplication kept so the existing green test stays untouched;
+    # collapse when embbuild subsumes the hand-rolled test.
+    for host, image in (("shell/tools/tally.c",         b"data/src/tally/tally.c"),
+                        ("shell/tools/tally.build.ebm", b"data/src/tally/build.ebm"),
+                        ("shell/tools/embbuild.c",      b"data/src/embbuild/embbuild.c")):
+        blob = _read_file(host)
+        if blob is not None:
+            objects.append((image, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
     # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
     # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the
     # executable's OWN directory -- so moving all three together needs no ._pth

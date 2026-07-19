@@ -76,6 +76,78 @@ static void cx_cancel_waiter_kthread(void)
     process_exit_self(0);
 }
 
+/* ==== `test embbuild` helpers ============================================ */
+
+/* Naive substring find -- the kernel has no strstr and eight lines beats an
+ * include-world argument. */
+static int emb_find(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (strncmp(p, needle, nl) == 0) return 1;
+    return 0;
+}
+
+/* Spawn `path` with argv, its fd 1 AND fd 2 piped back to us; drain the pipe
+ * into `cap` (NUL-terminated) AND onto the serial log; reap; return the exit
+ * code. This is how the transcript the acceptance run wants gets from a
+ * ring-3 stdout (which is the SCREEN) into the serial record. */
+static int emb_run_cap(const char *path, char **argv, int argc,
+                       char *cap, size_t capsz) {
+    struct process *me = current_process;
+    int rh = -1, wh = -1;
+    size_t used = 0;
+    cap[0] = '\0';
+    if (pipe_create(&rh, &wh) != EMBK_OK) return -1000;
+    struct pipe_end *pe_r = obj_handle_resolve(me, rh, HANDLE_KIND_PIPE);
+    if (!pe_r || fd_install_pipe(me, 9, pe_r->p, 0) != EMBK_OK) {
+        obj_handle_free(me, rh); obj_handle_free(me, wh);
+        return -1001;
+    }
+    struct spawn_file_action acts[2];
+    memset(acts, 0, sizeof acts);
+    acts[0].kind = SPAWN_ACTION_INSTALL_OBJ; acts[0].target_fd = 1; acts[0].src_obj_handle = wh;
+    acts[1].kind = SPAWN_ACTION_INSTALL_OBJ; acts[1].target_fd = 2; acts[1].src_obj_handle = wh;
+    char *env[] = { "HOME=/", NULL };
+    int pid = process_create_env(path, argv, argc, env, acts, 2);
+    obj_handle_free(me, wh);                 /* ours must go or EOF never comes */
+    if (pid < 0) {
+        vfs_close(9); obj_handle_free(me, rh);
+        return -1002;
+    }
+    for (;;) {
+        char buf[256]; size_t got = 0;
+        if (vfs_fd_read(9, buf, sizeof buf - 1, &got) != EMBK_OK || got == 0) break;
+        buf[got] = '\0';
+        kprintf("%s", buf);                  /* the live transcript */
+        if (used + got < capsz - 1) { memcpy(cap + used, buf, got); used += got; }
+    }
+    cap[used] = '\0';
+    vfs_close(9); obj_handle_free(me, rh);
+    return process_wait((uint32_t)pid);
+}
+
+/* Whole-file read into buf (returns length, -1 on error) and whole-buffer
+ * write (O_TRUNC) -- the acceptance run's file surgery. */
+static int emb_read_all(const char *path, char *buf, size_t cap) {
+    int fd = vfs_open(path, O_RDONLY, 0);
+    if (fd < 0) return -1;
+    size_t total = 0, got = 0;
+    while (total < cap - 1 &&
+           vfs_fd_read(fd, buf + total, cap - 1 - total, &got) == EMBK_OK && got > 0)
+        total += got;
+    vfs_close(fd);
+    buf[total] = '\0';
+    return (int)total;
+}
+static int emb_write_all(const char *path, const char *buf, size_t len) {
+    int fd = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    size_t w = 0;
+    vfs_fd_write(fd, buf, len, &w);
+    vfs_close(fd);
+    return w == len ? 0 : -1;
+}
+
 void selftests_init(struct fat32_volume *fat_vol, bool fat_ready)
 {
     g_fat32 = fat_vol;
@@ -346,6 +418,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc link\n");
     kprintf("  test tcc real\n");
     kprintf("  test tcc tally\n");
+    kprintf("  test embbuild\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -1875,6 +1948,141 @@ int selftests_handle_command(const char *cmd)
         }
         int c = timed_out ? -2 : process_wait((uint32_t)p);
         kprintf("\n[cmd] test externdiag: rc=%d (%s)\n", c, timed_out ? "HUNG" : "completed");
+        return 1;
+    }
+
+/* EMBBUILD ACCEPTANCE (docs/BUILD.md §10) -- the six cases, one boot:
+ *   (a) clean build via manifest + the tally pipeline oracle
+ *   (b) immediate re-run: "0 ran" -- content stamps hit
+ *   (c) edit one source: exactly that unit's CHAIN reruns
+ *   (d) change one stanza's flag, sources untouched: it reruns -- the
+ *       false-fresh case make structurally fails on this machine
+ *   (e) mis-ordered manifest: parse-time refusal naming both stanzas
+ *   (f) install aimed at /system: the §3 boundary refusal
+ * All EmbBuild output arrives via emb_run_cap (fd1+2 piped) so the
+ * transcript lands in the serial record, not just on the screen. */
+    if (strcmp(cmd, "test embbuild") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild: VFS not registered\n"); return 1; }
+        static char cap[4096];
+        static char fbuf[8192];
+        int ok = 1;
+        char *bb = "/data/apps/embbuild/embbuild.elf";
+
+        /* (a) clean build + oracle */
+        kprintf("[embbuild-test] (a) clean build\n");
+        char *a1[] = { bb, "/data/src/tally/build.ebm", NULL };
+        int rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
+        if (rc != 0 || !emb_find(cap, "6 ran, 0 up_to_date")) { kprintf("[embbuild-test] (a) FAIL rc=%d\n", rc); ok = 0; }
+        if (ok) {
+            char *o1[] = { "/system/bin/shell.elf", "-c", "ls / | tally | get rows", NULL };
+            int p = process_create("/system/bin/shell.elf", o1, 3, NULL, 0);
+            int c1 = p >= 0 ? process_wait((uint32_t)p) : -1;
+            char *o2[] = { "/system/bin/shell.elf", "-c", "ls / | count", NULL };
+            p = process_create("/system/bin/shell.elf", o2, 3, NULL, 0);
+            int c2 = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[embbuild-test] (a) oracle: tally rc=%d count rc=%d\n", c1, c2);
+            if (c1 != 0 || c2 != 0) ok = 0;
+        }
+
+        /* (b) re-run: 0 ran */
+        if (ok) {
+            kprintf("[embbuild-test] (b) no-op rebuild\n");
+            rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
+            if (rc != 0 || !emb_find(cap, "0 ran, 6 up_to_date")) { kprintf("[embbuild-test] (b) FAIL rc=%d\n", rc); ok = 0; }
+        }
+
+        /* (c) one edited source: its chain reruns (tally.o -> link -> install),
+         * the other three compiles stay skipped. The edit adds a SYMBOL so the
+         * object genuinely changes and the chain propagates. */
+        if (ok) {
+            kprintf("[embbuild-test] (c) edit tally.c -> chain rebuild\n");
+            int n = emb_read_all("/data/src/tally/tally.c", fbuf, sizeof fbuf);
+            static const char probe[] = "\nint emb_probe_case_c;\n";
+            if (n < 0 || n + (int)sizeof probe >= (int)sizeof fbuf) { ok = 0; }
+            else {
+                memcpy(fbuf + n, probe, sizeof probe - 1);
+                if (emb_write_all("/data/src/tally/tally.c", fbuf, (size_t)n + sizeof probe - 1) != 0) ok = 0;
+            }
+            if (ok) {
+                rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
+                if (rc != 0 || !emb_find(cap, "3 ran, 3 up_to_date") ||
+                    !emb_find(cap, "skipping 'sval.o'")) {
+                    kprintf("[embbuild-test] (c) FAIL rc=%d\n", rc); ok = 0;
+                }
+            }
+        }
+
+        /* (d) THE ONE: a flag change with sources untouched. Surgery on the
+         * manifest: insert -DEMB_FLAG_D=1 into sval.o's args (the token
+         * "-I/data/src/shell /data/src/shell/sval/sval.c" is unique to it),
+         * run from /data/tmp -- same project, same stamps. Expect exactly
+         * sval.o to rerun; and because the flag changes no bytes of the
+         * object, the chain CUTS OFF: 1 ran, 5 up to date. Timestamps could
+         * never express any of this. */
+        if (ok) {
+            kprintf("[embbuild-test] (d) flag-only rebuild\n");
+            int n = emb_read_all("/data/src/tally/build.ebm", fbuf, sizeof fbuf);
+            static const char at[]  = "-I/data/src/shell /data/src/shell/sval/sval.c";
+            static const char ins[] = "-DEMB_FLAG_D=1 ";
+            int pos = -1;
+            for (int i = 0; n > 0 && i + (int)sizeof at - 1 <= n; i++)
+                if (strncmp(fbuf + i, at, sizeof at - 1) == 0) { pos = i; break; }
+            if (n < 0 || pos < 0 || n + (int)sizeof ins >= (int)sizeof fbuf) ok = 0;
+            else {
+                int split = pos + 18;   /* after "-I/data/src/shell " */
+                memmove(fbuf + split + sizeof ins - 1, fbuf + split, (size_t)(n - split) + 1);
+                memcpy(fbuf + split, ins, sizeof ins - 1);
+                if (emb_write_all("/data/tmp/flagged.ebm", fbuf, (size_t)n + sizeof ins - 1) != 0) ok = 0;
+            }
+            if (ok) {
+                char *a2[] = { bb, "/data/tmp/flagged.ebm", NULL };
+                rc = emb_run_cap(bb, a2, 2, cap, sizeof cap);
+                if (rc != 0 || !emb_find(cap, "1 ran, 5 up_to_date") ||
+                    !emb_find(cap, "sval.o")) {
+                    kprintf("[embbuild-test] (d) FAIL rc=%d\n", rc); ok = 0;
+                }
+            }
+        }
+
+        /* (e) the ordering guard: a manifest whose first stanza consumes the
+         * second's output. Refusal must name BOTH stanzas. */
+        if (ok) {
+            kprintf("[embbuild-test] (e) mis-ordered manifest\n");
+            static const char bad[] =
+                "project: badorder\n\n"
+                "name: use-first\nkind: compile\ninputs: /data/tmp/nope.o\n"
+                "args: /data/apps/tcc/tcc.elf -c x -o y\noutput: /data/tmp/z.o\n\n"
+                "name: make-nope\nkind: compile\ninputs: /data/src/tally/tally.c\n"
+                "args: /data/apps/tcc/tcc.elf -c x -o /data/tmp/nope.o\noutput: /data/tmp/nope.o\n";
+            if (emb_write_all("/data/tmp/badorder.ebm", bad, sizeof bad - 1) != 0) ok = 0;
+            if (ok) {
+                char *a3[] = { bb, "/data/tmp/badorder.ebm", NULL };
+                rc = emb_run_cap(bb, a3, 2, cap, sizeof cap);
+                if (rc == 0 || !emb_find(cap, "ordering error") ||
+                    !emb_find(cap, "use-first") || !emb_find(cap, "make-nope")) {
+                    kprintf("[embbuild-test] (e) FAIL rc=%d\n", rc); ok = 0;
+                }
+            }
+        }
+
+        /* (f) the §3 boundary: an install pointed at /system/bin refuses. */
+        if (ok) {
+            kprintf("[embbuild-test] (f) /system install refusal\n");
+            static const char evil[] =
+                "project: evil\n\n"
+                "name: sneak\nkind: install\ninputs: /data/src/tally/build.ebm\n"
+                "output: /system/bin/evil.elf\n";
+            if (emb_write_all("/data/tmp/evil.ebm", evil, sizeof evil - 1) != 0) ok = 0;
+            if (ok) {
+                char *a4[] = { bb, "/data/tmp/evil.ebm", NULL };
+                rc = emb_run_cap(bb, a4, 2, cap, sizeof cap);
+                if (rc == 0 || !emb_find(cap, "cannot write into /system")) {
+                    kprintf("[embbuild-test] (f) FAIL rc=%d\n", rc); ok = 0;
+                }
+            }
+        }
+
+        kprintf("\n[cmd] test embbuild: %s\n", ok ? "OK (a-f)" : "FAIL");
         return 1;
     }
 

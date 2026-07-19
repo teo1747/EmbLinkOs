@@ -1063,7 +1063,10 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
-- [ ] **Native build tool** (the make-equivalent — DECIDED, not yet built).
+- [ ] **embbuild** — the native build tool (the make-equivalent — DECIDED and
+  now DESIGNED: `docs/BUILD.md` is the ratification document + v1 spec;
+  manifest format, content-hash stamps, stage/adopt via atomic rename,
+  `/data/build/` tree, `test embbuild` acceptance).
   The fork was audited and ratified: a **native structured tool**, not a make
   port. The deciding facts, each verified against the tree: every userland
   recipe is one argv = one `spawn()` (no `/bin/sh` buys nothing); the host

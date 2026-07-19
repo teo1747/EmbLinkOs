@@ -393,10 +393,16 @@ $(BUILD)/shtool_sysinfo.o: shell/tools/sysinfo.c $(SHELL_HDRS) user/lib/embk.h |
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shtool_tally.o: shell/tools/tally.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shtool_embbuild.o: shell/tools/embbuild.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 
 build/sysinfo.elf: $(BUILD)/shtool_sysinfo.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
 build/tally.elf: $(BUILD)/shtool_tally.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
+# EmbBuild (docs/BUILD.md): the typed-manifest walker. Same static sval-tool
+# shape; host-bootstrapped here, self-hosting is its own target #3.
+build/embbuild.elf: $(BUILD)/shtool_embbuild.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
 
 # --- uidemo.elf: the EmbLink UI toolkit running live in ring-3 -----------------
@@ -640,6 +646,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
+               build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
