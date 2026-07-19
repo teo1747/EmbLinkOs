@@ -31,6 +31,15 @@ extern void irq14(void);       extern void irq15(void);
 // Table of registered IRQ handlers. Indexed by IRQ number (0-15)
 static irq_handler_t irq_handlers[16] = {0};
 
+/* Prior PIC mask state, captured the first time irq_register() touches a line
+ * so irq_unregister() can RESTORE it rather than unconditionally masking.
+ * Without this, register-then-unregister is not transparent: it would leave a
+ * line masked even if it had been unmasked before, silently disabling whatever
+ * else relied on it. `saved` gates validity (both zero-init => "nothing saved
+ * yet"); `was_masked` is the captured bit. */
+static bool irq_mask_saved[16];
+static bool irq_was_masked[16];
+
 
 void irq_install(void) {
     idt_set_entry(32, (uint64_t)irq0, 0x8E);
@@ -58,23 +67,57 @@ void irq_install(void) {
 
 void irq_register(uint8_t irq, irq_handler_t handler) {
     if (irq >= 16) return; // Invalid IRQ number
-        irq_handlers[irq] = handler;
-        pic_unmask_irq(irq); // Unmask the IRQ at the PIC
-    
+    irq_handlers[irq] = handler;
+
+    /* Save the line's prior mask bit ONCE, before we unmask, so unregister can
+     * put it back exactly. `irq < 8` selects master vs slave; the bit within
+     * that register is `irq & 7`. */
+    if (!irq_mask_saved[irq]) {
+        uint8_t imr = pic_get_mask(irq < 8);
+        irq_was_masked[irq] = (imr & (1 << (irq & 7))) != 0;
+        irq_mask_saved[irq] = true;
+    }
+
+    pic_unmask_irq(irq); // Unmask the IRQ at the PIC
 }
 
 
 void irq_unregister(uint8_t irq) {
     if (irq >= 16) return; // Invalid IRQ number
     irq_handlers[irq] = 0;
-    pic_mask_irq(irq); // Mask the IRQ at the PIC
+
+    /* Restore the mask state we captured at register time instead of blindly
+     * masking. If there is nothing saved (unregister with no matching register),
+     * fall back to masking -- the safe default for a line with no handler. */
+    if (irq_mask_saved[irq]) {
+        if (irq_was_masked[irq]) pic_mask_irq(irq);
+        else                     pic_unmask_irq(irq);
+        irq_mask_saved[irq] = false;
+    } else {
+        pic_mask_irq(irq);
+    }
 }
 
 
 // called from assembly stub with IRQ number in rdi
 void irq_handler(struct registers *regs) {
     uint8_t irq = (uint8_t)(regs->vector - 32); // IRQ number is vector - 32
-    // DEBUG: signal that we entered
+
+    /* Spurious 8259 IRQ7/15 guard. Gated on there being NO registered handler:
+     * a registered handler means a REAL device owns this vector via the IO-APIC
+     * (ATA secondary is IRQ15 -> vector 47), and its interrupts never touch the
+     * PIC, so the PIC ISR bit would read clear for them -- consulting it there
+     * would wrongly drop a genuine ATA IRQ. Only an UNWIRED 7/15 can be a PIC
+     * phantom worth swallowing. Dormant today (the PIC is masked, so it delivers
+     * nothing), but correct the moment a PIC line is ever used again: a master
+     * spurious (7) gets no EOI at all; a slave spurious (15) still needs the
+     * master's cascade EOI even though the slave must not be acked. Neither
+     * takes the LAPIC EOI below -- nothing was delivered through the LAPIC. */
+    if ((irq == 7 || irq == 15) && !irq_handlers[irq] && pic_irq_is_spurious(irq)) {
+        if (irq == 15) pic_send_eoi(8);   // cascade EOI to the master only
+        return;
+    }
+
     if (irq_handlers[irq]) {
         irq_handlers[irq](); // Call the registered handler
     }else {

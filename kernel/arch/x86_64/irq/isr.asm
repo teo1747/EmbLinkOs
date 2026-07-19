@@ -5,6 +5,19 @@ extern isr_handler
 extern irq_handler
 extern lapic_timer_handler
 global lapic_timer_stub
+global lapic_spurious_stub
+
+
+; LAPIC spurious-interrupt handler (the vector programmed into the SVR, 0xFF).
+; A spurious interrupt is the local APIC saying "the IRQ that raised this
+; de-asserted before I could latch WHICH one" -- there is nothing to service.
+; It must NOT be EOI'd: the SDM (Vol.3A 10.9) is explicit that a spurious
+; vector does not set an ISR bit, so an EOI here would acknowledge some OTHER,
+; genuinely-in-service interrupt. So touch no state, send no EOI, just return.
+; No register saves are needed -- a bare iretq restores the interrupted context
+; byte-for-byte (we clobbered nothing). Shared across all cores via the one IDT.
+lapic_spurious_stub:
+    iretq
 
 
 lapic_timer_stub:
@@ -37,6 +50,51 @@ irq%1:
     push qword 0 ; push dummy error code (not used for IRQs, but we want to keep the stack layout consistent)
     push qword %2 ; push IRQ number ( VECTOR NUMBER)
     jmp irq_commom
+%endmacro
+
+
+; Shared GPR save/restore for EVERY common interrupt path (CPU exceptions, PIC
+; IRQs, the LAPIC timer). The three paths differ only in which C handler they
+; call; this 15-register frame was copy-pasted into all three, so any change to
+; its layout -- which the C-side `struct registers` mirrors field-for-field --
+; had to be kept in lockstep in three places or the frame would silently
+; desync. One definition each now. The push order is the REVERSE of struct
+; registers' declaration, so after PUSH_GPRS `rsp` points at a valid
+; `struct registers` to hand the C handler in rdi.
+%macro PUSH_GPRS 0
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+%endmacro
+
+%macro POP_GPRS 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
 %endmacro
 
 
@@ -110,134 +168,27 @@ isr_double_fault:
 
 
 isr_commom:
-    ; save registers
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-    ; call the common handler in C code, passing the pointer to the stack as argument
-    mov rdi, rsp ; pass pointer to stack as first argument (in RDI)
+    PUSH_GPRS
+    mov rdi, rsp          ; pass pointer to the register frame as first argument
     call isr_handler
-
-    ; restore registers and return from interrupt
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    ;skip the error code and ISR number on the stack
-    add rsp, 16 ; 8 bytes for error code + 8 bytes for ISR number
-
-    iretq ; return from interrupt
+    POP_GPRS
+    add rsp, 16           ; skip the error code + ISR number pushed by the stub
+    iretq
 
 
 irq_commom:
-    ; save registers
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-    ; pass pinter to register frame to c handler
-    mov rdi, rsp ; pass pointer to stack as first argument (in RDI)
+    PUSH_GPRS
+    mov rdi, rsp          ; pass pointer to the register frame as first argument
     call irq_handler
+    POP_GPRS
+    add rsp, 16           ; skip the error code + vector number pushed by the stub
+    iretq
 
-    ; restore registers and return from interrupt
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    ;skip the error code and vector number on the stack
-    add rsp, 16 ; 8 bytes for error code + 8 bytes for vector number
-
-    iretq ; return from interrupt
 
 irq_common_lapic:
-    ; save registers
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-    ; pass pinter to register frame to c handler
-    mov rdi, rsp ; pass pointer to stack as first argument (in RDI)
+    PUSH_GPRS
+    mov rdi, rsp          ; pass pointer to the register frame as first argument
     call lapic_timer_handler
-
-    ; restore registers and return from interrupt
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-     ;skip the error code and vector number on the stack (even if LAPIC timer doesn't use error code, we pushed a dummy one for consistency)
-     add rsp, 16 ; 8 bytes for error code + 8 bytes for vector number
-
-     iretq ; return from interrupt
+    POP_GPRS
+    add rsp, 16           ; skip the dummy error code + vector number pushed by the stub
+    iretq

@@ -30,6 +30,7 @@
 // LVT Timer bits
 #define LAPIC_TIMER_MASKED   0x10000  // Bit 16: Masked when set, unmasked when clear
 #define LAPIC_TIMER_PERIODIC 0x20000  // Bit 17: Periodic mode when set, one-shot when clear
+#define LAPIC_TIMER_TSC_DEADLINE 0x40000 // Bits 18:17 = 10b: TSC-deadline mode (arm via IA32_TSC_DEADLINE MSR)
 
 // Initialize the local APIC: enable it and set the spurious interrupt vector
 void lapic_init(void);
@@ -55,8 +56,11 @@ void lapic_send_eoi(void);
 // Get the local APIC ID (for identifying the current CPU)
 uint32_t lapic_get_id(void);
 
-// Set up the local APIC timer to generate interrupts at a specified frequency (Hz)
-// Calibrate against the PIT to determine the correct initial count value for the desired frequency
+// Set up the local APIC timer at 100 Hz on `vector`. Uses TSC-deadline mode
+// when the CPU advertises it (CPUID.01H:ECX[24]) and the TSC has been
+// calibrated (call tsc_calibrate() first); otherwise calibrates the LVT count
+// against the HPET/PIT and runs in periodic mode. Each core calls this for its
+// own local APIC (the BSP here, every AP from ap_main()).
 void lapic_timer_init(uint8_t vector);
 
 // Ticks elapsed since lapic_timer_init (100 Hz -> 10 ms per tick)
