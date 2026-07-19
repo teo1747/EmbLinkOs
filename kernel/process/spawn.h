@@ -2,8 +2,15 @@
 #include <stdint.h>
 
 
-#define SPAWN_ARGV_MAX             16          // max number of argv[] entries (including the NULL terminator) a spawn() can pass to a child process
-#define SPAWN_ARGV_BYTES_MAX       1024        // total bytes of argv[] strings (including NULL terminators)
+/* Raised 16 -> 32 (and bytes 1024 -> 2048) for EmbBuild v2: a real link line
+ * -- compiler, flags, crt0, syscalls, ELEVEN objects, -lc, -o, output -- is
+ * 19 argv entries and ~720 string bytes, entirely legitimate. 16 was sized
+ * for hand-typed commands; the first machine-generated argv outgrew it
+ * (spawn returned E2BIG on the shell's own rebuild). Kernel-stack cost of
+ * the bump: +1 KB in sys_spawn's argv_buf + 128 B of pointer arrays --
+ * well inside the guarded kernel stacks. */
+#define SPAWN_ARGV_MAX             32          // max argv[] entries (incl. the NULL terminator)
+#define SPAWN_ARGV_BYTES_MAX       2048        // total bytes of argv[] strings (incl. NUL terminators)
 
 /* ENVIRONMENT -- passed EXPLICITLY at spawn, exactly like argv, and never
  * inherited.

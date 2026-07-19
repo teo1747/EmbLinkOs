@@ -420,6 +420,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc tally\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
+    kprintf("  test embbuild shell\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -1949,6 +1950,95 @@ int selftests_handle_command(const char *cmd)
         }
         int c = timed_out ? -2 : process_wait((uint32_t)p);
         kprintf("\n[cmd] test externdiag: rc=%d (%s)\n", c, timed_out ? "HUNG" : "completed");
+        return 1;
+    }
+
+/* V2 -- THE SHELL REBUILDS THE SHELL, and the FIRST ADOPTION EVENT
+ * (docs/BUILD.md §3). Four movements:
+ *   (1) BUILD: EmbBuild walks /data/src/shell/build.ebm -- eleven TCC
+ *       compiles and a link, STAGED ONLY (the manifest has no install
+ *       stanza; /system/bin is sealed and EmbBuild will not cross it).
+ *   (2) VERIFY THE STAGED ARTIFACT: the TCC-built shell runs the shell-test
+ *       -c oracles -- expression eval, a real ls pipeline with
+ *       where/sort-by/select, and an extern pipeline (the staged shell
+ *       spawning tally through its own plumbing) -- BEFORE anyone considers
+ *       adopting it.
+ *   (3) ADOPT -- the deliberate seal-crossing, done by the SYSTEM (this
+ *       test standing in for the hand-run ritual), not by the build tool:
+ *       snapshot the volume (rollback safety), then copy staged ->
+ *       /system/bin/shell.elf.
+ *   (4) POST-ADOPT: the same oracles through /system/bin/shell.elf -- from
+ *       here on, every pipeline in the system runs through a shell the
+ *       system built for itself. */
+    if (strcmp(cmd, "test embbuild shell") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild shell: VFS not registered\n"); return 1; }
+        static char cap[4096];
+        int ok = 1, rc;
+        char *bb = "/data/apps/embbuild/embbuild.elf";
+        static const char *oracle[3] = {
+            "echo 1mb + 512kb",
+            "ls / | where size > 100kb | sort-by size | select name size",
+            "ls / | tally | get rows",
+        };
+
+        /* (1) build to staging */
+        kprintf("[v2] (1) building the shell from /data/src/shell\n");
+        char *a1[] = { bb, "/data/src/shell/build.ebm", NULL };
+        rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
+        if (rc != 0 || !emb_find(cap, "12 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }
+
+        /* (2) verify the staged shell BEFORE adoption */
+        if (ok) {
+            kprintf("[v2] (2) verifying the STAGED shell\n");
+            for (int i = 0; i < 3 && ok; i++) {
+                char *s[] = { "/data/build/out/shell/shell.elf", "-c", (char *)oracle[i], NULL };
+                int p = process_create("/data/build/out/shell/shell.elf", s, 3, NULL, 0);
+                int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+                kprintf("[v2] (2) staged -c \"%s\" rc=%d\n", oracle[i], c);
+                if (c != 0) ok = 0;
+            }
+        }
+
+        /* (3) the adoption ritual: snapshot, then the seal-crossing copy --
+         * performed HERE, by the system's own hand, never by EmbBuild. */
+        if (ok) {
+            struct embkfs_volume *vol = embkfs_live_volume();
+            int src = vol ? embkfs_snapshot_create(vol, "pre-shell-adopt") : -1;
+            kprintf("[v2] (3) snapshot 'pre-shell-adopt': %s\n",
+                    src == EMBK_OK ? "created" : "FAILED (continuing -- copy is still reversible by rebuild)");
+            static char xfer[4096];
+            int in = vfs_open("/data/build/out/shell/shell.elf", O_RDONLY, 0);
+            int out = vfs_open("/system/bin/shell.elf", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            if (in < 0 || out < 0) { kprintf("[v2] (3) FAIL open in=%d out=%d\n", in, out); ok = 0; }
+            else {
+                size_t total = 0, got = 0;
+                for (;;) {
+                    if (vfs_fd_read(in, xfer, sizeof xfer, &got) != EMBK_OK || got == 0) break;
+                    size_t w = 0;
+                    if (vfs_fd_write(out, xfer, got, &w) != EMBK_OK || w != got) { ok = 0; break; }
+                    total += w;
+                }
+                kprintf("[v2] (3) ADOPTED: %u bytes -> /system/bin/shell.elf\n", (unsigned)total);
+                if (total < 1024) ok = 0;
+            }
+            if (in >= 0) vfs_close(in);
+            if (out >= 0) vfs_close(out);
+        }
+
+        /* (4) the adopted shell IS the system's shell now -- same oracles */
+        if (ok) {
+            kprintf("[v2] (4) verifying the ADOPTED /system/bin/shell.elf\n");
+            for (int i = 0; i < 3 && ok; i++) {
+                char *s[] = { "/system/bin/shell.elf", "-c", (char *)oracle[i], NULL };
+                int p = process_create("/system/bin/shell.elf", s, 3, NULL, 0);
+                int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+                kprintf("[v2] (4) adopted -c \"%s\" rc=%d\n", oracle[i], c);
+                if (c != 0) ok = 0;
+            }
+        }
+
+        kprintf("\n[cmd] test embbuild shell: %s\n",
+                ok ? "OK -- the shell that runs is a shell the OS built" : "FAIL");
         return 1;
     }
 

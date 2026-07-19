@@ -922,7 +922,15 @@ cannot do). "Self-hosting for C" remains the accurate phrase.
 
 What's left:
 
-1. **embbuild** — the make-equivalent, now the *last named item* between
+1. ~~**embbuild**~~ — ✅ **the OS rebuilds its own userland.** EmbBuild
+   (BUILD.md) rebuilds tally, sysinfo, itself, and — the headline —
+   **the shell**, whose TCC-built successor was staged, verified, and
+   ADOPTED into the sealed `/system/bin` (snapshot → copy): every pipeline
+   in the system now runs through a shell the system built for itself
+   (`test embbuild shell`). What remains is breadth, not capability. The
+   original entry, for the record:
+
+   **embbuild** — the make-equivalent, the last named item between
    "self-hosting for C" and rebuild-self, and the one with a design doc:
    **[BUILD.md](BUILD.md)**. Its primitive is already proven end-to-end:
    `test tcc tally` compiles four translation units on-OS, links the

@@ -65,6 +65,18 @@ sealed image; ADOPTING it is an update event."* Therefore:
   the staged artifact (run it `-c` against the shell-test
   expectations — the oracle pattern), only then adopt.
 
+**✅ DONE (`test embbuild shell`).** The shell rebuilds the shell and the
+first adoption event is real: 12 units TCC-built to staging; the STAGED
+shell passes the `-c` oracles (expression eval, `where`/`sort-by`/`select`
+pipeline, an extern `tally` pipeline); the system snapshots
+(`pre-shell-adopt`) and copies staged → `/system/bin/shell.elf` (191,904
+bytes); the ADOPTED shell passes the same oracles — every pipeline in the
+system now runs through a shell the system built for itself. The build tool
+never touched `/system`: the manifest has no install stanza, and the
+seal-crossing copy is the system's act. (This also flushed out
+`SPAWN_ARGV_MAX` 16 → 32 — the first machine-generated argv, a 19-entry
+link line, outgrew a limit sized for hand-typed commands.)
+
 ## 4. Staleness — content, not time
 
 The RTC resolves to one second; TCC compiles in milliseconds.

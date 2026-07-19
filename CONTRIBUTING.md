@@ -83,7 +83,15 @@ appear if the program was really compiled and really executed.
   `build/syscalls.o` via a raw path their own build systems treat as a file, not
   a prerequisite, so `make python` says *"up to date"* however much our libc
   changed. Our Makefile now forces the relink; check mkfs's `src fingerprint`
-  line if you are unsure what got packed.
+  line if you are unsure what got packed. **The kernel has the same trap for
+  HEADERS:** `kernel.elf` is one big `gcc` over an explicit `.c` list with no
+  `-MMD` depfiles, so editing a `.h` (e.g. bumping a `#define` in
+  `spawn.h`) does **not** trigger a rebuild — `make` cheerfully reports success
+  and packs the old kernel. This cost two full 35-minute v2 boots before the
+  timestamps gave it away (`myos.img` *older* than the edited header). When you
+  change a kernel header, `rm kernel/kernel.elf` (or `touch` a `.c`) before
+  `make`; and if a result contradicts a change you *know* you made, diff the
+  image mtime against the file you edited before doubting anything else.
 - **Your code never ran at all.** Put a marker (a `kprintf` naming what you are
   testing) in any new selftest. If the marker does not appear, you are not
   running the kernel you just built — check *that* before doubting the code.

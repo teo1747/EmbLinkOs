@@ -578,7 +578,15 @@ $(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM) | $(BUILD)
 $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BUILD)
 	$(ASM) -f elf64 $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+# Every kernel header is a prerequisite. The kernel is one monolithic $(CC)
+# over $(KERNEL_SRC) with no per-TU depfiles, so without this a header-only
+# change (a #define in spawn.h, a struct field) leaves kernel.elf "up to date"
+# and `make` silently packs the OLD kernel -- a stale-binary trap that cost two
+# 35-minute boots during EmbBuild v2. A wildcard over every .h under kernel/ is
+# coarse (any header touch rebuilds the whole kernel) but the kernel is one
+# compile anyway, so the granularity is already all-or-nothing; correctness wins.
+KERNEL_HDRS := $(shell find kernel -name '*.h')
+$(KERNEL_ELF): $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
 # Boot image carries the stripped kernel (see KERNEL_BIN note above).

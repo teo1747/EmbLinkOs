@@ -763,10 +763,23 @@ def discover_userland_objects(build_dir="build"):
     # and installs over /data/apps/tally/tally.elf: the first component of the
     # system rebuilt by the system. An explicit list, not a tree walk -- the
     # closure is the point (7 files, ~1400 lines), not the whole shell/.
-    _TALLY_SRC = ("tools/tally.c", "sval/sval.c", "sval/sval.h",
+    # v2 (BUILD.md §3): the FULL shell closure -- every unit shell.elf links,
+    # so the shell can rebuild the shell. Still an explicit list, not a tree
+    # walk: tools/ and test/ stay off the image (host tests don't belong on
+    # the OS), and the list IS the claim of what the rebuild needs.
+    _SHELL_SRC = ("main.c",
+                  "lex/lex.c", "lex/lex.h",
+                  "parse/parse.c", "parse/parse.h",
+                  "eval/eval.c", "eval/eval_extern.c", "eval/eval.h",
+                  "builtins/builtins.c", "builtins/builtins_os.c",
+                  "builtins/builtins.h",
+                  "hist/hist.c", "hist/hist.h",
+                  "tools/tally.c",
+                  "sval/sval.c", "sval/sval.h",
                   "value/value.c", "value/value.h",
-                  "wire/wire.c", "wire/wire.h")
-    for rel in _TALLY_SRC:
+                  "wire/wire.c", "wire/wire.h",
+                  "build.ebm")
+    for rel in _SHELL_SRC:
         blob = _read_file(f"shell/{rel}")
         if blob is not None:
             objects.append((b"data/src/shell/" + rel.encode(),
