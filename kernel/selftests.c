@@ -7,6 +7,8 @@
 #include "block/block.h"   /* blkstat request counters (test ioperf) */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
+#include "drivers/char/serial.h"      /* serial_write_char: test tcc real heartbeat */
+#include "arch/x86_64/irq/lapic.h"    /* lapic_timer_get_ticks: test tcc real pacing */
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "arch/x86_64/cpu/rwlock.h"
@@ -17,6 +19,8 @@
 #include "drivers/input/keyboard.h"
 #include "process/ksync.h"
 #include "mm/kheap.h"
+#include "mm/vmm.h"
+#include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -52,6 +56,23 @@ static void pipe_eof_reader_kthread(void)
     (void)pipe_read(s_pipe_eof_p, b, 1, &got);
     s_pipe_eof_got  = got;
     s_pipe_eof_done = 1;
+    process_exit_self(0);
+}
+
+/* --- `test ksync` helper: a kthread that BLOCKS on a held mutex via the
+ * cancellation-aware acquire, so the test can cancel it and prove the acquire
+ * returns -EMBK_ECANCELED instead of sleeping forever. Same "the blocker can't
+ * assert its own blocking" reason as the pipe helper. Statics, not stack. */
+static struct mutex  s_cx_mutex;
+static volatile int  s_cx_started;   /* set just before the (blocking) acquire */
+static volatile int  s_cx_result;    /* the acquire's return; 999 = not finished */
+static void cx_cancel_waiter_kthread(void)
+{
+    s_cx_started = 1;
+    s_cx_result  = mutex_lock_interruptible(&s_cx_mutex);   /* the driver holds it */
+    /* Expected: -ECANCELED, having REFUSED the contended lock. If it somehow
+     * acquired (returned 0), release so the lock isn't leaked to a corpse. */
+    if (s_cx_result == EMBK_OK) mutex_unlock(&s_cx_mutex);
     process_exit_self(0);
 }
 
@@ -323,6 +344,8 @@ static void selftests_print_commands(void)
     kprintf("  test tcc\n");
     kprintf("  test tcc compile\n");
     kprintf("  test tcc link\n");
+    kprintf("  test tcc real\n");
+    kprintf("  test tcc tally\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -1129,9 +1152,99 @@ int selftests_handle_command(const char *cmd)
         SCHK("mutex: free after unlock()", mutex_trylock(&m) == 1);
         mutex_unlock(&m);
 
+        /* --- cancellation-aware acquire (the *_interruptible variants) ---
+         *
+         * Success path first: the interruptible acquire of an AVAILABLE
+         * primitive behaves exactly like the plain one -- returns 0 -- because
+         * cancellation gates only BLOCKING, never an uncontended take. */
+        struct mutex fm; mutex_init(&fm);
+        SCHK("mutex_lock_interruptible: free -> acquires (0)", mutex_lock_interruptible(&fm) == EMBK_OK);
+        mutex_unlock(&fm);
+        struct semaphore is; sem_init(&is, 1);
+        SCHK("sem_wait_interruptible: permit avail -> takes it (0)", sem_wait_interruptible(&is) == EMBK_OK);
+        SCHK("sem_wait_interruptible: then empty", sem_trywait(&is) == 0);
+
+        /* Headline: a waiter that BLOCKS on a held mutex and is then cancelled
+         * must WAKE and return -ECANCELED, WITHOUT stealing the lock. This
+         * context (the driver) holds the lock for the whole exchange, so the
+         * waiter is genuinely contended -- exactly the case the plain
+         * mutex_lock() would sleep through until release. */
+        mutex_init(&s_cx_mutex);
+        mutex_lock(&s_cx_mutex);              /* the driver owns it */
+        s_cx_started = 0;
+        s_cx_result  = 999;                   /* sentinel: kthread not finished */
+        struct thread *wt = process_create_kthread(cx_cancel_waiter_kthread, NULL);
+        SCHK("cancel: waiter kthread spawned", wt != NULL);
+        uint32_t wpid = wt ? wt->proc->pid : 0;
+        /* Let it reach and park in the acquire. Yield counts are MODEST on
+         * purpose (see `test pipe`): schedule() is a full cooperative hand-off
+         * and under TCG a rotation costs ms, so a huge count reads as a hang. */
+        for (int y = 0; y < 300 && !s_cx_started; y++) schedule();
+        for (int y = 0; y < 50; y++) schedule();     /* settle into m->wq */
+        /* Now cancel it: process_cancel sets the sticky flag AND removes the
+         * thread from m->wq (marks it READY), so it re-checks at its wake point
+         * and returns -ECANCELED rather than re-sleeping. */
+        if (wpid) process_cancel(wpid);
+        for (int y = 0; y < 3000 && s_cx_result == 999; y++) schedule();
+        SCHK("cancel: blocked interruptible acquire woke (no hang)", s_cx_result != 999);
+        SCHK("cancel: acquire refused with -ECANCELED", s_cx_result == -EMBK_ECANCELED);
+        /* Non-vacuous: the waiter REFUSED, it did not acquire. The driver still
+         * owns the lock, so a clean unlock + retake round-trips. Had the waiter
+         * stolen the lock, owner would have changed and this unlock would fire
+         * the non-owner warning / the retake would be against a held lock. */
+        mutex_unlock(&s_cx_mutex);
+        SCHK("cancel: waiter never stole the lock (driver round-trips)", mutex_trylock(&s_cx_mutex) == 1);
+        mutex_unlock(&s_cx_mutex);
+
         kprintf("\n[cmd] test ksync: %s (%d/%d)\n",
                 fail == 0 ? "OK" : "FAIL", pass, pass + fail);
         #undef SCHK
+        return 1;
+    }
+
+    if (strcmp(cmd, "test vmm") == 0) {
+        int pass = 0, fail = 0;
+        #define VCHK(name, cond) do { if (cond) pass++; else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        /* A benign RAM phys we only MAP/UNMAP -- never dereference -- so a
+         * second VA aliasing it is harmless. */
+        const uint64_t test_phys = 0x100000;   /* 1 MiB */
+
+        /* --- map: page-aligned VA inside [MMIO_BASE, MMIO_END), really mapped --- */
+        uint64_t va1 = vmm_map_mmio(test_phys, 0x1000);
+        VCHK("vmm_map_mmio: non-zero VA", va1 != 0);
+        VCHK("vmm_map_mmio: page-aligned", (va1 & 0xFFF) == 0);
+        VCHK("vmm_map_mmio: inside [MMIO_BASE, MMIO_END)",
+             va1 >= MMIO_BASE && va1 < MMIO_BASE + (1ULL << 38));
+        VCHK("vmm_map_mmio: actually mapped", vmm_get_phys(va1) == test_phys);
+
+        /* --- unmap clears the PTE --- */
+        vmm_unmap_mmio(va1, 0x1000);
+        VCHK("vmm_unmap_mmio: PTE cleared", vmm_get_phys(va1) == 0);
+
+        /* --- free-list REUSE: same size comes back at the same VA (item B) --- */
+        uint64_t va2 = vmm_map_mmio(test_phys, 0x1000);
+        VCHK("vmm_unmap_mmio: freed VA reused first-fit", va2 == va1);
+        VCHK("reused VA is mapped again", vmm_get_phys(va2) == test_phys);
+        vmm_unmap_mmio(va2, 0x1000);
+
+        /* --- WC variant maps, and PAT entry 4 really is Write-Combining (item A) --- */
+        uint64_t wc = vmm_map_mmio_wc(test_phys, 0x1000);
+        VCHK("vmm_map_mmio_wc: non-zero VA", wc != 0);
+        VCHK("vmm_map_mmio_wc: mapped", vmm_get_phys(wc) == test_phys);
+        {
+            uint32_t lo, hi;
+            __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277u));
+            (void)lo;
+            uint8_t pa4 = (uint8_t)(hi & 0xFF);   /* PAT entry 4 = bits[39:32] = low byte of hi */
+            VCHK("IA32_PAT entry 4 == WC (0x01)", pa4 == 0x01);
+        }
+        vmm_unmap_mmio(wc, 0x1000);
+
+        kprintf("\n[cmd] test vmm: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef VCHK
         return 1;
     }
 
@@ -1528,6 +1641,341 @@ int selftests_handle_command(const char *cmd)
 
         int ok = (pid >= 0 && code == 0 && is_elf && is_exec && rcode == 42);
         kprintf("\n[cmd] test tcc link: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* A REAL PROGRAM: #include <stdio.h> and friends, compiled+linked+run on-OS.
+ *
+ * `test tcc link` proved the toolchain on a header-free toy that pulled ZERO
+ * members out of libc.a. This is the step it left open, and it closes three
+ * gaps at once:
+ *   - HEADERS: #include <stdio.h> resolves from tcc's baked-in sysinclude
+ *     paths (/system/abi/include for newlib, /data/apps/tcc/include for the
+ *     compiler's own stddef.h) -- both packed by mkfs. Needs tcc patch 0002:
+ *     a pristine tcc 0.9.27 predefines no GCC type macros and newlib's
+ *     sys/_intsup.h #errors on the very first include.
+ *   - THE LIBRARY AT SCALE: fopen/fprintf/fclose drag in newlib's buffered
+ *     stdio -- dozens of libc.a members, hundreds of cross-object calls.
+ *     This is the load the PLT32->PC32 patch (0001) must survive at scale;
+ *     `twice(21)` never exercised it.
+ *   - BARE -lc: no -L on the line -- tcc's baked-in /system/abi libpath must
+ *     find libc.a by itself.
+ * No -lgcc anywhere: proven unnecessary on the host (libc.a references zero
+ * libgcc intrinsics; both objects link to 0 undefined without it).
+ *
+ * The proof is twofold: the produced binary EXITS 42 (computed, not constant),
+ * and the FILE it wrote through buffered stdio reads back byte-exact. */
+/* Hammer the kernel-context fs WRITE path: create/write/close/unlink in a
+ * tight loop with per-iteration progress. Built to make a PROBABILISTIC hang
+ * (observed: console commands freezing in their first vfs write or spawn,
+ * different points on different boots) near-certain within one run, so a
+ * kernel bisect gets a reliable verdict per boot instead of a coin flip. */
+    if (strcmp(cmd, "test writestorm") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test writestorm: VFS not registered\n"); return 1; }
+        static const char blob[300] = "writestorm";
+        /* IF-probe after each stage: the class of bug this test exists for is
+         * a blocking path LEAKING IF=0 back into process context (the
+         * sched_block_current_locked bug, fixed in process.c -- found because
+         * this storm made the resulting hlt-with-IF=0 hang reproducible). Any
+         * report here is a regression of that fix; the probe re-enables IF so
+         * the run survives to count every leak, and ANY leak fails the test. */
+        int if_leaks = 0;
+        #define IFCHK(stage) do { uint64_t _rf; \
+            __asm__ volatile ("pushfq; popq %0" : "=r"(_rf)); \
+            if (!(_rf & (1ULL << 9))) { \
+                if_leaks++; \
+                kprintf("[storm] IF=0 after %s (iter %d)\n", stage, i); \
+                __asm__ volatile ("sti" ::: "memory"); \
+            } } while (0)
+        int i;
+        for (i = 0; i < 200; i++) {
+            int fd = vfs_open("/data/tmp/w.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            IFCHK("open");
+            if (fd < 0) { kprintf("[storm] iter %d: open failed %d\n", i, fd); break; }
+            size_t w = 0;
+            vfs_fd_write(fd, blob, sizeof blob, &w);
+            IFCHK("write");
+            vfs_close(fd);
+            IFCHK("close");
+            if (vfs_unlink_path("/data/tmp/w.bin") != 0) { kprintf("[storm] iter %d: unlink failed\n", i); break; }
+            IFCHK("unlink");
+            if ((i % 10) == 0) kprintf("[storm] iter %d ok\n", i);
+        }
+        #undef IFCHK
+        kprintf("\n[cmd] test writestorm: %s (%d/200, %d IF leak(s))\n",
+                (i == 200 && if_leaks == 0) ? "OK" : "FAIL", i, if_leaks);
+        return 1;
+    }
+
+    if (strcmp(cmd, "test tcc real") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc real: VFS not registered\n"); return 1; }
+
+        static const char src[] =
+            "#include <stdio.h>\n"
+            "#include <string.h>\n"
+            "#include <stdint.h>\n"
+            "int main(void) {\n"
+            "    FILE *f = fopen(\"/data/tmp/r.out\", \"w\");\n"
+            "    if (!f) return 1;\n"
+            "    uint64_t v = 40;\n"
+            "    const char *tag = \"ok\";\n"
+            "    fprintf(f, \"hdr=%s n=%u\\n\", tag, (unsigned)(v + strlen(tag)));\n"
+            "    fclose(f);\n"
+            "    return (int)(v + strlen(tag));\n"   /* 40 + 2 = 42 */
+            "}\n";
+        {
+            int fd = vfs_open("/data/tmp/r.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test tcc real: cannot write /data/tmp/r.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/r.elf");
+        (void)vfs_unlink_path("/data/tmp/r.out");
+
+        char *a[] = { "/data/apps/tcc/tcc.elf", "-static", "-nostdlib", "/data/tmp/r.c",
+                      "/system/abi/crt0.o", "/system/abi/syscalls.o", "-lc",
+                      "-o", "/data/tmp/r.elf" };
+        char *env[] = { "HOME=/", NULL };
+        kprintf("[tcc real] %s %s %s %s %s %s %s %s\n",
+                a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+        int pid = process_create_env("/data/apps/tcc/tcc.elf", a, 9, env, NULL, 0);
+        kprintf("[tcc real] spawned pid=%d\n", pid);   /* prints or create hung */
+        /* Pump-wait with a LIVE progress line every ~10 s (1000 ticks @100 Hz):
+         * device-read deltas rising = tcc is grinding I/O; frozen deltas with a
+         * still-alive process = a genuine hang. Under TCG the whole compile+link
+         * is minutes, and a silent minutes-long wait is indistinguishable from a
+         * hang from the outside -- that ambiguity cost a debugging session. */
+        int code = -1;
+        if (pid >= 0) {
+            struct embk_blkstat pb;
+            embk_blkstat_get(&pb);
+            uint64_t t0 = lapic_timer_get_ticks(), tlast = t0;
+            uint64_t spins = 0;
+            while (process_alive((uint32_t)pid)) {
+                __asm__ volatile ("hlt");
+                /* Unconditional iteration heartbeat, deliberately NOT tick-gated:
+                 * if ticks froze, the 10s line below never fires and the silence
+                 * is ambiguous; this one only needs the loop itself to spin. */
+                if ((++spins & 0xFFFFF) == 0) serial_write_char('~');
+                uint64_t now = lapic_timer_get_ticks();
+                if (now - tlast >= 1000) {
+                    struct embk_blkstat nb;
+                    embk_blkstat_get(&nb);
+                    kprintf("[tcc real] ... alive at +%llus, spins=%llu, +%llu dev reads (+%llu KB)\n",
+                            (unsigned long long)((now - t0) / 100),
+                            (unsigned long long)spins,
+                            (unsigned long long)(nb.reads - pb.reads),
+                            (unsigned long long)((nb.read_blocks - pb.read_blocks) / 2));
+                    pb = nb;
+                    tlast = now;
+                }
+            }
+            code = process_wait((uint32_t)pid);
+        }
+        kprintf("[tcc real] tcc exit=%d\n", code);
+
+        int rcode = -1;
+        struct vfs_stat st;
+        if (vfs_stat("/data/tmp/r.elf", &st) == 0) {
+            char *b[] = { "/data/tmp/r.elf", NULL };
+            int p2 = process_create_env("/data/tmp/r.elf", b, 1, env, NULL, 0);
+            rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+            kprintf("[tcc real] r.elf (%llu bytes) ran: exit=%d (want 42)\n",
+                    (unsigned long long)st.size, rcode);
+        } else {
+            kprintf("[tcc real] r.elf MISSING (link failed)\n");
+        }
+
+        /* The stdio proof: what fprintf buffered and fclose flushed. */
+        static const char want[] = "hdr=ok n=42\n";
+        char got[32] = {0};
+        size_t r = 0;
+        int ofd = vfs_open("/data/tmp/r.out", O_RDONLY, 0);
+        if (ofd >= 0) { vfs_fd_read(ofd, got, sizeof got - 1, &r); vfs_close(ofd); }
+        int out_ok = (r == sizeof want - 1 && memcmp(got, want, r) == 0);
+        kprintf("[tcc real] r.out: %s (got \"%s\")\n", out_ok ? "byte-exact" : "WRONG/MISSING", got);
+
+        int ok = (pid >= 0 && code == 0 && rcode == 42 && out_ok);
+        kprintf("\n[cmd] test tcc real: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* THE OS REBUILDS ONE OF ITS OWN TOOLS.
+ *
+ * tally.elf (the reference pipeline consumer, an external re-implementation of
+ * the `count` builtin) is rebuilt FROM SOURCE, ON the OS, and INSTALLED over
+ * /data/apps/tally/tally.elf -- then proven by running it through the shell's
+ * real extern pipeline. mkfs packs its exact source closure (7 files) at
+ * /data/src/shell/, tree-shaped so the quote-includes resolve with one -I.
+ *
+ * Beyond the headline, this closes the last unproven toolchain primitive:
+ * SEPARATE COMPILE-THEN-LINK. `test tcc real` went source -> ELF in one tcc
+ * invocation; a build tool's natural shape is `tcc -c` per unit and a second
+ * invocation linking the .o files -- four TCC-PRODUCED objects resolving each
+ * other's symbols plus libc.a's. That combination runs here for the first time.
+ *
+ * The install genuinely REPLACES the host-built binary (the fs is mutable and
+ * that is the point); functionally identical, and the next host `make`
+ * re-bakes the image anyway. The oracle is tally's own documented self-check:
+ * `ls / | tally | get rows` must agree with `ls / | count` -- same data, one
+ * path through a builtin, one through spawn/INSTALL_OBJ/serialize/deserialize
+ * and OUR freshly built binary. */
+/* Diagnostic for the extern-CONSUMER pipeline hang: run the hanging line with
+ * a timeout, and when it wedges, dump the process table -- who exists, and in
+ * what state -- instead of freezing the console. Temporary instrument. */
+    if (strcmp(cmd, "test externdiag") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test externdiag: VFS not registered\n"); return 1; }
+        char *s[] = { "/system/bin/shell.elf", "-c", "ls / | tally | get rows", NULL };
+        int p = process_create("/system/bin/shell.elf", s, 3, NULL, 0);
+        kprintf("[externdiag] shell pid=%d\n", p);
+        if (p < 0) return 1;
+        uint64_t t0 = lapic_timer_get_ticks(), tmark = t0;
+        int timed_out = 0;
+        while (process_alive((uint32_t)p)) {
+            __asm__ volatile ("sti; hlt");
+            uint64_t now = lapic_timer_get_ticks();
+            if (now - tmark >= 500) {                 /* 5 s heartbeat */
+                kprintf("[externdiag] +%llus shell still alive\n",
+                        (unsigned long long)((now - t0) / 100));
+                tmark = now;
+            }
+            if (now - t0 > 1500) { timed_out = 1; break; }   /* 15 guest-s (TCG clock runs ~1/3 wall) */
+        }
+        if (timed_out) {
+            struct process_info procs[MAX_PROCESSES];
+            int n = process_list(procs, MAX_PROCESSES);
+            kprintf("[externdiag] TIMED OUT. process table (%d):\n", n);
+            for (int i = 0; i < n; i++) {
+                const char *st = "?";
+                switch (procs[i].state) {
+                case PROCESS_READY:   st = "READY";   break;
+                case PROCESS_RUNNING: st = "RUNNING"; break;
+                case PROCESS_BLOCKED: st = "BLOCKED"; break;
+                case PROCESS_ZOMBIE:  st = "ZOMBIE";  break;
+                default: break;
+                }
+                kprintf("  pid=%-3u ppid=%-3u %-8s %s\n",
+                        (unsigned int)procs[i].pid, (unsigned int)procs[i].parent_pid,
+                        st, procs[i].is_kthread ? "kthread" : "process");
+            }
+            /* the shell's own pump diagnostics land in a file (ring-3 console
+             * writes go to the screen, not serial) -- read them back here */
+            char dbg[400] = {0};
+            int dfd = vfs_open("/data/tmp/extdbg.txt", O_RDONLY, 0);
+            if (dfd >= 0) {
+                size_t r = 0;
+                vfs_fd_read(dfd, dbg, sizeof dbg - 1, &r);
+                vfs_close(dfd);
+                kprintf("[externdiag] shell pump dbg:\n%s", dbg);
+            } else {
+                kprintf("[externdiag] no /data/tmp/extdbg.txt (pump never hit no-progress)\n");
+            }
+            process_kill((uint32_t)p);
+        }
+        int c = timed_out ? -2 : process_wait((uint32_t)p);
+        kprintf("\n[cmd] test externdiag: rc=%d (%s)\n", c, timed_out ? "HUNG" : "completed");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test tcc tally") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc tally: VFS not registered\n"); return 1; }
+        char *env[] = { "HOME=/", NULL };
+        int ok = 1;
+
+        /* (1) compile each unit: tcc -c -I/data/src/shell src -o obj */
+        static const char *units[4][2] = {
+            { "/data/src/shell/tools/tally.c", "/data/tmp/ty_tally.o" },
+            { "/data/src/shell/sval/sval.c",   "/data/tmp/ty_sval.o"  },
+            { "/data/src/shell/value/value.c", "/data/tmp/ty_value.o" },
+            { "/data/src/shell/wire/wire.c",   "/data/tmp/ty_wire.o"  },
+        };
+        for (int u = 0; u < 4 && ok; u++) {
+            char *a[] = { "/data/apps/tcc/tcc.elf", "-c", "-I/data/src/shell",
+                          (char *)units[u][0], "-o", (char *)units[u][1], NULL };
+            int p = process_create_env("/data/apps/tcc/tcc.elf", a, 6, env, NULL, 0);
+            int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[tcc tally] cc %s -> exit=%d\n", units[u][0], c);
+            if (p < 0 || c != 0) ok = 0;
+        }
+
+        /* (2) link the four tcc-produced objects + the ABI into a NEW app,
+         * tally2 (bare `tally2` resolves to /data/apps/tally2/tally2.elf via
+         * eval_extern's ordered search). Separate invocation = the
+         * compile-then-link primitive. The host-built tally stays untouched as
+         * the A/B CONTROL for the pipeline oracle below. */
+        int lc = -1;
+        if (ok) {
+            (void)vfs_mkdir_path("/data/apps/tally2");   /* EEXIST is fine */
+            char *l[] = { "/data/apps/tcc/tcc.elf", "-static", "-nostdlib",
+                          "/system/abi/crt0.o", "/system/abi/syscalls.o",
+                          "/data/tmp/ty_tally.o", "/data/tmp/ty_sval.o",
+                          "/data/tmp/ty_value.o", "/data/tmp/ty_wire.o",
+                          "-lc", "-o", "/data/apps/tally2/tally2.elf", NULL };
+            int p = process_create_env("/data/apps/tcc/tcc.elf", l, 12, env, NULL, 0);
+            lc = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[tcc tally] link -> exit=%d\n", lc);
+            if (p < 0 || lc != 0) ok = 0;
+        }
+
+        /* (2b) look at what we installed (same readout as test tcc link). */
+        if (ok) {
+            unsigned char hdr[64] = {0};
+            struct vfs_stat st;
+            int have = (vfs_stat("/data/apps/tally2/tally2.elf", &st) == 0);
+            if (have) {
+                int fd = vfs_open("/data/apps/tally2/tally2.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+            }
+            int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[16] == 2;
+            kprintf("[tcc tally] installed tally2: %llu bytes, ET_EXEC=%d\n",
+                    have ? (unsigned long long)st.size : 0ULL, is_exec);
+            if (!is_exec) ok = 0;
+        }
+
+        /* (2c) direct spawn, NO pipeline: with a console stdin (not a FIFO),
+         * tally must print its "no structured input" usage line and exit 1 --
+         * separates "the binary starts and runs at all" from the pipeline
+         * plumbing before the oracle below. */
+        if (ok) {
+            char *d[] = { "/data/apps/tally2/tally2.elf", NULL };
+            int p = process_create_env("/data/apps/tally2/tally2.elf", d, 1, env, NULL, 0);
+            int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[tcc tally] direct spawn rc=%d (want 1; usage line above proves it ran)\n", c);
+            if (p < 0 || c != 1) ok = 0;
+        }
+
+        /* (3) the A/B oracle, each leg TIMEOUT-GUARDED (a wedged pipeline must
+         * fail the test, not the whole console): control = host-built tally,
+         * experiment = our tcc-built tally2, same input. Both numbers land on
+         * serial; both legs exiting 0 is the machine verdict. */
+        if (ok) {
+            static const char *legs[2] = { "ls / | tally | get rows",
+                                           "ls / | tally2 | get rows" };
+            for (int g = 0; g < 2 && ok; g++) {
+                kprintf("[tcc tally] oracle %s: %s\n", g ? "EXPERIMENT" : "CONTROL", legs[g]);
+                char *s[] = { "/system/bin/shell.elf", "-c", (char *)legs[g], NULL };
+                int p = process_create("/system/bin/shell.elf", s, 3, NULL, 0);
+                if (p < 0) { ok = 0; break; }
+                uint64_t t0 = lapic_timer_get_ticks();
+                int timed_out = 0;
+                while (process_alive((uint32_t)p)) {
+                    __asm__ volatile ("sti; hlt");
+                    if (lapic_timer_get_ticks() - t0 > 4500) {   /* 45 s @100 Hz */
+                        timed_out = 1;
+                        kprintf("[tcc tally] %s TIMED OUT -- killing shell pid=%d\n",
+                                g ? "EXPERIMENT" : "CONTROL", p);
+                        process_kill((uint32_t)p);
+                        break;
+                    }
+                }
+                int c = timed_out ? -2 : process_wait((uint32_t)p);
+                kprintf("[tcc tally] %s rc=%d\n", g ? "EXPERIMENT" : "CONTROL", c);
+                if (c != 0) ok = 0;
+            }
+        }
+
+        kprintf("\n[cmd] test tcc tally: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

@@ -219,7 +219,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     if (has_input) {
         if (embk_fd_install_obj(pb[1], EXT_FD_INPUT_WRITE) < 0) {
             embk_close_handle(pb[1]);
-            embk_close_handle(EXT_FD_OUTPUT_READ);
+            close(EXT_FD_OUTPUT_READ);   /* an FD (self-installed above), not a handle */
             wire_buf_free(&inframe);
             shell_tty_resume();
             embk_wait((int)child);
@@ -255,7 +255,15 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
              * replaced, which fired only under scheduler pressure. */
         }
         if (off >= inframe.len) {
-            embk_close_handle(EXT_FD_INPUT_WRITE);           /* EOF to the child */
+            /* EOF to the child. close(), NOT embk_close_handle():
+             * EXT_FD_INPUT_WRITE is an FD (self-installed via fd_install_obj;
+             * its handle was closed right after installing). close_handle(10)
+             * silently hit an unrelated/empty HANDLE slot, the pipe's write end
+             * stayed open, the child never saw EOF, and every extern CONSUMER
+             * pipeline (`ls / | tally`) wedged: child blocked on stdin forever,
+             * this pump spinning in the drain. The drain's own close at the
+             * bottom of this function always had it right. */
+            close(EXT_FD_INPUT_WRITE);
             in_open = false;
             progress = true;
         }
@@ -284,7 +292,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
             embk_yield();
         }
     }
-    if (in_open) embk_close_handle(EXT_FD_INPUT_WRITE);      /* error exit mid-feed */
+    if (in_open) close(EXT_FD_INPUT_WRITE);      /* error exit mid-feed (an FD, see above) */
     wire_buf_free(&inframe);
 
     /* --- stdin done: drain the output to EOF --- */
