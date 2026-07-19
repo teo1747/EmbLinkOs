@@ -1,6 +1,6 @@
 # EmbLinkOS — Project Status & Handoff
 
-*Last updated: 2026-07-13. Living document — reconciled from two previously
+*Last updated: 2026-07-19. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
 first (the intended design and the decisions behind it), then this file
@@ -922,13 +922,23 @@ cannot do). "Self-hosting for C" remains the accurate phrase.
 
 What's left:
 
-1. **Native shell/coreutils** — the structured shell has shipped
-   ([SHELL.md](SHELL.md)); coreutils and a real TTY remain. The GUI stack
-   landing first means a native *editor* is now also plausible as an EmUI
-   app before a text shell exists — worth reconsidering that ordering. See
-   `docs/ARCHITECTURE.md` §5 for the current critical-path roadmap.
-2. **A real TTY** — scrollback, line editing — for whichever of the above
-   needs a text console; the framebuffer console today is output-only.
+1. **The build tool** — the make-equivalent, now the *last named item*
+   between "self-hosting for C" and rebuild-self. Its primitive is already
+   proven end-to-end: `test tcc tally` compiles four translation units on-OS,
+   links the tcc-produced objects in a separate invocation, installs the
+   result, and A/B-runs it against the host-built original through the live
+   shell pipeline. What remains is the orchestrator itself — decided as a
+   **native structured tool** (targets as typed records, recipes as spawn
+   argvs, staleness by content hash; rationale in TODO.md), with a make port
+   deferred to the ports/compat story. v1 scope: rebuild tally + sysinfo
+   from `/data/src`.
+2. ~~**A real TTY**~~ — **shipped**: the kernel console has a cooked/raw
+   line discipline with blocking reads and routed ^C ([INTERRUPTION.md]
+   (INTERRUPTION.md)), the shell does its own raw-mode line editing with
+   history recall, and the Terminal app (`term.elf`) adds scrollback.
+   Coreutils breadth remains open, but the structured shell's builtins +
+   sval tools cover the daily set; new tools are one `/data/apps` directory
+   each — and, since `test tcc tally`, can in principle be *built on the OS*.
 3. **Per-CPU run queues** — the one piece of the SMP work deliberately left
    unbuilt: the single global `g_sched_lock` is the shipped design, and
    per-CPU queues are scoped as the *next* step only once that lock is
