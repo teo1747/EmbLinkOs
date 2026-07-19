@@ -70,12 +70,25 @@ first adoption event is real: 12 units TCC-built to staging; the STAGED
 shell passes the `-c` oracles (expression eval, `where`/`sort-by`/`select`
 pipeline, an extern `tally` pipeline); the system snapshots
 (`pre-shell-adopt`) and copies staged → `/system/bin/shell.elf` (191,904
-bytes); the ADOPTED shell passes the same oracles — every pipeline in the
-system now runs through a shell the system built for itself. The build tool
-never touched `/system`: the manifest has no install stanza, and the
+bytes); the ADOPTED shell passes the same oracles — every pipeline that
+reaches `/system/bin/shell.elf` (the terminal, `test extern`) now runs
+through a shell the system built for itself, on its next spawn. The build
+tool never touched `/system`: the manifest has no install stanza, and the
 seal-crossing copy is the system's act. (This also flushed out
 `SPAWN_ARGV_MAX` 16 → 32 — the first machine-generated argv, a 19-entry
 link line, outgrew a limit sized for hand-typed commands.)
+
+Two boundaries stated plainly, so the headline is not mistaken for more than
+it is:
+- **Verification depth.** The staged/adopted shell is proven by three `-c`
+  oracles (expression eval, a `where`/`sort-by`/`select` pipeline, an extern
+  `tally` pipeline), *not* the full 38-test host suite. It is "a working
+  shell across the paths that matter," not "byte-for-byte the host shell"
+  (different compiler — nor should it be).
+- **Adoption depth.** The ritual exercised is snapshot → copy → re-spawn.
+  The `reboot` leg of §3 was not run, and nothing at boot spawns the shell
+  anyway (boot goes to `home.elf`); "adopted" here means the file is
+  replaced and used on next spawn, with the snapshot as the rollback.
 
 ## 4. Staleness — content, not time
 

@@ -922,12 +922,19 @@ cannot do). "Self-hosting for C" remains the accurate phrase.
 
 What's left:
 
-1. ~~**embbuild**~~ — ✅ **the OS rebuilds its own userland.** EmbBuild
-   (BUILD.md) rebuilds tally, sysinfo, itself, and — the headline —
-   **the shell**, whose TCC-built successor was staged, verified, and
-   ADOPTED into the sealed `/system/bin` (snapshot → copy): every pipeline
-   in the system now runs through a shell the system built for itself
-   (`test embbuild shell`). What remains is breadth, not capability. The
+1. ~~**embbuild**~~ — ✅ **the OS rebuilds the static-C core of its own
+   userland, the shell included.** EmbBuild (BUILD.md) rebuilds tally,
+   sysinfo, itself, and — the headline — **the shell**, whose TCC-built
+   successor was staged, verified, and ADOPTED into the sealed `/system/bin`
+   (snapshot → copy): pipelines that reach `/system/bin/shell.elf` now run
+   through a shell the system built for itself (`test embbuild shell`).
+   **Honest boundary, same shape as "self-hosting for C":** that C core is
+   the shell plus the sval-family tools — *not* the GUI. `home.elf` and
+   every EmUI app are dynamically linked against `libembk.so`, which TCC
+   cannot produce (no dynamic linking, no TLS, no C++); the kernel wants
+   GCC. So this is "rebuilds its own **static-C** userland," and what
+   remains for the *rest* of the userland is a capability question (dynamic
+   linking / a gcc-shaped or extended toolchain), not just breadth. The
    original entry, for the record:
 
    **embbuild** — the make-equivalent, the last named item between
