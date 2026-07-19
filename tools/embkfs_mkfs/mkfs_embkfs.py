@@ -70,6 +70,20 @@ NOW_NS = int(time.time() * 1_000_000_000)
 # it just cannot link, which is exactly the truth of that image.
 NEWLIB_LIBC = os.environ.get("EMBK_NEWLIB_LIBC", "")
 
+# The HEADER trees tcc searches ON the OS (same Makefile-owns-the-path rule as
+# NEWLIB_LIBC above):
+#   EMBK_NEWLIB_INC -> /system/abi/include    newlib's headers: declaring the
+#                      libc IS part of the ABI contract, so they live with
+#                      crt0.o/syscalls.o/libc.a in the sealed region.
+#   EMBK_TCC_INC    -> /data/apps/tcc/include tcc's own compiler headers
+#                      (stddef.h/stdarg.h/...): they belong to the COMPILER,
+#                      so they live with the app.
+# Both must mirror what tools/tcc/build-tcc-emblink.sh bakes into tcc's
+# sysinclude paths. Empty -> not packed: tcc then compiles only header-free
+# programs, which is the truth of that image.
+NEWLIB_INC = os.environ.get("EMBK_NEWLIB_INC", "")
+TCC_INC    = os.environ.get("EMBK_TCC_INC", "")
+
 
 # --- helper: CRC32C-based name hash for directory-entry keys (spec §7.2/§9.2) ---
 def name_hash(name: bytes) -> int:
@@ -634,6 +648,31 @@ def _read_file(path):
         return None
 
 
+def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
+    """Walk a HOST directory tree and emit (name, dtype, mode, data) objects
+    placing every file under `image_prefix` on the image, preserving relative
+    paths (build_root_items auto-creates the intermediate dirs from the
+    '/'-joined names). `suffix` filters by extension (e.g. ".h") so a header
+    pack can't accidentally drag in stray build residue. Sorted for a
+    deterministic image. Empty/missing host_dir -> no objects (honest: the
+    capability is absent from that image, not faked)."""
+    out = []
+    if not host_dir or not os.path.isdir(host_dir):
+        return out
+    for root, dirs, files in os.walk(host_dir):
+        dirs.sort()
+        for fn in sorted(files):
+            if suffix and not fn.endswith(suffix):
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, host_dir).replace(os.sep, "/")
+            data = _read_file(full)
+            if data is not None:
+                out.append((image_prefix + rel.encode(), L.DT_REG,
+                            L.S_IFREG | L.PERM_FILE, data))
+    return out
+
+
 # --- the userspace LAYOUT (docs/USERSPACE.md §6) --------------------------
 # The boot image is a TREE, not a flat root. Placement follows the sealed/mutable
 # boundary (D2 §3): the system's own programs + the ABI are sealed under /system;
@@ -703,6 +742,35 @@ def discover_userland_objects(build_dir="build"):
     libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
     if libc is not None:
         objects.append((b"system/abi/libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
+
+    # THE HEADERS (the other half of "targeting EmbLinkOS"): newlib's include
+    # tree under /system/abi/include (declaring the libc is part of the sealed
+    # ABI contract, next to the objects that implement it), and tcc's own
+    # compiler headers (stddef.h/stdarg.h/...) under /data/apps/tcc/include
+    # (they belong to the COMPILER, so they live with the app). These two paths
+    # are exactly tcc's baked-in sysinclude search order
+    # (tools/tcc/build-tcc-emblink.sh) -- with them packed, `#include <stdio.h>`
+    # resolves ON the OS and tcc can compile real programs, not just
+    # header-free toys. ~140 files, ~1.1 MB.
+    objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
+    objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+
+    # SOURCE on the image: tally's exact closure (the reference pipeline
+    # consumer + the sval SDK it links), preserved with its tree shape so the
+    # quote-includes ("sval/sval.h", "value/value.h") resolve with a single
+    # -I/data/src/shell -- the same layout the host build compiles with
+    # (SHELL_INC = -Ishell). This is what `test tcc tally` rebuilds ON the OS
+    # and installs over /data/apps/tally/tally.elf: the first component of the
+    # system rebuilt by the system. An explicit list, not a tree walk -- the
+    # closure is the point (7 files, ~1400 lines), not the whole shell/.
+    _TALLY_SRC = ("tools/tally.c", "sval/sval.c", "sval/sval.h",
+                  "value/value.c", "value/value.h",
+                  "wire/wire.c", "wire/wire.h")
+    for rel in _TALLY_SRC:
+        blob = _read_file(f"shell/{rel}")
+        if blob is not None:
+            objects.append((b"data/src/shell/" + rel.encode(),
+                            L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
     # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
     # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the

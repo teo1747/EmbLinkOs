@@ -14,7 +14,7 @@ and TCC, and **zero** to git.
 | C++ / libstdc++ | runs | `test cxx` → 13/13 | — |
 | CPython 3.14 | runs | `test python` → "hello from CPython on EmbLink" | `-cpu max` |
 | git 2.49 | runs | `test git repo` → a real root commit | `-cpu max` |
-| **TCC 0.9.27** | **runs, and compiles** | **`test tcc link` → `exit=42`** | — |
+| **TCC 0.9.27** | **runs, and compiles real `#include` programs** | **`test tcc real` → `exit=42` + byte-exact stdio output** | — |
 
 `-cpu max` is not a QEMU nicety: `getentropy()` here is RDRAND-backed and
 **refuses to fabricate entropy**, returning `ENOSYS` on a CPU without it. Both
@@ -89,11 +89,51 @@ leaving the OS:
 was really compiled and really executed. A valid-looking ELF would prove only
 that the writer works; `tcc -v` exiting 0 would prove nothing at all.
 
-**The flat root is the search path.** mkfs packs no directories, so `crt0.o`,
-`syscalls.o` and `libc.a` (6.6 MB — the largest object on the image) live at
-`/`, and tcc is told `-L/`. No `/lib`, no `/include`, no directory support
-needed. `libc.a` is the *same archive* the cross-build uses, so a program built
-**on** EmbLink and one built **for** it are the same program.
+That toy was deliberately header-free and pulled **zero** members out of
+`libc.a`. `test tcc real` closes the remaining distance — a **real** program,
+`#include <stdio.h>`/`<string.h>`/`<stdint.h>`, compiled against the on-image
+newlib headers, linked with a bare `-lc` (tcc's baked-in `/system/abi` libpath,
+no `-L`, no `-lgcc`), then run:
+
+```
+[tcc real] -static -nostdlib /data/tmp/r.c /system/abi/crt0.o /system/abi/syscalls.o -lc -o /data/tmp/r.elf
+[tcc real] tcc exit=0
+[tcc real] r.elf (92916 bytes) ran: exit=42 (want 42)
+[tcc real] r.out: byte-exact (got "hdr=ok n=42")
+```
+
+The proof is twofold: the computed exit code, and the file the program wrote
+through **buffered stdio** — `fopen`/`fprintf`/`fclose` drag in dozens of
+`libc.a` members and hundreds of cross-object calls (exactly the load the
+PLT32 patch must survive at scale), and the bytes read back exact. The binary
+is the same size as its host-linked twin.
+
+And `test tcc tally` closes the loop: **the OS rebuilds one of its own tools
+from source.** mkfs packs tally's exact 7-file closure (the sval SDK it links)
+at `/data/src/shell/`; on-OS, tcc compiles the four units (`-c
+-I/data/src/shell`, quote-includes resolving exactly as the host build's
+`-Ishell`), a **separate invocation links the four tcc-produced objects** —
+the compile-then-link shape every build tool assumes — installs the result as
+`/data/apps/tally2/tally2.elf`, and the shell then runs it as a genuine
+pipeline stage: `ls / | tally2 | get rows` agrees with the host-built `tally`
+on the same input (an A/B the test performs each run). Debugging this oracle
+also flushed out and fixed a real shell bug: `eval_extern`'s streaming pump
+closed the child's stdin write end with `embk_close_handle()` on an *fd*
+number, so no consumer ever saw EOF — every `x | tally` pipeline had been
+wedging since the pump rework landed.
+
+**The ABI directory is the search path.** Since the §6.1 layout migration the
+toolchain inputs live in the sealed ABI: `/system/abi/{crt0.o, syscalls.o,
+libc.a}` — `libc.a` (6.6 MB) is the *same archive* the cross-build uses, so a
+program built **on** EmbLink and one built **for** it are the same program.
+tcc's search paths are baked in at configure time
+(`tools/tcc/build-tcc-emblink.sh`): `-lXXX` resolves in `/system/abi`, and
+`#include <...>` resolves in `/system/abi/include` (newlib's full header tree —
+declaring the libc is part of the ABI contract, so the headers live beside the
+objects that implement it) then `/data/apps/tcc/include` (tcc's own compiler
+headers — `stddef.h`, `stdarg.h`, … — which belong to the compiler, so they
+live with the app). Both trees are packed by mkfs from `EMBK_NEWLIB_INC` /
+`EMBK_TCC_INC` (Makefile-derived, like `EMBK_NEWLIB_LIBC`).
 
 **`-static -nostdlib` are load-bearing, not tidiness.** `-nostdlib` drops tcc's
 host `crt1/crti/crtn` (wrong here — our entry contract is crt0's
@@ -103,7 +143,7 @@ interpreter to be exec'd — a Linux contract this OS does not implement and wil
 not. `e_phnum` (2 static, 5 dynamic) is printed by the test as the direct
 readout of that.
 
-### Our one TCC patch, and why a pristine tcc is dangerous
+### Our two TCC patches, and why a pristine tcc is dangerous
 
 `tools/tcc/0001-static-link-plt32-is-pc32.patch` — in a static link,
 `R_X86_64_PLT32` must become a plain `PC32` call.
@@ -119,6 +159,21 @@ this path for **every ordinary call** — 407 of them (`main`, `malloc`, `memcpy
 **It does not fail at build time.** tcc exits 0, the ELF is valid, and the
 program dies at a wild jump. That silence is why the patch is applied by
 `tools/tcc/build-tcc-emblink.sh` and not left to a README instruction.
+
+`tools/tcc/0002-x86_64-gcc-type-macros.patch` — tcc 0.9.27 predefines almost
+none of GCC's type/limit macros (`__INT64_TYPE__`, `__INTPTR_TYPE__`, …), and
+newlib's headers select every fixed-width type from them **unconditionally**:
+`sys/_intsup.h` redefines the type keywords as small integers and evaluates
+`__INTPTR_TYPE__` *arithmetically*, then `#error`s without it. So a pristine
+tcc compiles header-free toys and nothing else — the very first real
+`#include <stdint.h>` dies. The patch defines the 67 missing macros for x86_64
+LP64, values taken verbatim from `x86_64-elf-gcc -dM -E` on the same target
+(nothing hand-derived). Proven on the host before it reached the OS: a native
+tcc with this patch compiles a five-header program against the real newlib
+tree, and the object links against `crt0.o + syscalls.o + libc.a` with zero
+undefined symbols — **and no `libgcc`** (measured: `libc.a` references no
+`__*ti3`-class intrinsics at all, so `-lgcc` is genuinely unnecessary on this
+target, not skipped on hope).
 
 ### Known limits (all real, none hidden)
 
