@@ -1,0 +1,41 @@
+# /data/src/sysinfo/build.ebm -- EmbBuild target #2 (BUILD.md §10).
+# Same shape as tally's manifest; sysinfo additionally includes the ABI's
+# embk.h (-I/system/abi/include, stated explicitly even though it is also in
+# tcc's baked sysinclude -- a manifest should read as the whole truth).
+
+project: sysinfo
+
+name: sysinfo.o
+kind: compile
+inputs: /data/src/sysinfo/sysinfo.c /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell -I/system/abi/include /data/src/sysinfo/sysinfo.c -o /data/build/out/sysinfo/sysinfo.o
+output: /data/build/out/sysinfo/sysinfo.o
+
+name: sval.o
+kind: compile
+inputs: /data/src/shell/sval/sval.c /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/sval/sval.c -o /data/build/out/sysinfo/sval.o
+output: /data/build/out/sysinfo/sval.o
+
+name: value.o
+kind: compile
+inputs: /data/src/shell/value/value.c /data/src/shell/value/value.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/value/value.c -o /data/build/out/sysinfo/value.o
+output: /data/build/out/sysinfo/value.o
+
+name: wire.o
+kind: compile
+inputs: /data/src/shell/wire/wire.c /data/src/shell/wire/wire.h /data/src/shell/value/value.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/wire/wire.c -o /data/build/out/sysinfo/wire.o
+output: /data/build/out/sysinfo/wire.o
+
+name: sysinfo.elf
+kind: link
+inputs: /data/build/out/sysinfo/sysinfo.o /data/build/out/sysinfo/sval.o /data/build/out/sysinfo/value.o /data/build/out/sysinfo/wire.o
+args: /data/apps/tcc/tcc.elf -static -nostdlib /system/abi/crt0.o /system/abi/syscalls.o /data/build/out/sysinfo/sysinfo.o /data/build/out/sysinfo/sval.o /data/build/out/sysinfo/value.o /data/build/out/sysinfo/wire.o -lc -o /data/build/out/sysinfo/sysinfo.elf
+output: /data/build/out/sysinfo/sysinfo.elf
+
+name: install
+kind: install
+inputs: /data/build/out/sysinfo/sysinfo.elf
+output: /data/apps/sysinfo/sysinfo.elf

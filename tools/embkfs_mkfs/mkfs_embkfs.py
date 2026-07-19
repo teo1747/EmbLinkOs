@@ -779,9 +779,17 @@ def discover_userland_objects(build_dir="build"):
     # closure, unchanged) and /data/src/tally (the manifest's project) -- a
     # 2 KB duplication kept so the existing green test stays untouched;
     # collapse when embbuild subsumes the hand-rolled test.
-    for host, image in (("shell/tools/tally.c",         b"data/src/tally/tally.c"),
-                        ("shell/tools/tally.build.ebm", b"data/src/tally/build.ebm"),
-                        ("shell/tools/embbuild.c",      b"data/src/embbuild/embbuild.c")):
+    for host, image in (("shell/tools/tally.c",            b"data/src/tally/tally.c"),
+                        ("shell/tools/tally.build.ebm",    b"data/src/tally/build.ebm"),
+                        ("shell/tools/sysinfo.c",          b"data/src/sysinfo/sysinfo.c"),
+                        ("shell/tools/sysinfo.build.ebm",  b"data/src/sysinfo/build.ebm"),
+                        ("shell/tools/embbuild.c",         b"data/src/embbuild/embbuild.c"),
+                        ("shell/tools/embbuild.build.ebm", b"data/src/embbuild/build.ebm"),
+                        # embk.h + embk_syscall.h: the ABI's userspace surface
+                        # -- sysinfo.c and embbuild.c #include them, so
+                        # declaring the ABI joins the ABI (BUILD.md's rule).
+                        ("user/lib/embk.h",                b"system/abi/include/embk.h"),
+                        ("user/lib/embk_syscall.h",        b"system/abi/include/embk_syscall.h")):
         blob = _read_file(host)
         if blob is not None:
             objects.append((image, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))

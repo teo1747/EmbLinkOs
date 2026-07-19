@@ -419,6 +419,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc real\n");
     kprintf("  test tcc tally\n");
     kprintf("  test embbuild\n");
+    kprintf("  test embbuild self\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -1948,6 +1949,81 @@ int selftests_handle_command(const char *cmd)
         }
         int c = timed_out ? -2 : process_wait((uint32_t)p);
         kprintf("\n[cmd] test externdiag: rc=%d (%s)\n", c, timed_out ? "HUNG" : "completed");
+        return 1;
+    }
+
+/* EMBBUILD TARGETS #2 + #3 (docs/BUILD.md §10): sysinfo, then THE LOOP-CLOSER
+ * -- EmbBuild rebuilds EmbBuild, and the TCC-built successor is cross-checked
+ * against its gcc-built parent:
+ *   (1) tally manifest, gcc-built tool: 6 ran (fresh stamps for the oracle)
+ *   (2) sysinfo manifest: 6 ran + the rebuilt sysinfo runs a live pipeline
+ *   (3) embbuild manifest: 6 ran -- TCC compiles the build tool, EmbBuild
+ *       installs its own successor into /data/apps (no seal crossed)
+ *   (4) THE ORACLE: the STAGED, TCC-built embbuild reruns the tally manifest
+ *       and must say "0 ran, 6 up_to_date" -- two implementations of the tool
+ *       agreeing on the state of the world (the EMBKFS two-oracle pattern)
+ *   (5) the INSTALLED successor reruns its OWN manifest: "0 ran, 6 up_to_date"
+ *       -- the loop closes on itself */
+    if (strcmp(cmd, "test embbuild self") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild self: VFS not registered\n"); return 1; }
+        static char cap[4096];
+        int ok = 1, rc;
+        char *bb    = "/data/apps/embbuild/embbuild.elf";
+        char *bb_st = "/data/build/out/embbuild/embbuild.elf";
+
+        kprintf("[embbuild-self] (1) tally manifest, gcc-built tool\n");
+        char *m_tally[] = { bb, "/data/src/tally/build.ebm", NULL };
+        rc = emb_run_cap(bb, m_tally, 2, cap, sizeof cap);
+        if (rc != 0 || !emb_find(cap, "6 ran, 0 up_to_date")) { kprintf("[embbuild-self] (1) FAIL rc=%d\n", rc); ok = 0; }
+
+        if (ok) {
+            kprintf("[embbuild-self] (2) sysinfo manifest + oracle\n");
+            char *m_si[] = { bb, "/data/src/sysinfo/build.ebm", NULL };
+            rc = emb_run_cap(bb, m_si, 2, cap, sizeof cap);
+            if (rc != 0 || !emb_find(cap, "6 ran, 0 up_to_date")) { kprintf("[embbuild-self] (2) FAIL rc=%d\n", rc); ok = 0; }
+            if (ok) {
+                char *o[] = { "/system/bin/shell.elf", "-c", "sysinfo | get processes", NULL };
+                int p = process_create("/system/bin/shell.elf", o, 3, NULL, 0);
+                int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+                kprintf("[embbuild-self] (2) rebuilt sysinfo pipeline rc=%d\n", c);
+                if (c != 0) ok = 0;
+            }
+        }
+
+        if (ok) {
+            kprintf("[embbuild-self] (3) embbuild rebuilds embbuild\n");
+            char *m_self[] = { bb, "/data/src/embbuild/build.ebm", NULL };
+            rc = emb_run_cap(bb, m_self, 2, cap, sizeof cap);
+            if (rc != 0 || !emb_find(cap, "6 ran, 0 up_to_date")) { kprintf("[embbuild-self] (3) FAIL rc=%d\n", rc); ok = 0; }
+            if (ok) {   /* what got installed is a runnable ELF, and TCC-sized */
+                unsigned char hdr[20] = {0}; struct vfs_stat st;
+                int have = (vfs_stat("/data/apps/embbuild/embbuild.elf", &st) == 0);
+                if (have) {
+                    int fd = vfs_open("/data/apps/embbuild/embbuild.elf", O_RDONLY, 0);
+                    if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+                }
+                int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[16] == 2;
+                kprintf("[embbuild-self] (3) installed successor: %llu bytes, ET_EXEC=%d\n",
+                        have ? (unsigned long long)st.size : 0ULL, is_exec);
+                if (!is_exec) ok = 0;
+            }
+        }
+
+        if (ok) {
+            kprintf("[embbuild-self] (4) ORACLE: staged TCC-built tool vs tally stamps\n");
+            char *m4[] = { bb_st, "/data/src/tally/build.ebm", NULL };
+            rc = emb_run_cap(bb_st, m4, 2, cap, sizeof cap);
+            if (rc != 0 || !emb_find(cap, "0 ran, 6 up_to_date")) { kprintf("[embbuild-self] (4) FAIL rc=%d\n", rc); ok = 0; }
+        }
+
+        if (ok) {
+            kprintf("[embbuild-self] (5) installed successor vs its OWN manifest\n");
+            char *m5[] = { bb, "/data/src/embbuild/build.ebm", NULL };   /* bb is now TCC-built */
+            rc = emb_run_cap(bb, m5, 2, cap, sizeof cap);
+            if (rc != 0 || !emb_find(cap, "0 ran, 6 up_to_date")) { kprintf("[embbuild-self] (5) FAIL rc=%d\n", rc); ok = 0; }
+        }
+
+        kprintf("\n[cmd] test embbuild self: %s\n", ok ? "OK (loop closed)" : "FAIL");
         return 1;
     }
 

@@ -136,9 +136,25 @@ option's primitive already ran. Exit 42.
 `clean` is honest and total: `rm -r /data/build`. All tool-owned state
 lives in one deletable directory.
 
-## 10. v1 scope + acceptance
+## 10. v1 scope + acceptance — ✅ COMPLETE, including target #3
 
-Rebuild `tally` and `sysinfo` from `/data/src` via manifests. Green =
+All three targets are live (`test embbuild` a–f + `test embbuild self`):
+tally and sysinfo rebuild from `/data/src` via manifests, and **EmbBuild
+rebuilds EmbBuild** — the TCC-built successor is staged, installed to
+`/data/apps/embbuild/` (an apps write, no seal crossed), and cross-checked
+two ways: the STAGED successor reruns the tally manifest and reports
+`0 ran, 6 up_to_date` (a gcc-built tool and its TCC-built child agreeing on
+the state of the world — the two-implementations oracle), and the INSTALLED
+successor reruns its own manifest to the same verdict. Closing the loop
+surfaced two real bugs beneath it: the ABI's syscall stubs were gcc-only
+(`register …asm("r10")` bindings tcc ignores — embk_syscall.h now carries a
+`__TINYC__` branch passing high args through memory), and **tcc 0.9.27 never
+relocates the GOT in static links** (the relocation walk skips `s1->got`;
+right with a dynamic loader, NULL-deref without one — every newlib
+`stderr`/`errno` is a GOTPCREL `_impure_ptr` access). That is
+`tools/tcc/0003-static-link-relocate-got.patch`, sibling of 0001.
+
+Original acceptance definition, all exercised: green =
 (a) both oracles pass on the staged binaries; (b) no-change rebuild is
 a no-op (stamps hit); (c) one edited byte rebuilds exactly that unit's
 chain; (d) one changed flag rebuilds despite identical sources —

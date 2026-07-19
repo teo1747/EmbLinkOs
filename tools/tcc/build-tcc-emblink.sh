@@ -56,6 +56,16 @@ else
     echo "  PATCH    0002-x86_64-gcc-type-macros"
     patch -p1 -d "$TCC_SRC" < "$HERE/0002-x86_64-gcc-type-macros.patch"
 fi
+# 0003: static links never relocated the GOT (the walk skips s1->got, right
+# only when a dynamic loader exists) -- every GOTPCREL data access (newlib's
+# stderr/errno = _impure_ptr) dereferenced a NULL slot. Found by EmbBuild
+# rebuilding EmbBuild.
+if grep -q 's1->static_link))' "$TCC_SRC/tccelf.c" && grep -q 'patch 0003' "$TCC_SRC/tccelf.c"; then
+    echo "  patch    0003 already applied"
+else
+    echo "  PATCH    0003-static-link-relocate-got"
+    patch -p1 -d "$TCC_SRC" < "$HERE/0003-static-link-relocate-got.patch"
+fi
 
 # --- configure ---------------------------------------------------------------
 # Each flag is decided by an EmbLink FACT; see docs/BUILD_SETUP.md for the why:
