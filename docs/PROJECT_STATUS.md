@@ -900,14 +900,25 @@ the full scheduler + SMP + thread/process split + ring-3 threads, EMBKFS
 v2's full feature set, **and** the newlib port, dynamic linking, the window
 compositor, and the EmUI GUI stack — all of which landed *ahead of* the
 self-hosting-first ordering originally sketched in `docs/ARCHITECTURE.md`)
-is now done — **and so is self-hosting for C**: TCC compiles, assembles, links
-and runs a program entirely on the OS (`test tcc link` → `exit=42`). The OS also
-hosts C++/libstdc++, CPython 3.14 and git 2.49; see [PORTS.md](PORTS.md).
+is now done — **and so is self-hosting for C, now with real headers**: TCC
+compiles, assembles, links and runs `#include`-using programs against the
+on-image newlib headers and `libc.a` (`test tcc real` → `exit=42`, byte-exact
+buffered-stdio output), and the OS has **rebuilt one of its own tools from
+source** — `tally`, four translation units compiled on-OS, linked in a
+separate invocation (the compile-then-link shape every build tool assumes),
+installed, and A/B-verified against the host-built original through the
+shell's live extern pipeline (`test tcc tally`). The OS also hosts
+C++/libstdc++, CPython 3.14 and git 2.49; see [PORTS.md](PORTS.md).
 
-**Honest scope of that claim:** the OS can compile and run C *on itself*. It
-cannot yet rebuild *itself* — that needs a make-equivalent and a real TTY, and
-the kernel build wants GCC (whose driver fork/execs `cc1`/`as`/`ld`, which this
-OS structurally cannot do). "Self-hosting for C" is the accurate phrase.
+**Honest scope of that claim:** the OS can compile, run, and now *rebuild its
+own static C programs*. It cannot yet rebuild *itself* wholesale: that needs a
+build orchestrator (decided: a native structured build tool — targets as typed
+records, recipes as spawn argvs, staleness by content hash — with a make port
+deferred to the future ports/compat story; see TODO.md), and the excluded
+classes are TCC facts, stated plainly — no `__thread` (TCC reads no
+`newlib.ld`/PT_TLS), no `libembk.so`-linked apps, no C++, and the kernel build
+wants GCC (whose driver fork/execs `cc1`/`as`/`ld`, which this OS structurally
+cannot do). "Self-hosting for C" remains the accurate phrase.
 
 What's left:
 

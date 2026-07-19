@@ -1,6 +1,7 @@
 #include "arch/x86_64/irq/lapic.h"
 #include "drivers/char/serial.h"
 #include "drivers/timer/hpet.h"
+#include "drivers/timer/timer.h"   /* tsc_read() / tsc_get_freq_hz() for TSC-deadline mode */
 #include "acpi/acpi.h"
 #include "include/kprintf.h"
 #include "mm/vmm.h"
@@ -11,10 +12,29 @@
 
 
 extern void lapic_timer_stub(void); // Forward declaration of the LAPIC timer handler defined in isr.asm
+extern void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr);
 
 static volatile uint8_t *lapic_base = NULL; // virtual address of local APIC registers
 static uint32_t lapic_timer_ticks_per_ms = 0; // calibrated timer ticks per millisecond for the local APIC timer
 static volatile uint64_t lapic_ticks = 0;
+
+/* Timer mode selected at init. TSC-deadline (when the CPU has it) arms an
+ * absolute deadline in TSC ticks each tick instead of a hardware-reloaded
+ * periodic count; the handler must re-arm. Shared across cores: the mode +
+ * period derive from the invariant TSC frequency the BSP calibrated once, so
+ * every AP reuses them. */
+static bool     lapic_timer_tsc_deadline = false;
+static uint64_t lapic_tsc_period = 0;   // TSC ticks per 100 Hz period
+
+#define IA32_TSC_DEADLINE_MSR   0x6E0
+
+// CPUID.01H:ECX[24] = TSC-Deadline supported by this core's local APIC.
+static bool tsc_deadline_supported(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+    return (c & (1u << 24)) != 0;
+}
+// lapic_timer_arm_tsc_deadline() is defined after wrmsr(), below.
 
 // Read a 32 bit LAPIC register
 static inline uint32_t lapic_read(uint32_t reg){
@@ -38,6 +58,15 @@ static inline void wrmsr(uint32_t msr, uint64_t value){
     uint32_t low = (uint32_t)value;
     uint32_t high = (uint32_t)(value >> 32);
     __asm__ volatile ("wrmsr" : : "c"(msr), "a"(low), "d"(high));
+}
+
+
+// Arm the next TSC-deadline tick: write the ABSOLUTE TSC value at which the LVT
+// timer should next fire. Self-correcting (measured from the current TSC, not a
+// running phase), so a late tick never causes a back-to-back storm. Defined here
+// -- after wrmsr() above -- so its call is a declared function, not implicit.
+static void lapic_timer_arm_tsc_deadline(void) {
+    wrmsr(IA32_TSC_DEADLINE_MSR, tsc_read() + lapic_tsc_period);
 }
 
 
@@ -171,6 +200,37 @@ uint32_t lapic_get_id(void) {
 
 void lapic_timer_init(uint8_t vector) {
 
+    /* Prefer TSC-deadline mode when the CPU advertises it (CPUID.01H:ECX[24])
+     * and the TSC frequency is known. It arms an ABSOLUTE deadline in TSC ticks
+     * -- no divisor to pick, no second clock domain to calibrate, no periodic
+     * drift -- and is the mode modern kernels use. Requires the TSC to have been
+     * calibrated first (main.c calls tsc_calibrate() before this; APs inherit
+     * the BSP's invariant-TSC frequency). Everything without it -- e.g. QEMU's
+     * default qemu64 CPU -- falls through to the periodic LVT path below, so the
+     * common local setup is unaffected.
+     *
+     * VERIFICATION NOTE: this branch is UNEXERCISED in our bring-up. QEMU's TCG
+     * APIC does not implement TSC-deadline, so it clears CPUID.01H:ECX[24] on
+     * every CPU model (confirmed: even -cpu max and an explicit +tsc-deadline
+     * read the bit as 0), and no KVM is available here to advertise it. The gate
+     * therefore always picks periodic under TCG; this path activates only on
+     * KVM/real hardware. Written to the SDM (Vol.3 10.5.4.1) but not yet run. */
+    if (tsc_deadline_supported() && tsc_get_freq_hz() != 0) {
+        lapic_timer_tsc_deadline = true;
+        lapic_tsc_period = tsc_get_freq_hz() / 100;   // 100 Hz quantum
+
+        /* SDM Vol.3 10.5.4.1: set the LVT to TSC-deadline mode, then MFENCE to
+         * order that write ahead of the first WRMSR that arms the deadline. */
+        lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_TSC_DEADLINE | vector);
+        __asm__ volatile ("mfence" ::: "memory");
+        lapic_timer_arm_tsc_deadline();
+
+        idt_set_entry(vector, (uint64_t)lapic_timer_stub, 0x8E);
+        kprintf("LAPIC timer: TSC-deadline mode, period=%lu TSC ticks (100 Hz), vector=%u\n",
+                (unsigned long)lapic_tsc_period, (unsigned int)vector);
+        return;
+    }
+
     serial_write_string("\n=== LAPIC timer calibration ===\n");
     // Calibrate the LAPIC timer against the HPET (preferred) or PIT
     const uint32_t calibration_time_ms = 10;
@@ -206,7 +266,6 @@ void lapic_timer_init(uint8_t vector) {
     lapic_write(LAPIC_REG_TIMER_INIT, initial_count); // Set the initial count for 100 Hz
     kprintf("LAPIC timer: configured for 100 Hz with initial (count= %u), vector=%u \n", (unsigned int)initial_count, (unsigned int)vector);
 
-    extern void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr);
     idt_set_entry(vector, (uint64_t)lapic_timer_stub, 0x8E); // Set the LAPIC timer handler in the IDT
 }
 
@@ -225,6 +284,15 @@ void lapic_timer_handler(void){
     lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
                       // below, so the LAPIC can keep delivering interrupts to
                       // whichever process ends up running next.
+
+    /* TSC-deadline mode is one-shot: the LVT fired and disarmed itself, so
+     * re-arm the next deadline every tick or this core stops ticking. Do it
+     * AFTER the EOI and BEFORE schedule() -- schedule() may switch away for a
+     * full quantum and not return here, so the next deadline must already be
+     * set. Periodic mode reloads in hardware, so it skips this. */
+    if (lapic_timer_tsc_deadline) {
+        lapic_timer_arm_tsc_deadline();
+    }
 
     /* Timer-driven preemption (docs/architecture/process-and-scheduling.md
      * §13 Phase B): give every READY process a turn every tick (100 Hz, a

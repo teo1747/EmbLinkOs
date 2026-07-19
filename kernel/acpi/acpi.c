@@ -161,6 +161,17 @@ static void parse_madt(struct madt *madt){
                 kprintf(" IRQ Override: src=%u -> gsi=%u flags=%x\n",
                     (unsigned int)ov->source, (unsigned int)ov->global_system_interrupt,
                     (unsigned int)ov->flags);
+                /* STORE it (previously only printed): the routing side consults
+                 * these via acpi_resolve_isa_irq() so an ISA IRQ lands on the
+                 * GSI the firmware actually wired it to, with the right
+                 * polarity/trigger -- rather than assuming GSI == IRQ. */
+                if (info.int_override_count < ACPI_MAX_INT_OVERRIDES) {
+                    struct acpi_int_override *dst =
+                        &info.int_overrides[info.int_override_count++];
+                    dst->source = ov->source;
+                    dst->gsi    = ov->global_system_interrupt;
+                    dst->flags  = ov->flags;
+                }
                 break;
             }
 
@@ -182,6 +193,7 @@ const struct acpi_info *acpi_init(void) {
     info.local_apic_address = 0;
     info.cpu_count = 0;
     info.io_apic_count = 0;
+    info.int_override_count = 0;
     info.hpet_found = false;
     info.hpet_address = 0;
     info.hpet_minimum_tick = 0;
@@ -237,4 +249,35 @@ const struct acpi_info *acpi_init(void) {
 
 const struct acpi_info *acpi_get_info(void) {
     return &info;
+}
+
+void acpi_resolve_isa_irq(uint8_t isa_irq, uint32_t *out_gsi,
+                          bool *out_active_low, bool *out_level) {
+    /* ISA defaults, used when no override names this IRQ: the line goes to the
+     * GSI of the same number, edge-triggered, active-high. */
+    uint32_t gsi        = isa_irq;
+    bool     active_low = false;
+    bool     level      = false;
+
+    for (uint32_t i = 0; i < info.int_override_count; i++) {
+        if (info.int_overrides[i].source != isa_irq)
+            continue;
+
+        gsi = info.int_overrides[i].gsi;
+
+        /* MPS INTI flags. Polarity in bits[1:0], trigger in bits[3:2]; a value
+         * of 00 means "conforms to the bus default", which for ISA is
+         * active-high + edge. Only the explicit "active low" (11b) / "level"
+         * (11b) encodings change anything. */
+        uint16_t flags = info.int_overrides[i].flags;
+        uint16_t pol = flags & 0x3;
+        uint16_t trg = (flags >> 2) & 0x3;
+        active_low = (pol == 0x3);
+        level      = (trg == 0x3);
+        break;
+    }
+
+    if (out_gsi)        *out_gsi = gsi;
+    if (out_active_low) *out_active_low = active_low;
+    if (out_level)      *out_level = level;
 }

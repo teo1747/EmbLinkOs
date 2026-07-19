@@ -1,0 +1,109 @@
+Subject: [PATCH 2/2] x86_64: predefine the GCC type/limit macros libc headers require
+
+tcc 0.9.27 predefines only __SIZE_TYPE__/__PTRDIFF_TYPE__/__WCHAR_TYPE__/
+__WINT_TYPE__.  Modern libc headers select every fixed-width type from the
+full GCC macro family and fail hard without it -- newlib's
+machine/_default_types.h falls back to guessing, sys/_intsup.h #errors
+("Unable to determine type definition of intptr_t"): it evaluates
+__INTPTR_TYPE__ ARITHMETICALLY after redefining the type keywords as small
+integers, so no fallback can save it.  The result on EmbLink was that any
+program with a real #include could not be compiled on-OS at all.
+
+Define the missing 67 macros for x86_64 LP64 (non-PE), with values taken
+verbatim from `x86_64-elf-gcc -dM -E` on the same target -- nothing here is
+hand-derived.  The four macros tcc already defines are deliberately not
+repeated (equivalent spellings; repeating them only earns redefinition
+warnings).
+
+Proven on the host before it ever reached the OS: a native tcc with this
+patch compiles a program using <stdio.h>/<string.h>/<stdlib.h>/<unistd.h>/
+<stdint.h> against the real newlib headers, and the object links against
+crt0.o + syscalls.o + libc.a with zero undefined symbols and no libgcc.
+---
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -855,6 +855,84 @@
+     tcc_define_symbol(s, "__LP64__", NULL);
+ #endif
+ 
++#if defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_PE)
++    /* GCC-style type/limit macros for x86_64 LP64. Values taken verbatim
++       from `x86_64-elf-gcc -dM -E`. Modern libc headers (newlib among
++       them: machine/_default_types.h, sys/_intsup.h) select their fixed-
++       width types from these macros UNCONDITIONALLY -- sys/_intsup.h
++       even evaluates __INTPTR_TYPE__ arithmetically after redefining the
++       type keywords -- and hard-#error without them. __SIZE_TYPE__,
++       __PTRDIFF_TYPE__, __WCHAR_TYPE__, __WINT_TYPE__ are already
++       defined above with equivalent spellings and are not repeated. */
++    tcc_define_symbol(s, "__INT16_MAX__", "0x7fff");
++    tcc_define_symbol(s, "__INT16_TYPE__", "short int");
++    tcc_define_symbol(s, "__INT32_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INT32_TYPE__", "int");
++    tcc_define_symbol(s, "__INT64_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__INT64_TYPE__", "long int");
++    tcc_define_symbol(s, "__INT8_MAX__", "0x7f");
++    tcc_define_symbol(s, "__INT8_TYPE__", "signed char");
++    tcc_define_symbol(s, "__INT_FAST16_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INT_FAST16_TYPE__", "int");
++    tcc_define_symbol(s, "__INT_FAST32_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INT_FAST32_TYPE__", "int");
++    tcc_define_symbol(s, "__INT_FAST64_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__INT_FAST64_TYPE__", "long int");
++    tcc_define_symbol(s, "__INT_FAST8_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INT_FAST8_TYPE__", "int");
++    tcc_define_symbol(s, "__INT_LEAST16_MAX__", "0x7fff");
++    tcc_define_symbol(s, "__INT_LEAST16_TYPE__", "short int");
++    tcc_define_symbol(s, "__INT_LEAST32_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INT_LEAST32_TYPE__", "int");
++    tcc_define_symbol(s, "__INT_LEAST64_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__INT_LEAST64_TYPE__", "long int");
++    tcc_define_symbol(s, "__INT_LEAST8_MAX__", "0x7f");
++    tcc_define_symbol(s, "__INT_LEAST8_TYPE__", "signed char");
++    tcc_define_symbol(s, "__INT_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__INTMAX_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__INTMAX_TYPE__", "long int");
++    tcc_define_symbol(s, "__INTPTR_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__INTPTR_TYPE__", "long int");
++    tcc_define_symbol(s, "__LONG_LONG_MAX__", "0x7fffffffffffffffLL");
++    tcc_define_symbol(s, "__LONG_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__PTRDIFF_MAX__", "0x7fffffffffffffffL");
++    tcc_define_symbol(s, "__SIZE_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__SIZEOF_DOUBLE__", "8");
++    tcc_define_symbol(s, "__SIZEOF_INT__", "4");
++    tcc_define_symbol(s, "__UINT16_MAX__", "0xffff");
++    tcc_define_symbol(s, "__UINT16_TYPE__", "short unsigned int");
++    tcc_define_symbol(s, "__UINT32_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__UINT32_TYPE__", "unsigned int");
++    tcc_define_symbol(s, "__UINT64_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__UINT64_TYPE__", "long unsigned int");
++    tcc_define_symbol(s, "__UINT8_MAX__", "0xff");
++    tcc_define_symbol(s, "__UINT8_TYPE__", "unsigned char");
++    tcc_define_symbol(s, "__UINT_FAST16_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__UINT_FAST16_TYPE__", "unsigned int");
++    tcc_define_symbol(s, "__UINT_FAST32_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__UINT_FAST32_TYPE__", "unsigned int");
++    tcc_define_symbol(s, "__UINT_FAST64_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__UINT_FAST64_TYPE__", "long unsigned int");
++    tcc_define_symbol(s, "__UINT_FAST8_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__UINT_FAST8_TYPE__", "unsigned int");
++    tcc_define_symbol(s, "__UINT_LEAST16_MAX__", "0xffff");
++    tcc_define_symbol(s, "__UINT_LEAST16_TYPE__", "short unsigned int");
++    tcc_define_symbol(s, "__UINT_LEAST32_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__UINT_LEAST32_TYPE__", "unsigned int");
++    tcc_define_symbol(s, "__UINT_LEAST64_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__UINT_LEAST64_TYPE__", "long unsigned int");
++    tcc_define_symbol(s, "__UINT_LEAST8_MAX__", "0xff");
++    tcc_define_symbol(s, "__UINT_LEAST8_TYPE__", "unsigned char");
++    tcc_define_symbol(s, "__UINTMAX_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__UINTMAX_TYPE__", "long unsigned int");
++    tcc_define_symbol(s, "__UINTPTR_MAX__", "0xffffffffffffffffUL");
++    tcc_define_symbol(s, "__UINTPTR_TYPE__", "long unsigned int");
++    tcc_define_symbol(s, "__WCHAR_MAX__", "0x7fffffff");
++    tcc_define_symbol(s, "__WCHAR_MIN__", "(-__WCHAR_MAX__ - 1)");
++    tcc_define_symbol(s, "__WINT_MAX__", "0xffffffffU");
++    tcc_define_symbol(s, "__WINT_MIN__", "0U");
++#endif
++
+ #ifdef TCC_TARGET_PE
+     tcc_define_symbol(s, "__WCHAR_TYPE__", "unsigned short");
+     tcc_define_symbol(s, "__WINT_TYPE__", "unsigned short");

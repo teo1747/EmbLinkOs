@@ -107,6 +107,16 @@ struct acpi_hpet {
 // Max CPUs / IO-APICs we'll
 #define ACPI_MAX_CPUS     256
 #define ACPI_MAX_IO_APICS 8
+#define ACPI_MAX_INT_OVERRIDES 24
+
+// A parsed MADT Interrupt Source Override (type 2): the firmware saying "ISA IRQ
+// `source` is actually wired to GSI `gsi` with these polarity/trigger flags".
+// The canonical example is the PIT: ISA IRQ0 is delivered on GSI2, not GSI0.
+struct acpi_int_override {
+    uint8_t  source;   // ISA IRQ number (the legacy line a driver asks for)
+    uint32_t gsi;      // the Global System Interrupt it is really wired to
+    uint16_t flags;    // MPS INTI flags: bits[1:0]=polarity, bits[3:2]=trigger
+};
 
 // Parsed ACPI data, filled by acpi_init
 struct acpi_info{
@@ -120,6 +130,9 @@ struct acpi_info{
     uint32_t io_apic_addresses[ACPI_MAX_IO_APICS]; // physical addresses of I/O APICs
     uint32_t io_apic_gsi_bases[ACPI_MAX_IO_APICS]; // GSI base numbers for each I/O APIC
 
+    uint32_t int_override_count; // number of interrupt source overrides found
+    struct acpi_int_override int_overrides[ACPI_MAX_INT_OVERRIDES];
+
     bool     hpet_found;          /* true if HPET table was present and valid */
     uint64_t hpet_address;        /* physical base address of HPET MMIO block */
     uint16_t hpet_minimum_tick;   /* minimum IRQ period in clock ticks */
@@ -131,6 +144,13 @@ const struct acpi_info *acpi_init(void);
 
 // Get the parsed info after acpi_init. Returns NULL if ACPI tables were not found or failed to parse.
 const struct acpi_info *acpi_get_info(void);
+
+// Resolve an ISA IRQ (0-15) to the GSI it is really delivered on plus its
+// electrical characteristics, applying any MADT interrupt source override.
+// With no override the ISA defaults apply: identity GSI, edge-triggered,
+// active-high. Any of the out-params may be NULL if the caller doesn't need it.
+void acpi_resolve_isa_irq(uint8_t isa_irq, uint32_t *out_gsi,
+                          bool *out_active_low, bool *out_level);
 
 
 

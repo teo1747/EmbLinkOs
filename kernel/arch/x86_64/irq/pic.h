@@ -2,6 +2,7 @@
 #define _PIC_H_
 
 #include <stdint.h>
+#include "include/types.h"   /* bool */
 
 
 // PIC ports
@@ -28,5 +29,19 @@ void pic_mask_irq(uint8_t irq);
 
 // Unmask (enable) a specific IRQ line (0-15)
 void pic_unmask_irq(uint8_t irq);
+
+/* Read a PIC's Interrupt Mask Register (IMR) -- the currently masked lines.
+ * master=true reads PIC1 (IRQ0-7), false reads PIC2 (IRQ8-15). Used by
+ * irq_register/unregister to SAVE and RESTORE mask state rather than blindly
+ * unmasking/masking. */
+uint8_t pic_get_mask(bool master);
+
+/* Is a delivered IRQ7/IRQ15 a SPURIOUS 8259 interrupt? The classic quirk: a
+ * line that de-asserts between the PIC latching it and the CPU's interrupt-ack
+ * makes the chip report its lowest-priority line (7 on the master, 15 on the
+ * slave) with the In-Service Register bit NOT set -- there is no real IRQ to
+ * service. Reads the ISR via OCW3 and returns true iff the ISR bit is clear.
+ * Only meaningful for irq==7 / irq==15; returns false otherwise. */
+bool pic_irq_is_spurious(uint8_t irq);
 
 #endif /* _PIC_H_ */

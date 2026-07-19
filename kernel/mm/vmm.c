@@ -146,6 +146,15 @@ void vmm_destroy_address_space(uint64_t pml4_phys) {
 void vmm_switch_address_space(uint64_t pml4_phys) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
 }
+/* PTE bit 7 is the PAT index bit on a 4KB LEAF entry, but the PS (page-size)
+ * bit on a PDPTE/PDE. We use it as the PAT bit to select Write-Combining for
+ * leaf mappings (vmm_map_mmio_wc / vmm_pat_init_this_cpu). It must therefore
+ * NEVER reach an intermediate table entry, where it would wrongly declare a
+ * huge page -- vmm_map_in() masks it out of the flags it hands to
+ * get_or_create_table(). (Real huge pages are made by a separate direct PD
+ * write, not through this path, so nothing legitimately propagates bit 7 up.) */
+#define VMM_PTE_PAT (1ULL << 7)
+
 // Get or Create the next-level table from entry
 static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t flags) {
 
@@ -182,19 +191,24 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
 
     uint64_t *pml4 = vmm_table(pml4_phys);
 
-    uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  flags);
+    /* Intermediate tables must NOT carry the leaf's PAT bit (bit 7 = PS at
+     * their level -- see VMM_PTE_PAT). The leaf pt[] entry below gets the full
+     * flags. */
+    uint64_t table_flags = flags & ~VMM_PTE_PAT;
+
+    uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  table_flags);
     if (!pdpt) {
         spin_unlock(&vmm_lock);
         return -1;
     }
 
-    uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt_addr), flags);
+    uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt_addr), table_flags);
     if (!pd) {
         spin_unlock(&vmm_lock);
         return -1;
     }
 
-    uint64_t *pt = get_or_create_table(pd, pd_index(virt_addr), flags);
+    uint64_t *pt = get_or_create_table(pd, pd_index(virt_addr), table_flags);
     if (!pt) {
         spin_unlock(&vmm_lock);
         return -1;
@@ -337,11 +351,29 @@ void vmm_enable_nx_this_cpu(void) {
     __asm__ volatile("wrmsr" : : "c"(0xC0000080), "a"(lo), "d"(hi));
 }
 
+/* Program IA32_PAT (MSR 0x277) so PAT entry 4 selects Write-Combining. A 4KB
+ * leaf PTE with the PAT bit set (VMM_PTE_PAT, bit 7) and PCD=PWT=0 indexes
+ * entry 4 -- that is what vmm_map_mmio_wc() emits. Entries 0-3 keep their
+ * power-on memory types, so EVERY existing mapping is unaffected: normal RAM
+ * (index 0 = WB) and UC MMIO (VMM_NOCACHE -> PCD -> index 2 = UC-) resolve
+ * exactly as before. This is PER-CORE state, like EFER.NXE: called from
+ * vmm_init() (BSP) and each AP's ap_main(). Set BEFORE any WC mapping is
+ * created/touched, so no cached line ever needs its type changed (the SDM's
+ * heavyweight PAT-change flush dance is unnecessary).
+ *
+ *   idx: 0=WB(06) 1=WT(04) 2=UC-(07) 3=UC(00) 4=WC(01) 5=WT(04) 6=UC-(07) 7=UC(00) */
+void vmm_pat_init_this_cpu(void) {
+    const uint64_t pat = 0x0007040100070406ULL;
+    __asm__ volatile("wrmsr" : : "c"(0x277u),
+                     "a"((uint32_t)pat), "d"((uint32_t)(pat >> 32)));
+}
+
 // Initialize the virtual memory manager
 void vmm_init(void) {
     serial_write_string("\n=== VMM init ===\n");
 
     vmm_enable_nx_this_cpu();
+    vmm_pat_init_this_cpu();   /* WC PAT slot -- before any vmm_map_mmio_wc() */
 
     // step 1:Allocate a new page for the kernel PML4
     // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it
@@ -448,48 +480,109 @@ void vmm_init(void) {
     serial_write_string("\n");
 }
 
-// Bump pointer for MMIO Virtual address allocation
+// ---- MMIO / kmap virtual-address allocator -------------------------------
+//
+// A bump pointer within [MMIO_BASE, MMIO_END), PLUS a small free list so
+// vmm_unmap_mmio() can return a released VA range for reuse instead of leaking
+// it forever. MMIO_END is the hard ceiling: this region must not grow into the
+// kernel-stack region 256 GiB above MMIO_BASE (KSTACK_REGION_BASE == MMIO_END).
+#define MMIO_END (MMIO_BASE + (1ULL << 38))
 static uint64_t mmio_next_virt = MMIO_BASE;
 
-uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
-    // Round up to nearest 4KB boundary
-    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    
-    // Page-align the physical address downwards, remember the offset
-    uint64_t phys_algned = phys_addr & ~0xFFFULL; // 4KB pages
-    uint64_t offset = phys_addr - phys_algned;
+// Freed VA ranges awaiting reuse (page-aligned base + byte size). Bounded: on
+// overflow a freed range simply isn't recorded and its VA leaks -- the same
+// spirit as the bump pointer never shrinking, just an upper bound on how much
+// churn we can recycle. All of mmio_next_virt / mmio_free[] is under vmm_lock.
+#define MMIO_FREE_MAX 32
+static struct { uint64_t base; uint64_t size; } mmio_free[MMIO_FREE_MAX];
+static uint32_t mmio_free_count = 0;
 
-    // If the offset pushes us into the next page, we need to allocate a new page
-    uint64_t total_size = (size + PAGE_SIZE + offset -1) & ~0xFFFULL; 
-    pages = total_size  / PAGE_SIZE;
-
-    // Reserve the virtual address range
-    spin_lock(&vmm_lock);
-    uint64_t virt_base = mmio_next_virt;
+// Reserve `total_size` (page-aligned) bytes of MMIO VA. Prefers a freed range
+// that fits (first-fit, splitting any remainder back onto the list); otherwise
+// bumps mmio_next_virt with a hard MMIO_END check (which also catches wrap).
+// Returns 0 when the region is exhausted. Caller holds vmm_lock.
+static uint64_t mmio_reserve_va_locked(uint64_t total_size) {
+    for (uint32_t i = 0; i < mmio_free_count; i++) {
+        if (mmio_free[i].size >= total_size) {
+            uint64_t base = mmio_free[i].base;
+            if (mmio_free[i].size == total_size) {
+                mmio_free[i] = mmio_free[--mmio_free_count];   // consume whole slot
+            } else {
+                mmio_free[i].base += total_size;                // keep the remainder
+                mmio_free[i].size -= total_size;
+            }
+            return base;
+        }
+    }
+    if (total_size > MMIO_END - mmio_next_virt) return 0;        // ceiling / wrap guard
+    uint64_t base = mmio_next_virt;
     mmio_next_virt += total_size;
+    return base;
+}
+
+// Shared body for vmm_map_mmio / vmm_map_mmio_wc: reserve VA + map the pages
+// with `cache_flags` (VMM_NOCACHE for strict UC, VMM_PTE_PAT for WC).
+static uint64_t mmio_map(uint64_t phys_addr, uint64_t size, uint64_t cache_flags) {
+    uint64_t phys_aligned = phys_addr & ~0xFFFULL;
+    uint64_t offset       = phys_addr - phys_aligned;
+    uint64_t total_size   = (size + offset + PAGE_SIZE - 1) & ~0xFFFULL;
+    uint64_t pages        = total_size / PAGE_SIZE;
+
+    spin_lock(&vmm_lock);
+    uint64_t virt_base = mmio_reserve_va_locked(total_size);
     spin_unlock(&vmm_lock);
+    if (!virt_base) {
+        serial_write_string("vmm_map_mmio: MMIO VA region exhausted\n");
+        return 0;
+    }
 
-    serial_write_string("vmm_map_mmio: phys=");
-    serial_write_hex(phys_algned);
-    serial_write_string(", virt=");
-    serial_write_hex(virt_base);
-    serial_write_string(", pages=");
-    serial_write_hex(pages);
-    serial_write_string(", \n");
-
-    // Map the pages
     for (uint64_t i = 0; i < pages; i++) {
-        uint64_t virt = virt_base + (i * PAGE_SIZE);
-        uint64_t phys = phys_algned + (i * PAGE_SIZE);
-        if (vmm_map(virt, phys, VMM_WRITABLE | VMM_NOCACHE) < 0) {
-            serial_write_string("FATAL: vmm_map mmio failed at\n");
-            serial_write_hex(phys);
+        if (vmm_map(virt_base + i * PAGE_SIZE, phys_aligned + i * PAGE_SIZE,
+                    VMM_WRITABLE | cache_flags) < 0) {
+            serial_write_string("FATAL: vmm_map mmio failed\n");
             return 0;
         }
     }
-
-    // Return the virtual address of the first page
     return virt_base + offset;
+}
+
+// Map device memory strictly UNCACHEABLE (device registers, most MMIO).
+uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
+    return mmio_map(phys_addr, size, VMM_NOCACHE);
+}
+
+// Map device memory WRITE-COMBINING (PAT entry 4 via VMM_PTE_PAT): the CPU
+// coalesces bursts of writes, a big win for a linear framebuffer or other large
+// write-mostly aperture. NOT for device registers -- WC's weak ordering breaks
+// their required UC semantics. Needs vmm_pat_init_this_cpu() to have programmed
+// this core's IA32_PAT (done in vmm_init + every AP).
+uint64_t vmm_map_mmio_wc(uint64_t phys_addr, uint64_t size) {
+    return mmio_map(phys_addr, size, VMM_PTE_PAT);
+}
+
+// Unmap and RELEASE a range previously returned by vmm_map_mmio[_wc]. Clears
+// the PTEs (flushing the TLB) and hands the page-aligned VA range back to the
+// free list for reuse. `virt`/`size` are the values passed to / returned from
+// the mapping call. (Contrast vmm_kunmap_pages, which unmaps but does not
+// reclaim the VA.)
+void vmm_unmap_mmio(uint64_t virt, uint64_t size) {
+    if (!virt || !size) return;
+    uint64_t virt_aligned = virt & ~0xFFFULL;
+    uint64_t offset       = virt - virt_aligned;
+    uint64_t total_size   = (size + offset + PAGE_SIZE - 1) & ~0xFFFULL;
+    uint64_t pages        = total_size / PAGE_SIZE;
+
+    // vmm_unmap() takes vmm_lock itself, so unmap BEFORE grabbing it here.
+    for (uint64_t i = 0; i < pages; i++)
+        vmm_unmap(virt_aligned + i * PAGE_SIZE);
+
+    spin_lock(&vmm_lock);
+    if (mmio_free_count < MMIO_FREE_MAX) {
+        mmio_free[mmio_free_count].base = virt_aligned;
+        mmio_free[mmio_free_count].size = total_size;
+        mmio_free_count++;
+    }   // table full -> VA leaks (bounded, documented above)
+    spin_unlock(&vmm_lock);
 }
 
 /* Map `n` (possibly non-contiguous) physical pages into a fresh, CONTIGUOUS,
@@ -503,9 +596,9 @@ uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
 uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
     if (!phys || n == 0) return 0;
     spin_lock(&vmm_lock);
-    uint64_t virt_base = mmio_next_virt;
-    mmio_next_virt += (uint64_t)n * PAGE_SIZE;
+    uint64_t virt_base = mmio_reserve_va_locked((uint64_t)n * PAGE_SIZE);
     spin_unlock(&vmm_lock);
+    if (!virt_base) return 0;   // MMIO/kmap VA region exhausted
     for (uint32_t i = 0; i < n; i++) {
         if (vmm_map(virt_base + (uint64_t)i * PAGE_SIZE, phys[i] & ~0xFFFULL,
                     VMM_WRITABLE | VMM_NX) < 0) {
@@ -543,7 +636,7 @@ void vmm_kunmap_pages(uint64_t virt_base, uint32_t n) {
 // the first vmm_create_address_space() runs. Offset well clear (256 GiB in,
 // out of the 512 GiB one PML4 entry spans) of where the actual MMIO bump
 // allocator grows (a few hundred KB at most).
-#define KSTACK_REGION_BASE (MMIO_BASE + (1ULL << 38))
+#define KSTACK_REGION_BASE MMIO_END   /* == MMIO_BASE + (1<<38); the MMIO bump stops here */
 static uint64_t kstack_next_virt = KSTACK_REGION_BASE;
 
 uint64_t vmm_alloc_kernel_stack(uint64_t size) {

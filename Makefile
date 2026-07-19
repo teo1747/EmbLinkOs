@@ -658,10 +658,17 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) bu
 	       echo "***          NOT rebuild the image. Add it to EMBKFS_APPS."; ;; \
 	  esac; \
 	done
-	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs at the image root
+	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs into /system/abi
 	@# for tcc to link against ON the OS. Derived from the ONE NEWLIB_PREFIX so a
 	@# checkout on another machine needs no mkfs edit -- see docs/BUILD_SETUP.md.
+	@# EMBK_NEWLIB_INC / EMBK_TCC_INC: the HEADER trees mkfs packs so tcc can
+	@# COMPILE real #include-ing programs on-OS -- newlib's headers are part of
+	@# the ABI (-> /system/abi/include), tcc's own compiler headers
+	@# (stddef.h/stdarg.h/...) belong to the compiler (-> /data/apps/tcc/include).
+	@# Both paths mirror what build-tcc-emblink.sh bakes into tcc's search paths.
 	EMBK_NEWLIB_LIBC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libc.a,)" \
+	EMBK_NEWLIB_INC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/include,)" \
+	EMBK_TCC_INC="$(if $(HAVE_TCC),$(TCC_SRC)/include,)" \
 	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 

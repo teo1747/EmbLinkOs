@@ -361,16 +361,28 @@ D2 = §3 (sealed/mutable), D3 = §4 (regions/compat), D4 = §5 (users).
 │   ├── lib/
 │   │   └── libembk.so     THE hardwired loader path (elf.c) — migration item 2
 │   └── abi/               the targeting contract (D2 §3.1): what it means
-│       ├── include/       to compile FOR EmbLinkOS. Compilers read here,
-│       ├── crt0.o         read-only; they live in /data/apps (D2 §3.2).
-│       └── syscalls.o
+│       ├── include/       to compile FOR EmbLinkOS — newlib's full header
+│       │                  tree (135 files), LIVE since the tcc-headers work.
+│       ├── crt0.o         Compilers read here, read-only; they live in
+│       ├── syscalls.o     /data/apps (D2 §3.2).
+│       └── libc.a         the libc the ABI declares — same archive the
+│                          cross-build links, so on-OS and for-OS builds
+│                          produce the same program.
 │
 ├── data/                  mutable state (D2). Everything normal operation touches.
 │   ├── apps/              one directory per installed application (D3 §4.1);
 │   │   ├── tcc/           upgrade = replace one directory (§3.3). Compilers
-│   │   ├── python/        are apps: they target /system/abi, they are not it.
+│   │   │   └── include/   are apps: they target /system/abi, they are not it.
+│   │   │                  tcc's OWN headers (stddef.h/stdarg.h/…) live WITH
+│   │   │                  the compiler — they are tcc's, not the ABI's.
+│   │   ├── python/
 │   │   ├── git/
-│   │   └── …/             (sysinfo, tally, and future sval tools land here too)
+│   │   └── …/             (sysinfo, tally — and tally2, the first tool the
+│   │                       OS rebuilt from source — land here too)
+│   ├── src/               SOURCE trees for on-OS builds (established by the
+│   │   └── shell/         tally rebuild: tree shape preserved so quote-
+│   │                      includes resolve with one -I; the future build
+│   │                      tool's project convention)
 │   ├── users/
 │   │   └── teo/           a person's world (D4). Session cwd by init/home policy.
 │   └── tmp/               scratch; where /t.o goes to die (D3 §4.1)
@@ -408,6 +420,14 @@ paths gone), `test tcc link` exit=42 (ABI at /system/abi, scratch at /data/tmp),
 python` exit=0 (relative ._pth zip resolves after the move). SCOPE NOTE: the EmUI
 demo apps and fonts stayed at root (checklist named only the core + tools);
 migrating them is an additive follow-up.
+
+LATER ADDITIONS to the tree, each pulled in by the tcc-headers work rather
+than planned here: `/system/abi/include/` went live (newlib's headers — the
+`include/` slot this tree reserved from day one), `/system/abi/libc.a` moved
+in beside the crt objects, `/data/apps/tcc/include/` holds the compiler's own
+headers, and `/data/src/<project>/` became the source-tree convention when
+`test tcc tally` rebuilt tally on-OS from `/data/src/shell/`. All packed by
+mkfs from Makefile-owned paths (`EMBK_NEWLIB_INC`, `EMBK_TCC_INC`).
 
 
 Derived by diffing this tree against audit §1.2 — every hardcoded path,

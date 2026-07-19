@@ -75,7 +75,7 @@ that it emits a valid-looking ELF — either can be true of a broken compiler.
 It **runs the produced binary and checks it returns 42**. That number can only
 appear if the program was really compiled and really executed.
 
-### Two ways a green test lies, both of which have bitten this repo
+### Four ways a green test lies, all of which have bitten this repo
 
 - **The binary under test was stale.** `python.elf` sat **15 hours** out of
   date, passing `test python` against a frozen copy of an old libc — green, and
@@ -90,7 +90,26 @@ appear if the program was really compiled and really executed.
   A `pkill -f` pattern once matched its own shell's command line and killed two
   QEMU runs before they started; the `>` redirect left the *previous* log in
   place, so the stale output read as fresh and sent a debugging session chasing
-  a result that never happened.
+  a result that never happened. (That same self-match trap has since fired
+  **four more times** in one session — never put the process's match string in
+  the killing command's own text.)
+- **A green build is not a green test.** The extern-consumer pipeline
+  (`ls / | tally`) shipped wedged: the pump rework landed after the last time
+  `test extern` was actually run, and the post-merge check was "builds clean +
+  the code is present" — both true, neither a test. When you touch a
+  subsystem, re-run *that subsystem's* tests, not the ones that happen to be
+  in muscle memory (the same gap let the IF=0 wake leak hide behind a sweep
+  that re-ran posix/vmm/ksync but not extern/pipe).
+- **The clock you're timing with is not wall time.** Under TCG with the
+  desktop compositing, the guest's 100 Hz tick runs at a fraction of wall
+  speed — tick-based test timeouts need ~3× wall budget, and "no output for a
+  minute" is routinely *slow*, not hung (CPython's startup "freeze" and tcc's
+  on-OS link both looked dead and weren't). Before diagnosing a hang, take a
+  stable snapshot instead of watching silence: QEMU's monitor
+  (`-monitor unix:...` + `info registers`, RIP→`addr2line`) or GDB `-nx`
+  attach; and run QEMU on *copies* of the images — a timed-out run SIGTERMs
+  qemu mid-write and quietly poisons `embkfs.img`, which `make` then keeps
+  (newer mtime) for every later boot.
 
 ### Live tests worth knowing
 
@@ -100,9 +119,11 @@ serial input while a spawned process runs):
 | Command | Proves |
 |---|---|
 | `test posix` | the libc/POSIX surface, incl. cwd and rename |
-| `test tcc link` | the OS compiles+links+**runs** C (`exit=42`) |
+| `test tcc real` | the OS compiles+links+**runs** real `#include` C (`exit=42`, byte-exact stdio) |
+| `test tcc tally` | the OS **rebuilds one of its own tools** from `/data/src` and A/B-runs it in the live pipeline |
 | `test python` / `test git repo` | the interpreter / git (need `-cpu max`) |
-| `test shell` / `test ctrlc` | structured pipelines / interruption |
+| `test shell` / `test extern` / `test ctrlc` | structured pipelines / extern spawn plumbing / interruption |
+| `test writestorm` | kernel-context fs writes + zero IF leaks (the Bug-26 regression trap) |
 
 The port tests need their toolchain built — see
 [docs/PORTS.md](docs/PORTS.md) and

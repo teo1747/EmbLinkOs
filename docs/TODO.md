@@ -65,13 +65,22 @@ left to do.
 
 ### vmm_map_mmio
 
-- [ ] Add vmm_map_mmio_wc() for write-combining (framebuffer, large buffers).
-  Requires PAT setup in IA32_PAT (MSR 0x277); then PWT + PAT bits in the PTE
-  select the WC slot. See Intel SDM Vol 3, §11.12.
-- [ ] No deallocation — bump allocator only. Need vmm_unmap_mmio that frees
-  the virtual range (requires tracking allocated ranges: list or tree).
-- [ ] No bounds check on mmio_next_virt — could run off the end of the MMIO
-  region silently. Add MMIO_END and check before advancing.
+- [x] `vmm_map_mmio_wc()` for write-combining. `vmm_pat_init_this_cpu()`
+  programs IA32_PAT entry 4 = WC (entries 0-3 keep power-on types, so every
+  existing mapping is untouched); a leaf PTE with the PAT bit (`VMM_PTE_PAT`,
+  bit 7) + PCD=PWT=0 selects it. Per-core, called from vmm_init + every AP
+  (ap_main). The linear framebuffer now maps WC. 🪤 bit 7 is PAT on a LEAF but
+  PS (huge page) on a PDPTE/PDE — `vmm_map_in` masks it out of the intermediate-
+  table flags so it only lands on the leaf. Verified: `test vmm` reads PAT
+  entry 4 == 0x01, fb renders, smp=4 clean.
+- [x] `vmm_unmap_mmio(virt, size)` — clears the PTEs and returns the VA range
+  to a small free list (`mmio_free[]`, first-fit, splits remainder) so it can be
+  reused instead of leaked. `vmm_kmap_pages` also draws from it now. Verified:
+  `test vmm` unmaps then re-maps and gets the SAME VA back.
+- [x] Bounds check — `MMIO_END` (= `KSTACK_REGION_BASE`) is the hard ceiling;
+  `mmio_reserve_va_locked` refuses to bump past it (also catches wrap) and
+  returns 0 → the map fails cleanly instead of running into the kernel-stack
+  region. Shared by `vmm_map_mmio[_wc]` and `vmm_kmap_pages`.
 
 ### Heap
 - [x] kmalloc/kfree locking — spinlock with cli/sti save-restore.
@@ -117,9 +126,18 @@ left to do.
   — the block-layer bounce buffer, held across a `hlt`-wait for the disk — does.
   Mutex is non-recursive and **detects self-deadlock** (re-lock by the owner is
   a loud halt, not a silent hang) and non-owner unlock (a warning). `test ksync`
-  = 12/12 invariants; the bounce buffer now uses it (`test posix` still ALL PASS).
-  - [ ] Not cancellation-aware (a blocked acquire ignores `process_cancel`) —
-    fine for briefly-held locks; revisit if one guards a long wait.
+  = 19/19 invariants; the bounce buffer now uses it (`test posix` still ALL PASS).
+  - [x] Cancellation-aware acquire — `mutex_lock_interruptible` /
+    `sem_wait_interruptible` return `-EMBK_ECANCELED` when the caller's process
+    is cancelled while it *would block*, so a waiter behind a long-held lock
+    unwinds on ^C instead of sleeping through the whole operation. The plain
+    `mutex_lock`/`sem_wait` stay **uninterruptible** on purpose (a cleanup path
+    must still be able to take a lock even after cancellation, and the flag is
+    sticky). Cancellation gates only blocking: an uncontended acquire still
+    succeeds regardless of the flag (completed-op-wins, as `process_wait`
+    returns a ready child's status before considering cancellation). Proven by
+    `test ksync`: a kthread blocked on a held mutex is `process_cancel`'d, wakes,
+    and returns `-ECANCELED` without stealing the lock (the driver round-trips).
   - [ ] Not IRQ-safe by design (a handler cannot sleep). Spinlocks remain the
     IRQ-context tool. No compile-time guard enforces this yet.
   - [ ] No priority inheritance — a low-prio holder can be starved while a
@@ -146,18 +164,36 @@ left to do.
 ## Interrupts & Timers
 
 ### APIC / IRQ
-- [ ] MADT interrupt source overrides not applied to IO-APIC routing
-  (e.g. timer IRQ0 → GSI2). Only keyboard (GSI1, no override) is routed today.
-  When routing more IRQs, consult overrides + polarity/trigger flags.
-- [ ] Spurious-interrupt vector (0xFF) is set in the SVR but has no IDT
-  handler — add a no-op handler to be safe.
-- [ ] Spurious IRQ 7 / IRQ 15 (legacy PIC) detection — read the PIC ISR and
-  check the bit before EOI. (Low priority now that the PIC is masked/retired.)
-- [ ] No per-CPU LAPIC init — needed when APs come online (SMP).
-- [ ] LAPIC timer not using TSC-deadline mode (more precise, modern).
-- [ ] Duplicated register save/restore between irq_common and
-  irq_common_lapic in isr.asm — refactor to share.
-- [ ] irq_register/irq_unregister don't save/restore IRQ mask state.
+- [x] MADT interrupt source overrides now stored (`acpi_info.int_overrides`,
+  parse_madt) and applied: `acpi_resolve_isa_irq()` maps an ISA IRQ → real GSI +
+  polarity/trigger (MPS INTI flags), and `ioapic_route_isa()` routes through it.
+  Keyboard/mouse/ATA switched to it; identity/edge/high when no override, so
+  override-free machines are unchanged. Verified live: QEMU's `src=0 → gsi=2`
+  (PIT) is parsed, and the ISA lines log their resolved GSI/trigger.
+- [x] Spurious-interrupt vector (0xFF) now has an IDT handler
+  (`lapic_spurious_stub`, isr.asm; installed in idt_init). Sends NO EOI (SDM:
+  a spurious vector sets no ISR bit, so an EOI would ack a real interrupt) —
+  a bare `iretq`. One install covers every core (shared IDT).
+- [x] Spurious IRQ 7 / IRQ 15 detection — `pic_irq_is_spurious()` reads the PIC
+  ISR via OCW3; `irq_handler` swallows a phantom (no EOI for a master-7, cascade
+  EOI for a slave-15). Gated on NO registered handler so a real IO-APIC device
+  on the same vector (ATA secondary = IRQ15 → vector 47) is never mis-dropped.
+  Dormant while the PIC is masked; correct the moment a PIC line is used again.
+- [x] Per-CPU LAPIC init — already in place: `lapic_init_this_cpu()`
+  (MSR enable + SVR) is called by every AP in `ap_main()` (smp.c). Verified:
+  smp=4 brings all APs online, each with its own LAPIC timer.
+- [x] LAPIC timer TSC-deadline mode — implemented + CPUID-gated
+  (`CPUID.01H:ECX[24]`), periodic LVT as the fallback. ⚠️ The active path is
+  UNVERIFIED: QEMU's TCG APIC does not implement TSC-deadline and clears the
+  bit on every CPU model (even -cpu max / +tsc-deadline), and no KVM is
+  available here, so only the periodic path runs under our bring-up. Written to
+  the SDM (Vol.3 10.5.4.1); needs KVM/real hardware to exercise.
+- [x] Deduplicated the register save/restore across isr_common / irq_common /
+  irq_common_lapic in isr.asm via shared `PUSH_GPRS` / `POP_GPRS` macros (the
+  frame the C-side `struct registers` mirrors now has one definition).
+- [x] irq_register/irq_unregister now save the line's prior PIC mask state on
+  register and restore it on unregister, instead of unconditionally
+  unmasking/masking (register/unregister is transparent).
 
 ### Exceptions
 - [x] Page-fault handler prints CR2 + decodes the error code (P/W/U/RSVD/I)
@@ -323,8 +359,8 @@ left to do.
   `fb_present()`, clipped fill/copy rects, lines, circles, alpha-blit.
   Remaining: `virtio_gpu.c` only negotiates VIRTIO_F_VERSION_1 (no indirect
   descriptors, no multiple scanouts, no 3D/Virgl); `bochs_vbe.c` has no
-  `-vga qxl` support; no write-combining on the LFB mapping
-  (`vmm_map_mmio_wc` still doesn't exist — see `vmm_map_mmio` entry above).
+  `-vga qxl` support. (The LFB mapping is now write-combining via
+  `vmm_map_mmio_wc` — see the `vmm_map_mmio` entry above.)
 
 ### Keyboard
 
@@ -931,6 +967,17 @@ substantially complete.
   this single lock is measured to bottleneck.
 
 ### New bugs found while building preemption/syscalls/spawn (not on this list originally)
+- [x] **IF=0 leak into every voluntary-block wake** (ledger Bug 26, the
+  full write-up lives in docs/architecture/process-and-scheduling.md).
+  `sched_block_current_locked()` sleepers resumed with interrupts off whenever
+  a *timer-initiated* switch-in woke them; the leak reached `ata_wait_irq`'s
+  bare `hlt` and froze the machine. Ten call sites had accumulated without the
+  IF-restore Bug 25 declared a "documented rule" — the fix is now structural
+  (`sti` inside the primitive itself), `ata_wait_irq` uses `sti;hlt` + a loud
+  canary, and `test writestorm` (200 write/unlink cycles + IF probes, any leak
+  fails) pins it. Found while porting tcc headers: the probabilistic freeze
+  masqueraded as "tcc hangs on-OS" until the QEMU monitor's `info registers`
+  showed `RIP` at ata.c's `hlt` with `RFL.IF=0`.
 - [x] **RFLAGS.IF corruption in context switch.** `kernel_ctx_switch`/
   `kernel_ctx_save` (`kcontext.asm`) capture RFLAGS via `pushfq`/`pop rax`
   and are always called from inside an interrupt-gate ISR (timer IRQ,
@@ -1016,3 +1063,25 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
+- [ ] **Native build tool** (the make-equivalent — DECIDED, not yet built).
+  The fork was audited and ratified: a **native structured tool**, not a make
+  port. The deciding facts, each verified against the tree: every userland
+  recipe is one argv = one `spawn()` (no `/bin/sh` buys nothing); the host
+  Makefile cannot run on-OS regardless (no compatibility payoff); the RTC's
+  one-second mtimes against millisecond TCC compiles make timestamp staleness
+  structurally false-fresh (→ staleness by **content hash** of inputs + argv).
+  Shape: targets as typed records (name, sources, `-I`, objects, link inputs,
+  install path), recipes as argv arrays, `/data/src/<project>/` as the source
+  convention, the ABI as ambient constants — the schema `test tcc tally`
+  already executes hand-unrolled. Deliberately absent from v1: variables,
+  pattern rules, parallelism (the real graph is ~50 explicit nodes). Honest
+  rebuild-self scope with TCC: static newlib C only — no `__thread` (no
+  linker scripts/PT_TLS), no `libembk.so` apps, no C++, kernel wants GCC.
+  make itself arrives later as opt-in compat with the foreign-tree ports
+  story. Nice detail available: build it on the sval SDK, which is on-image
+  and already proven self-rebuildable.
+  - [ ] v1 staleness detail: hash file bytes in userspace; exposing a cheap
+    content identity from EMBKFS's CoW generation machinery is a later kernel
+    item, pulled by need.
+  - [ ] Prerequisite already DONE: separate compile-then-link with
+    tcc-produced objects, proven live (`test tcc tally`).

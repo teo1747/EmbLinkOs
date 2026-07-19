@@ -98,6 +98,15 @@ void idt_init(void) {
     idt_set_entry(30, (uint64_t)isr30, 0x8E);
     idt_set_entry(31, (uint64_t)isr31, 0x8E);
 
+    /* LAPIC spurious-interrupt vector (0xFF, the value programmed into every
+     * core's SVR by lapic_enable_this_core()). Without an entry here a spurious
+     * interrupt -- which real APICs DO occasionally deliver -- would hit the
+     * unpopulated IDT slot and #GP/triple-fault. The stub sends no EOI (see
+     * isr.asm). One install covers every core: the IDT is shared, APs just
+     * lidt the same table. */
+    extern void lapic_spurious_stub(void);
+    idt_set_entry(0xFF, (uint64_t)lapic_spurious_stub, 0x8E);
+
     // Load the IDT using lidt instruction
     __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
 }

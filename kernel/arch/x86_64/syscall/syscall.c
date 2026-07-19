@@ -819,6 +819,12 @@ static int64_t sys_cancelled(struct regs *r) {
 static int64_t sys_console_interrupt_route(struct regs *r) {
     int handle = (int)r->rdi;
 
+    if (handle == 0) {                       /* route to SELF: the session owner
+                                              * claiming ^C at its own prompt */
+        keyboard_set_interrupt_target(current_process->pid);
+        return 0;
+    }
+
     if (handle < 0) {
         keyboard_set_interrupt_target(0);   /* reclaim: ^C is a byte again */
         return 0;

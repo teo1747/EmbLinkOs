@@ -85,6 +85,31 @@ void ioapic_route_level(uint8_t gsi, uint8_t vector, uint8_t dest_apic_id, bool 
             active_low ? "active-low" : "active-high");
 }
 
+// Route a legacy ISA IRQ, applying any MADT interrupt source override: the IRQ
+// lands on the GSI the firmware actually wired it to, with the correct trigger
+// mode and polarity, instead of assuming GSI == IRQ. With no override this is
+// exactly ioapic_route(irq, vector, dest, false) -- identity GSI, edge, high --
+// so existing behaviour on override-free machines (e.g. QEMU's keyboard/mouse/
+// ATA lines) is unchanged. THE case this fixes: the PIT's ISA IRQ0 is delivered
+// on GSI2 on virtually all real firmware.
+void ioapic_route_isa(uint8_t isa_irq, uint8_t vector, uint8_t dest_apic_id){
+    uint32_t gsi;
+    bool active_low, level;
+    acpi_resolve_isa_irq(isa_irq, &gsi, &active_low, &level);
+
+    kprintf("IO-APIC: ISA IRQ %u -> GSI %u (%s%s)\n",
+            (unsigned int)isa_irq, (unsigned int)gsi,
+            level ? "level" : "edge", active_low ? ", active-low" : "");
+
+    if (level) {
+        ioapic_route_level((uint8_t)gsi, vector, dest_apic_id, active_low);
+    } else {
+        // ISA edge lines are active-high by convention; ioapic_route programs
+        // edge + active-high, matching the resolved characteristics.
+        ioapic_route((uint8_t)gsi, vector, dest_apic_id, false);
+    }
+}
+
 void ioapic_mask(uint8_t gsi){
    uint32_t reg = IOAPIC_REG_REDTBL_BASE + (gsi * 2);
    uint32_t low = ioapic_read(reg);

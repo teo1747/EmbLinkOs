@@ -38,7 +38,18 @@
  * needs a current_thread to block -- is never reached. current_thread being
  * NULL that early is therefore fine; no path dereferences it uncontended.
  *
- * NOT cancellation-aware, and NOT recursive. See the notes on mutex_lock.
+ * CANCELLATION (docs/INTERRUPTION.md): the plain sem_wait()/mutex_lock() are
+ * UNINTERRUPTIBLE -- a blocked acquire ignores the process's cancelled flag and
+ * sleeps until the resource is genuinely released. That is the right default for
+ * a lock a cleanup path must still be able to take, and for one held only
+ * briefly. The *_interruptible() variants opt INTO cancellation: a cancelled
+ * process abandons a blocking acquire with -EMBK_ECANCELED instead of sleeping
+ * (matching every other blocking syscall). Use them when the wait can be long --
+ * e.g. a lock guarding a disk operation -- so a ^C'd waiter unwinds rather than
+ * stalling for the whole operation. Cancellation gates only BLOCKING: an
+ * uncontended acquire still succeeds regardless of the flag (a completed
+ * operation wins, as process_wait() returns a ready child's status first).
+ * NOT recursive either way. See the notes on mutex_lock.
  * NOT IRQ-safe: never take one of these from an interrupt handler -- a handler
  * cannot sleep, so a contended acquire there would block a context that must
  * not block. (Spinlocks are the IRQ-context tool; that is their job.)
@@ -56,7 +67,8 @@
  * by value. This header owns the OPERATIONS. */
 
 void sem_init(struct semaphore *s, int32_t initial);
-void sem_wait(struct semaphore *s);      /* P: take a permit, block if none */
+void sem_wait(struct semaphore *s);      /* P: take a permit, block (uninterruptibly) if none */
+int  sem_wait_interruptible(struct semaphore *s); /* P, but -EMBK_ECANCELED if cancelled while blocked; 0 on permit */
 void sem_post(struct semaphore *s);      /* V: return a permit, wake one waiter */
 int  sem_trywait(struct semaphore *s);   /* 1 if a permit was taken, 0 if none (never blocks) */
 
@@ -76,7 +88,8 @@ int  sem_trywait(struct semaphore *s);   /* 1 if a permit was taken, 0 if none (
  * above.) */
 
 void mutex_init(struct mutex *m);
-void mutex_lock(struct mutex *m);
+void mutex_lock(struct mutex *m);        /* acquire, block (uninterruptibly) until free */
+int  mutex_lock_interruptible(struct mutex *m); /* -EMBK_ECANCELED if cancelled while blocked; 0 on acquire */
 void mutex_unlock(struct mutex *m);
 int  mutex_trylock(struct mutex *m);     /* 1 if acquired, 0 if already held */
 

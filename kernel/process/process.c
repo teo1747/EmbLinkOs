@@ -1867,6 +1867,24 @@ void sched_block_current_locked(struct wait_queue *wq) {
      * so this returns with the lock NOT held once the thread is resumed. */
     wait_queue_block(wq, current_thread);
     schedule_locked();
+    /* Re-enable interrupts UNCONDITIONALLY on resume. The resume path cannot
+     * restore the sleeper's IF: the kcontext restores RFLAGS verbatim from the
+     * switch point (inside schedule, under cli), and spin_unlock's restore
+     * reads g_sched_lock.saved_flags -- a single shared slot last written by
+     * whichever spin_lock initiated THIS switch-in. When that was the timer
+     * handler's schedule() (IRQ context, IF=0), the woken sleeper continued
+     * with IF=0 -- and a kernel-context caller that then reached ata_wait_irq
+     * hlt'ed with interrupts off, freezing the whole machine. Observed live
+     * (test writestorm; RIP captured via the QEMU monitor at ata.c's hlt with
+     * RFLAGS.IF=0); probabilistic because it needs a timer-driven switch-in to
+     * be the one that resumes the sleeper. process_wait/thread_join already
+     * carry their own entry_flags restore for exactly this reason -- this puts
+     * the fix where every OTHER blocker (fs, pipes, keyboard, channels,
+     * endpoints, ksync, kworker -- ten call sites) inherits it. Unconditional
+     * is correct by contract: callers are voluntary process-context sleepers
+     * (an IRQ handler cannot sleep), and none can mean to sleep with IF=0 --
+     * on a single core it could never be woken. */
+    __asm__ volatile ("sti" ::: "memory");
 }
 
 void process_init(void) {

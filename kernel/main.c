@@ -386,22 +386,25 @@ void kernel_main(void) {
     fb_init();
     console_init();
     keyboard_init();
-    ioapic_route(1, 33, 0, false);   // keyboard GSI 1 -> vector 33 -> CPU 0
+    ioapic_route_isa(1, 33, 0);   // keyboard: ISA IRQ 1 -> vector 33 -> CPU 0 (override-aware)
     // Clamp the cursor to the ACTUAL screen size (varies by GPU: virtio-gpu is
     // 1280x800, stdvga 1024x768) so it can reach every corner of the desktop.
     {
         const fb_info_t *fbi = fb_get_info();
         mouse_init(fbi ? (int)fbi->width : 1024, fbi ? (int)fbi->height : 768);
     }
-    ioapic_route(12, 44, 0, false);  // mouse GSI 12 -> vector 44 -> CPU 0
+    ioapic_route_isa(12, 44, 0);  // mouse: ISA IRQ 12 -> vector 44 -> CPU 0 (override-aware)
+
+    // --- TSC calibration (uses HPET if available, else PIT fallback) ---
+    // MUST precede lapic_timer_init(): if the CPU supports TSC-deadline mode the
+    // timer arms an absolute TSC deadline and needs the calibrated frequency
+    // here. Only depends on HPET/PIT (both up by now), not on the LAPIC timer.
+    tsc_calibrate();
 
     // --- Timer (LAPIC) + retire PIC ---
     lapic_timer_init(48);
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
-
-    // --- TSC calibration (uses HPET if available, else PIT fallback) ---
-    tsc_calibrate();
 
     __asm__ volatile ("sti");
 

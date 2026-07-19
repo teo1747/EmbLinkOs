@@ -108,8 +108,24 @@ static int ata_wait_irq(uint16_t io_base){
     // We wake periodically to re-check even if we miss the exact moment.
     volatile bool *flag = ata_irq_flag(io_base);
     int timeout = 0;
+    { /* CANARY: this loop's whole safety story assumes IF=1 (the timer wakes
+       * the hlt). An IF=0 arrival means some blocking path leaked disabled
+       * interrupts into process context again (the sched_block_current_locked
+       * class of bug -- see process.c); the sti;hlt below survives it, but it
+       * must never be silent. */
+        uint64_t rf;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(rf));
+        if (!(rf & (1ULL << 9)))
+            kprintf("ATA WARN: ata_wait_irq entered with IF=0 (leaked by a blocking path)\n");
+    }
     while (!*flag) {
-        __asm__ volatile ("hlt");
+        /* sti;hlt, not bare hlt: hlt with IF=0 is a permanent sleep, and this
+         * loop's contract REQUIRES interrupts (the ATA IRQ or the 100 Hz tick
+         * is the only way out). sti immediately before hlt is the canonical
+         * idiom -- the one-instruction shadow means no wakeup can slip into
+         * the gap. Asserting the loop's own precondition, not papering over a
+         * leak: the canary above still reports any leaker loudly. */
+        __asm__ volatile ("sti; hlt");
         if (++timeout > 1000000) {
         kprintf("ATA IRQ timeout\n");
         return -1; // safety: never hang forever on bad hardware
@@ -705,11 +721,11 @@ void ata_init(void) {
     // 100Hz hlt-wakeups (~2.7 hours), which looks indistinguishable from a
     // dead hang to anything with a normal test timeout.
     irq_register(ATA_PRIMARY_IRQ, ata_irq_handler_primary);
-    ioapic_route(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0, false); // Route to CPU 0, unmasked
+    ioapic_route_isa(ATA_PRIMARY_IRQ, ATA_PRIMARY_VECTOR, 0); // ISA IRQ14, override-aware
     kprintf("ATA: IRQ14 routed to vector %u\n", (unsigned int)ATA_PRIMARY_VECTOR);
 
     irq_register(ATA_SECONDARY_IRQ, ata_irq_handler_secondary);
-    ioapic_route(ATA_SECONDARY_IRQ, ATA_SECONDARY_VECTOR, 0, false);
+    ioapic_route_isa(ATA_SECONDARY_IRQ, ATA_SECONDARY_VECTOR, 0); // ISA IRQ15, override-aware
     kprintf("ATA: IRQ15 routed to vector %u\n", (unsigned int)ATA_SECONDARY_VECTOR);
 
     // Register block devices for each detected drive

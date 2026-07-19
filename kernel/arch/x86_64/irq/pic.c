@@ -94,3 +94,25 @@ void pic_unmask_irq(uint8_t irq) {
     outb(port, value);
 }
 
+uint8_t pic_get_mask(bool master) {
+    return inb(master ? PIC1_DATA : PIC2_DATA);
+}
+
+// OCW3 command byte that makes the NEXT read of the command port return the
+// In-Service Register (rather than the default Interrupt Request Register).
+#define OCW3_READ_ISR   0x0B
+
+bool pic_irq_is_spurious(uint8_t irq) {
+    if (irq == 7) {
+        // Master ISR bit 7 set => IRQ7 is really in service; clear => spurious.
+        outb(PIC1_COMMAND, OCW3_READ_ISR);
+        return (inb(PIC1_COMMAND) & (1 << 7)) == 0;
+    }
+    if (irq == 15) {
+        // Slave ISR bit 7 (its OWN line 7 == global IRQ15) set => real.
+        outb(PIC2_COMMAND, OCW3_READ_ISR);
+        return (inb(PIC2_COMMAND) & (1 << 7)) == 0;
+    }
+    return false;   // any other line is never an 8259 spurious
+}
+

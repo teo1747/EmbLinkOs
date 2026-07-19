@@ -71,7 +71,7 @@ static int spawn_test(void)
     actions[0].flags = EMBK_O_CREAT | EMBK_O_WRONLY | EMBK_O_TRUNC;
     actions[0].mode = 0644;
 
-    long handle = embk_spawn("/init.elf", argv, actions, 1);
+    long handle = embk_spawn("/system/bin/init.elf", argv, actions, 1);
     if (handle < 0) { embk_puts(1, "spawn_test: FAIL spawn()\n"); return 0; }
 
     long exit_code = embk_wait((int)handle);
@@ -143,7 +143,7 @@ static int env_spawn_test(void)
     actions[0].flags = EMBK_O_CREAT | EMBK_O_WRONLY | EMBK_O_TRUNC;
     actions[0].mode = 0644;
 
-    long handle = embk_spawn_env("/init.elf", argv, envp, actions, 1);
+    long handle = embk_spawn_env("/system/bin/init.elf", argv, envp, actions, 1);
     if (handle < 0) { embk_puts(1, "env_spawn_test: FAIL spawn()\n"); return 0; }
     if (embk_wait((int)handle) != 0) {
         embk_puts(1, "env_spawn_test: FAIL child reported bad env\n");
@@ -217,7 +217,7 @@ static int cancel_test(void)
     acts[0].target_fd = 0;
     acts[0].src_obj_handle = pfd[0];
 
-    long h = embk_spawn("/init.elf", argv, acts, 1);
+    long h = embk_spawn("/system/bin/init.elf", argv, acts, 1);
     if (h < 0) { embk_puts(1, "cancel_test: FAIL spawn\n"); return 0; }
 
     /* Let it reach the blocking read. Cancelling BEFORE it blocks would still
@@ -265,7 +265,7 @@ static void ctrlc_child(void)
 static void ctrlc_parent(void)
 {
     char *argv[] = { "init", "ctrlc-child", (char *)0 };
-    long h = embk_spawn("/init.elf", argv, (void *)0, 0);
+    long h = embk_spawn("/system/bin/init.elf", argv, (void *)0, 0);
     if (h < 0) { embk_puts(1, "ctrlc_test: FAIL spawn\n"); embk_exit(1); }
 
     /* THE DELEGATION. From here a console ^C means the child, not us. */
@@ -399,11 +399,11 @@ static void surface_parent(void)
     if (embk_surface_commit(s, idx) != 0) { embk_puts(1, "surface: commit(S1) FAIL\n"); embk_exit(3); }
 
     char idxbuf[2] = { (char)('0' + idx), 0 };
-    char *cargv[] = { "/init.elf", "surface-child", idxbuf, (char *)0 };
+    char *cargv[] = { "/system/bin/init.elf", "surface-child", idxbuf, (char *)0 };
     struct embk_spawn_file_action act[1];
     act[0].kind = EMBK_SPAWN_ACTION_INHERIT_SURFACE;
     act[0].target_fd = s;                     /* hand the child THIS surface */
-    long h = embk_spawn("/init.elf", cargv, act, 1);
+    long h = embk_spawn("/system/bin/init.elf", cargv, act, 1);
     if (h < 0) { embk_puts(1, "surface: spawn child FAIL\n"); embk_exit(3); }
     long code = embk_wait((int)h);
     if (code != 42) { embk_puts(1, "surface: child-didn't-see-pixel FAIL\n"); embk_exit(3); }
@@ -579,7 +579,7 @@ static void compositor_role(void)
     if (lh < 0) { embk_puts(1, "compositor: listen FAIL\n"); embk_exit(2); }
 
     char *cargv[] = { "init", "compositor-client", (char *)0 };
-    long spawn_h = embk_spawn("/init.elf", cargv, 0, 0);
+    long spawn_h = embk_spawn("/system/bin/init.elf", cargv, 0, 0);
     if (spawn_h < 0) { embk_puts(1, "compositor: spawn FAIL\n"); embk_exit(3); }
 
     int ch = embk_chan_accept(lh);

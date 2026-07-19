@@ -40,18 +40,37 @@ for f in "$MYOS/build/crt0.o" "$MYOS/build/syscalls.o"; do
     [ -f "$f" ] || { echo "$0: $f missing -- run \`make\` in $MYOS first" >&2; exit 2; }
 done
 
-# --- the patch: idempotent, and REQUIRED ------------------------------------
+# --- the patches: idempotent, and REQUIRED ----------------------------------
 if grep -q 's1->static_link)) {' "$TCC_SRC/tccelf.c"; then
-    echo "  patch    already applied"
+    echo "  patch    0001 already applied"
 else
     echo "  PATCH    0001-static-link-plt32-is-pc32"
     patch -p1 -d "$TCC_SRC" < "$HERE/0001-static-link-plt32-is-pc32.patch"
+fi
+# 0002: without the GCC type macros, newlib's sys/_intsup.h #errors on the very
+# first real #include -- a pristine tcc can compile header-free toys and nothing
+# else. (Proven on the host; see the patch header.)
+if grep -q '__INT_LEAST8_TYPE__' "$TCC_SRC/libtcc.c"; then
+    echo "  patch    0002 already applied"
+else
+    echo "  PATCH    0002-x86_64-gcc-type-macros"
+    patch -p1 -d "$TCC_SRC" < "$HERE/0002-x86_64-gcc-type-macros.patch"
 fi
 
 # --- configure ---------------------------------------------------------------
 # Each flag is decided by an EmbLink FACT; see docs/BUILD_SETUP.md for the why:
 #   --cross-prefix     build tcc WITH our toolchain, so it RUNS on EmbLink
-#   --sysincludepaths  /libpaths: where it looks ON the OS (the flat root)
+#   --sysincludepaths  where #include <...> resolves ON the OS (searched in
+#                      order, ':' separated):
+#                        /system/abi/include   the ABI's headers (newlib's tree
+#                                              -- the sealed contract, packed by
+#                                              mkfs from EMBK_NEWLIB_INC)
+#                        /data/apps/tcc/include  tcc's OWN compiler headers
+#                                              (stddef.h/stdarg.h/... -- they
+#                                              belong to the compiler, so they
+#                                              live with the app)
+#   --libpaths         where -lXXX resolves ON the OS: /system/abi holds libc.a
+#                      (so a bare `-lc` works without -L)
 #   -DCONFIG_TCC_STATIC  no dlopen here (that is only for tcc -run)
 #   -DCONFIG_TCCBOOT     drops backtrace/bcheck: they need a SIGSEGV handler,
 #                        and EmbLink has no async signal delivery, so it could
@@ -63,8 +82,8 @@ cd "$TCC_SRC"
 ./configure \
     --cross-prefix="$CROSS" \
     --prefix=/ \
-    --sysincludepaths=/include \
-    --libpaths=/lib \
+    --sysincludepaths="/system/abi/include:/data/apps/tcc/include" \
+    --libpaths=/system/abi \
     --extra-cflags="-O2 -mno-red-zone -fno-stack-protector -DCONFIG_TCC_STATIC -DCONFIG_TCCBOOT -I$MYOS/user/lib -isystem $NEWLIB_PREFIX/x86_64-elf/include -DSSIZE_MAX=0x7fffffffffffffffL" \
     --extra-ldflags="-static -nostartfiles -T $MYOS/user/lib/newlib.ld -L$NEWLIB_PREFIX/x86_64-elf/lib $MYOS/build/crt0.o $MYOS/build/syscalls.o"
 

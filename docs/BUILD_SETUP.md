@@ -56,10 +56,11 @@ ZLIB_BUILD=~/cross/build-zlib tools/git/build-git-emblink.sh ~/cross/git-2.49.1 
 make GIT_SRC=~/cross/git-2.49.1 ZLIB_BUILD=~/cross/build-zlib
 #   then boot with -cpu max and run: test git repo
 
-# TCC -- a C compiler that RUNS ON the OS (applies our patch for you)
+# TCC -- a C compiler that RUNS ON the OS (applies BOTH our patches for you)
 tools/tcc/build-tcc-emblink.sh ~/cross/tcc-0.9.27
 make TCC_SRC=~/cross/tcc-0.9.27
-#   then: test tcc link   -> must print `exit=42`
+#   then: test tcc real   -> exit=42 + byte-exact stdio (headers + libc.a, the full claim)
+#   also: test tcc link   -> exit=42 (the header-free toy, still the quick smoke)
 ```
 
 **If you set the `*_PREFIX` / `*_SRC` variables on the command line, pass them
@@ -73,6 +74,7 @@ they currently point at the original author's home directory).
 | `x86_64-elf-gcc: command not found` | step 2, or `PATH` |
 | `undefined reference to __sfnprintf`, `%zu` prints `zu` | step 3 — you're on the stock newlib, not the C99 rebuild |
 | `make` works, but `test tcc link` fails while `test tcc compile` passes | `libc.a` isn't on the image → `NEWLIB_PREFIX` unset/wrong |
+| `test tcc real` dies at `#include <stdio.h>` while `test tcc link` passes | header trees aren't on the image (`EMBK_NEWLIB_INC`/`EMBK_TCC_INC` empty → `NEWLIB_PREFIX`/`TCC_SRC` unset), or tcc built without patch 0002 |
 | a tcc-built program dies instantly at a nonsense address | you built tcc by hand instead of with our script (see below) |
 | `git add` dies / `test python` faults on startup | QEMU without `-cpu max` — `getentropy` is RDRAND-only and refuses to fake entropy |
 
@@ -346,11 +348,24 @@ is pre-cached there, each stating what is actually TRUE of EmbLink. Never flip
 one to "yes" to get past configure; a false yes compiles a call to something that
 does not exist.
 
-### TCC needs OUR patch -- a pristine tcc silently produces CRASHING binaries
+### TCC needs OUR patches -- a pristine tcc silently produces CRASHING binaries
+### (0001) and cannot compile a single real #include (0002)
 
 `tools/tcc/build-tcc-emblink.sh /path/to/tcc-0.9.27` fetches nothing, but it
-**applies `tools/tcc/0001-static-link-plt32-is-pc32.patch`** and encodes the
-exact configure. Use it; do not build tcc by hand.
+**applies `tools/tcc/0001-static-link-plt32-is-pc32.patch` and
+`tools/tcc/0002-x86_64-gcc-type-macros.patch`** and encodes the exact
+configure -- including the on-OS search paths baked into the binary
+(`--sysincludepaths=/system/abi/include:/data/apps/tcc/include`,
+`--libpaths=/system/abi`). Use it; do not build tcc by hand.
+
+**0002, in one line:** tcc 0.9.27 predefines almost none of GCC's type macros,
+and newlib's `sys/_intsup.h` `#error`s without `__INTPTR_TYPE__` and friends
+(it evaluates them *arithmetically* over redefined keywords -- no fallback
+exists). A pristine tcc compiles header-free toys and nothing else. The patch
+defines the 67 missing x86_64-LP64 macros, values taken verbatim from
+`x86_64-elf-gcc -dM -E`. The header trees themselves reach the image via
+`EMBK_NEWLIB_INC` / `EMBK_TCC_INC`, both derived by the Makefile from
+`NEWLIB_PREFIX` / `TCC_SRC` -- one source of truth, nothing to set separately.
 
 Upstream tcc 0.9.27 routes every `R_X86_64_PLT32` through a PLT so a shared
 object could preempt the call. A `-static` link has no shared objects and no
@@ -364,10 +379,15 @@ set, and `.plt` disappears.
 
 Verify a tcc build the only way that means anything -- boot and run:
 
+    test tcc real     -> [tcc real] r.elf ran: exit=42 ... r.out: byte-exact
     test tcc link     -> [tcc link] /l.elf ran: exit=42 (want 42)
 
 `42` appears only if the OS really compiled, assembled, linked AND ran the
-program. `tcc -v` exiting 0 proves nothing about any of that.
+program -- and `test tcc real` additionally proves the on-image headers
+resolve and real `libc.a` members (buffered stdio) link and work. `tcc -v`
+exiting 0 proves nothing about any of that. Budget real wall time for these
+under TCG: the guest clock runs well below wall speed under the compositing
+desktop, and a compile+link that is ~1 s native is tens of seconds here.
 
 ## Troubleshooting
 
