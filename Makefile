@@ -141,6 +141,7 @@ KERNEL_BIN  = kernel/kernel.strip.elf
 # .elf) go to $(BUILD), out of the source tree. -Iuser/lib lets a program in
 # user/bin include the SDK as "embk.h". See user/README.md.
 USER_CC      = x86_64-elf-gcc
+ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = x86_64-elf-ld
 USER_INC     = -Iuser/lib
 # Freestanding programs (init.elf): own _start, no libc, no SSE.
@@ -325,6 +326,18 @@ build/crt0.o: user/lib/crt0.c | $(BUILD)
 
 build/syscalls.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+# --- ON-OS DYNAMIC-LINK ABI (so tcc can build EmUI apps against libembk.so) ---
+# emlink_dynstubs.o: the tcc-world equivalent of newlib.ld's PROVIDE()s -- crt0's
+# weak bracket symbols (__ctors_start/end, __tls_*) as weak absolute 0. tcc uses
+# no linker script and would otherwise turn them into unresolvable dynamic
+# imports. libtcc1.o: the float/64-bit intrinsics tcc's codegen EMITS but gcc
+# inlines (so they're absent from x86_64 libgcc) -- __floatundisf & friends.
+# Cross-built here (both are just as/C); shipped to /system/abi by mkfs.
+build/emlink_dynstubs.o: user/lib/emlink_dynstubs.s | $(BUILD)
+	$(ASM_GAS) $< -o $@
+build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c | $(BUILD)
+	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $< -o $@
 
 build/hello.o: user/bin/hello.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
@@ -657,16 +670,28 @@ EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
+# STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
+# judged by the machine rather than by their author's host -- e.g. EmbCC (a
+# separate repo) stages an object it compiled, linked against our crt0/newlib,
+# so the OS can answer "does it actually run?". Empty by default and never
+# built here: nothing in this tree may depend on a foreign toolchain existing.
+#
+# Explicit on the command line, deliberately -- `make STAGED_APPS=build/x.elf`.
+# A wildcard would have been shorter and would have silently disarmed the drift
+# guard below for EVERY unnamed .elf, which is the exact bug the guard exists to
+# catch. Naming the file is the point.
+STAGED_APPS ?=
+
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) build/libembk.so
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/libembk.so build/libtcc1.o build/emlink_dynstubs.o
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
 	@# otherwise completely silent. Warn loudly rather than let it rot.
 	@for f in build/*.elf; do \
-	  case " $(EMBKFS_APPS) " in \
+	  case " $(EMBKFS_APPS) $(STAGED_APPS) " in \
 	    *" $$f "*) ;; \
 	    *) echo "*** WARNING: $$f is packed onto the image but is NOT a"; \
 	       echo "***          prerequisite of embkfs.img -- changes to it will"; \
@@ -682,6 +707,7 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) bu
 	@# (stddef.h/stdarg.h/...) belong to the compiler (-> /data/apps/tcc/include).
 	@# Both paths mirror what build-tcc-emblink.sh bakes into tcc's search paths.
 	EMBK_NEWLIB_LIBC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libc.a,)" \
+	EMBK_NEWLIB_LIBM="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libm.a,)" \
 	EMBK_NEWLIB_INC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/include,)" \
 	EMBK_TCC_INC="$(if $(HAVE_TCC),$(TCC_SRC)/include,)" \
 	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
