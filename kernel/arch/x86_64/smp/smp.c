@@ -60,6 +60,9 @@ void ap_main(void) {
      * bug, not a defensive measure -- reserved-bit double faults the first
      * time an AP ran a fresh kthread off its NX-mapped stack. */
     vmm_enable_nx_this_cpu();
+    vmm_pat_init_this_cpu();   // per-core, same reasoning as vmm_enable_nx_this_cpu()
+                               // -- so a WC (vmm_map_mmio_wc) mapping resolves to
+                               // Write-Combining on this AP too, not the reset WB.
     fpu_init_this_cpu();   // per-core, same reasoning as vmm_enable_nx_this_cpu()
                             // just above -- see fpu.h. Must land before this
                             // core ever runs a kernel_ctx_switch() (its own

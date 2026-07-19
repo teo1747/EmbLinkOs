@@ -166,9 +166,13 @@ void fb_init(void) {
     uint64_t fb_size = (uint64_t)fb.pitch * fb.height;
 
     // Map the linear framebuffer when the scan-out lives in device memory.
+    // WRITE-COMBINING (not strict UC): fb_present() memcpy's whole frames from
+    // the RAM backbuffer into this aperture, exactly the sequential write-mostly
+    // pattern WC coalescing is for, and pixel writes need no UC ordering. (A GPU
+    // register BAR would stay vmm_map_mmio -- UC.)
     fb_front = 0;
     if (fb.address) {
-        uint64_t virt = vmm_map_mmio(fb.address, fb_size);
+        uint64_t virt = vmm_map_mmio_wc(fb.address, fb_size);
         if (!virt) {
             serial_write_string("Fatal: Failed to map framebuffer into virtual memory\n");
             while (1) {}

@@ -25,6 +25,11 @@ void vmm_init(void);
 // before touching any VMM_NX-mapped memory (see vmm.c's comment).
 void vmm_enable_nx_this_cpu(void);
 
+// Program IA32_PAT on the CALLING core so PAT entry 4 = Write-Combining (what
+// vmm_map_mmio_wc uses). Per-core MSR, like vmm_enable_nx_this_cpu -- every AP
+// must call it (ap_main) so a WC mapping is interpreted consistently everywhere.
+void vmm_pat_init_this_cpu(void);
+
 // Map a virtual address to a physical address with the given flags
 // Return 0 on succes, -1 on failure
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
@@ -52,7 +57,15 @@ uint64_t vmm_get_kernel_pml4(void);
 // Map a contiguous Physical MMIO region to a fresh virtual address
 // In the MMIO_BASE range. Returns the virtual address on success, 0 on failure.
 // Size in bytes, will be rounded up to a multiple of PAGE_SIZE.
+// vmm_map_mmio maps strictly UNCACHEABLE; vmm_map_mmio_wc maps WRITE-COMBINING
+// (linear framebuffers / large write-mostly apertures only -- never registers).
 uint64_t vmm_map_mmio(uint64_t phys, uint64_t size);
+uint64_t vmm_map_mmio_wc(uint64_t phys, uint64_t size);
+
+// Unmap and release an MMIO range from vmm_map_mmio[_wc]: clears the PTEs and
+// returns the VA range to a free list for reuse (first-fit). Pass the VA the
+// map call returned and the same size.
+void vmm_unmap_mmio(uint64_t virt, uint64_t size);
 
 // Map n (possibly scattered) physical pages into a contiguous, cached kernel VA
 // window (a flat kernel view of shared pixel pages). Returns base VA or 0.
