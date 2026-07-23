@@ -200,20 +200,63 @@ uint64_t pmm_reserved_phys_end(void) {
     return (bitmap_phys_end + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
 }
 
+/* Where the last successful allocation left off. The scan resumes here instead
+ * of restarting at page 0, which is the whole of the "linear scan is O(n)"
+ * problem: low memory fills up early and stays full, so every later allocation
+ * re-walked the same thousands of used pages before reaching fresh ground.
+ * Wrapping once covers anything freed behind the hint, so this is still an
+ * exact allocator -- it never reports ENOMEM while a free page exists. */
+static uint64_t pmm_hint;
+
+/* Bits scanned across all allocations. The instrument for the above: with the
+ * old code this grows roughly quadratically as memory fills; with the hint it
+ * should stay near one bit per allocation. */
+static uint64_t pmm_scan_bits;
+
+void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs);
+static uint64_t pmm_scan_allocs;
+
 uint64_t pmm_alloc_page(void) {
     spin_lock(&pmm_lock);
 
-    for (uint64_t page_index = 0; page_index < total_pages; page_index++) {
-        if (!bitmap_test(page_index)) { // If the page is free
-            bitmap_set(page_index); // Mark it as used
-            free_pages--;
-            used_pages++;
-            spin_unlock(&pmm_lock);
-            return (page_index * PAGE_SIZE); // Return the physical address of the allocated page
+    /* Two passes: [hint, end) then [0, hint). Byte-at-a-time skipping of fully
+     * used regions -- a 0xFF byte means eight used pages, so testing it once
+     * replaces eight bit tests. That is the other half of the cost: the old
+     * loop paid a shift and mask per PAGE even across regions that could not
+     * possibly contain a free one. */
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t start = (pass == 0) ? pmm_hint : 0;
+        uint64_t end   = (pass == 0) ? total_pages : pmm_hint;
+
+        uint64_t i = start;
+        while (i < end) {
+            /* Aligned and a whole byte left to look at: skip it in one test. */
+            if ((i % 8) == 0 && i + 8 <= end && pmm_bitmap[i / 8] == 0xFF) {
+                i += 8;
+                pmm_scan_bits++;          /* one test, not eight */
+                continue;
+            }
+            pmm_scan_bits++;
+            if (!bitmap_test(i)) {
+                bitmap_set(i);
+                free_pages--;
+                used_pages++;
+                pmm_hint = i + 1;
+                if (pmm_hint >= total_pages) pmm_hint = 0;
+                pmm_scan_allocs++;
+                spin_unlock(&pmm_lock);
+                return i * PAGE_SIZE;
+            }
+            i++;
         }
     }
     spin_unlock(&pmm_lock);
-    return 0; // No free pages available
+    return 0; // genuinely out of physical memory: both passes found nothing
+}
+
+void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs) {
+    if (out_bits)   *out_bits   = pmm_scan_bits;
+    if (out_allocs) *out_allocs = pmm_scan_allocs;
 }
 
 
@@ -229,6 +272,11 @@ void pmm_free_page(uint64_t phys_addr) {
         bitmap_clear(page_index); // Mark it as free
         free_pages++;
         used_pages--;
+        /* Aim the scan at the page we just freed. Not required for correctness
+         * -- the wrap pass in pmm_alloc_page would find it anyway -- but it
+         * makes the common free-then-allocate pair cost ONE bit test instead of
+         * a walk from wherever the hint happened to be. */
+        if (page_index < pmm_hint) pmm_hint = page_index;
     }
     spin_unlock(&pmm_lock);
 }

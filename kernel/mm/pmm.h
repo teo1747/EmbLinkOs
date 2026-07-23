@@ -57,6 +57,12 @@ uint64_t pmm_reserved_phys_end(void);
 // Returns Physical address of the given virtual address (or NULL if not found)
 uint64_t pmm_alloc_page(void);
 
+/* Allocator scan cost: total bit/byte tests performed across all allocations,
+ * and how many allocations that was. bits/allocs is the number that matters --
+ * it says whether the free-page search is O(1) amortised or walking the bitmap.
+ * See the rotating hint in pmm_alloc_page. */
+void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs);
+
 // takes a physical address and frees the corresponding virtual page
 void pmm_free_page(uint64_t phys_addr);
 

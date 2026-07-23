@@ -35,21 +35,46 @@ left to do.
 ## Memory Management
 
 ### PMM
-- [ ] Linear scan for a free page is O(n) — slow under heavy allocation.
-  Future: free list or buddy allocator.
-- [ ] Stack region hardcoded at 0x200000 — should be allocated dynamically
-  and tracked properly.
-- [ ] Stack and PMM bitmap could collide if the stack grows > 1MB.
-  - Move the stack to its own dedicated region, or allocate it via PMM after
-    init, with proper guard pages.
+- [x] ~~Linear scan for a free page is O(n) — slow under heavy allocation~~ —
+  **fixed, and measured.** Two small changes rather than the buddy allocator
+  this entry reached for: a **rotating hint** (resume where the last success
+  left off, wrap once — still exact, it cannot report ENOMEM while a free page
+  exists) and **byte-at-a-time skipping** (a `0xFF` byte is eight used pages,
+  so one test replaces eight). `pmm_free_page` also aims the hint at the page
+  it just freed, so free-then-allocate costs one test.
+  Controlled A/B via `test pmm`, same build, hint disabled vs enabled:
+
+  | | hint off (old) | hint on | |
+  |---|---:|---:|---|
+  | scan tests, 2048 allocations | 2,289,920 | 2,048 | |
+  | **tests per allocation** | **1118** | **1** | **1118× fewer** |
+
+  The old cost grew with how much memory was already used — low memory fills
+  first and stays full, so every allocation re-walked it. Note the "old" column
+  already includes byte-skipping; the true original (bit-at-a-time from page 0)
+  was ~8× worse again.
+  - [ ] A **buddy allocator** is still the eventual answer *if contiguous
+    multi-page allocation is ever needed* — that is what it buys that this does
+    not. Nothing asks for it yet, so it is not built speculatively.
+- [x] ~~Stack region hardcoded at 0x200000~~ — the boot stack is a 128 KiB
+  `resb` in the kernel's own `.bss` (`kentry.asm`), so it moves with the kernel
+  and there is no hardcoded address left.
+- [x] ~~Stack and PMM bitmap could collide if the stack grows > 1MB~~ —
+  structurally impossible for the same reason: the stack is inside the kernel
+  image, below `kernel_end`, and the bitmap sits *at* `kernel_end`. They cannot
+  overlap without the linker placing `.bss` on top of itself.
+  - [ ] Still absent: **guard pages** on the boot stack. A deep recursion would
+    run off the bottom into whatever `.bss` precedes it rather than faulting.
+    Bounded (the kernel's call depth is shallow and known), but real.
 
 ### VMM — kernel mapping extent (NEW — today's near-miss)
-- [ ] vmm_init maps only the first 2MB of the kernel into the kernel range
-  (`for phys = 0; phys < 0x200000`). The kernel currently fits (~1.5MB), but
-  the moment it crosses 2MB (more drivers, filesystem code, bigger BSS) the
-  high addresses become unmapped → page fault on first access.
-  - FIX: map dynamically up to a rounded-up KV2P(kernel_end) instead of a
-    hardcoded 0x200000.
+- [x] ~~vmm_init maps only the first 2MB of the kernel into the kernel range~~ —
+  done, and the near-miss it warned about did arrive: the kernel is now ~1076
+  sectors (550 KB of image, ~4 MB total with `.bss`), well past 2 MB. `vmm_init`
+  maps `[0 .. max(kernel_end, pmm_reserved_phys_end()))`, rounded up — the
+  bitmap sits *at* `kernel_end` and is written before the remap, so the mapping
+  has to cover it too or the first bitmap access after the CR3 switch faults.
+  Visible at boot: `Mapping Kernel at 0xFFFFFFFF80000000 up to phys: 0x467000`.
 
 ### VMM — page-table location limit (measured)
 - [x] Boots fine at 4 GB. Page tables (~28 KB) + bitmap (160 KB) fit under

@@ -378,6 +378,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs shrink\n");
     kprintf("  test blockrace\n");
     kprintf("  test usercopy\n");
+    kprintf("  test pmm\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -595,6 +596,89 @@ int selftests_handle_command(const char *cmd)
  *                    had about it.
  * Either way this is the first time the question has been asked with a
  * counter instead of an anecdote. */
+/* THE PMM FREE-PAGE SEARCH, measured.
+ *
+ * docs/TODO.md: "Linear scan for a free page is O(n) -- slow under heavy
+ * allocation. Future: free list or buddy allocator." The scan restarted at
+ * page 0 on EVERY call and tested one bit at a time, so once low memory filled
+ * (it fills first and stays full) each allocation re-walked thousands of used
+ * pages to reach fresh ground. Cost per allocation grew with how much memory
+ * was already in use -- quadratic over a run, not linear.
+ *
+ * The fix is deliberately NOT the buddy allocator the TODO reaches for. Two
+ * small changes get the same win for a fraction of the risk:
+ *   - a rotating hint: resume where the last success left off, wrap once. Still
+ *     exact -- it cannot report ENOMEM while a free page exists.
+ *   - byte-at-a-time skipping: a 0xFF byte is eight used pages, so one test
+ *     replaces eight.
+ * A buddy allocator would also buy contiguous multi-page allocation, which
+ * nothing here asks for yet. That is why it stays on the list rather than
+ * getting built speculatively.
+ *
+ * This reports BITS PER ALLOCATION, which is the whole claim in one number:
+ * near 1 means the search is O(1) amortised; large means it is still walking.
+ * Re-run after touching pmm_alloc_page. */
+    if (strcmp(cmd, "test pmm") == 0) {
+        #define PMM_N 2048
+        static uint64_t pages[PMM_N];
+        uint64_t b0, a0, b1, a1;
+        int ok = 1;
+
+        pmm_scan_stats(&b0, &a0);
+
+        /* Allocate a lot. Under the old scan this is the pathological shape:
+         * each call starts over from page 0 across everything already used. */
+        uint64_t got = 0;
+        for (uint64_t i = 0; i < PMM_N; i++) {
+            pages[i] = pmm_alloc_page();
+            if (!pages[i]) break;
+            got++;
+        }
+        pmm_scan_stats(&b1, &a1);
+        uint64_t alloc_bits = b1 - b0, alloc_n = a1 - a0;
+        kprintf("[pmm] allocated %llu pages: %llu scan tests, %llu per allocation\n",
+                (unsigned long long)got, (unsigned long long)alloc_bits,
+                (unsigned long long)(alloc_n ? alloc_bits / alloc_n : 0));
+        if (got != PMM_N) { kprintf("[pmm] FAIL: only got %llu of %d\n",
+                                    (unsigned long long)got, PMM_N); ok = 0; }
+
+        /* Every page must be distinct -- a hint that skipped a bitmap update
+         * would hand the same frame out twice, which is the failure mode this
+         * optimisation could plausibly introduce, and it is silent. Sorting is
+         * overkill for 2048; a direct duplicate check against the previous
+         * allocation catches the realistic bug (hint not advancing). */
+        for (uint64_t i = 1; i < got && ok; i++) {
+            if (pages[i] == pages[i - 1]) {
+                kprintf("[pmm] FAIL: page %llu handed out twice (0x%llx)\n",
+                        (unsigned long long)i, (unsigned long long)pages[i]);
+                ok = 0;
+            }
+        }
+
+        /* Free them all, then reallocate: with the hint this should be nearly
+         * free, because each free aims the scan at a known-free page. */
+        for (uint64_t i = 0; i < got; i++) pmm_free_page(pages[i]);
+        pmm_scan_stats(&b0, &a0);
+        uint64_t got2 = 0;
+        for (uint64_t i = 0; i < got; i++) {
+            uint64_t p = pmm_alloc_page();
+            if (!p) break;
+            pages[i] = p; got2++;
+        }
+        pmm_scan_stats(&b1, &a1);
+        uint64_t re_bits = b1 - b0, re_n = a1 - a0;
+        kprintf("[pmm] re-allocated %llu pages after free: %llu tests, %llu per allocation\n",
+                (unsigned long long)got2, (unsigned long long)re_bits,
+                (unsigned long long)(re_n ? re_bits / re_n : 0));
+        if (got2 != got) { kprintf("[pmm] FAIL: reallocation got %llu of %llu\n",
+                                   (unsigned long long)got2, (unsigned long long)got); ok = 0; }
+        for (uint64_t i = 0; i < got2; i++) pmm_free_page(pages[i]);
+
+        kprintf("\n[cmd] test pmm: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+        #undef PMM_N
+    }
+
     if (strcmp(cmd, "test usercopy") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test usercopy: VFS not registered\n"); return 1; }
 
