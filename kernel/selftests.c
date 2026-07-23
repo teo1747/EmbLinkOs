@@ -374,6 +374,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs alloc\n");
     kprintf("  test embkfs tree\n");
     kprintf("  test embkfs obj\n");
+    kprintf("  test embkfs shrink\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -519,6 +520,12 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embkfs obj") == 0) {
         int rc = embkfs_run_object_selftests();
         kprintf("\n[cmd] test embkfs obj: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs shrink") == 0) {
+        int rc = embkfs_run_shrink_selftests();
+        kprintf("\n[cmd] test embkfs shrink: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
         return 1;
     }
 

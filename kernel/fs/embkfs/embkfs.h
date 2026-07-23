@@ -557,6 +557,7 @@ int embkfs_run_path_selftests(void);
 int embkfs_run_allocator_selftests(void);
 int embkfs_run_tree_selftests(void);
 int embkfs_run_object_selftests(void);
+int embkfs_run_shrink_selftests(void);
 int embkfs_run_timestamp_selftests(void);
 int embkfs_run_multivol_selftests(void);
 int embkfs_run_compress_selftests(void);

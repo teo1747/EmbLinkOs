@@ -499,17 +499,33 @@ interrupt-driven.
   `..`). VFS now does dot-dot itself with a breadcrumb stack, so this path is
   only hit by EMBKFS-internal callers — but if those stay, a stored parent
   back-ref would make it O(1). Low priority.
-- [ ] A pre-existing (not v2-introduced) extent-supersede bug: a shrinking
-  write can fail with `-EMBK_EINVAL` specifically when the object's PRIOR
-  data happened to land as a single multi-block extent instead of several
-  single-block extents covering the same range. 100% reproducible via
-  `test embkfs timestamps` immediately followed by `test embkfs obj` on a
-  freshly-formatted volume. Root-caused down to the old-extent-supersede /
-  `embkfs_alloc_run()` interaction but not fixed — needs GDB-based tracing
-  (`docs/GDB_CHEATSHEET.md`) to finish. Documented in a code comment above
-  `embkfs_write_file()`. Flagging here too since Phase 3/4's compression
-  and encryption both add MORE extent-shape variation on the exact code
-  path this bug lives in, and could make it easier to hit, not harder.
+- [~] The extent-supersede bug (shrinking write → `-EMBK_EINVAL` when the
+  prior data landed as ONE multi-block extent): **no longer reproducible, and
+  not knowingly fixed.** Re-checked 2026-07-23 — the documented sequence
+  (`test embkfs timestamps` then `test embkfs obj` on a fresh volume) passes
+  *with the triggering shape present* (the log shows the 4103-byte write
+  landing as `1 extent, 2 blk`, then the truncate succeeding). No fix was
+  identified: `puts_cap` and the allocate/supersede loop are unchanged since
+  the report (checked against 00fa091), so either something else in the
+  intervening work moved it, or the trigger needed a finer bitmap state than
+  "one extent vs several". **Cannot-reproduce is not fixed**, so this stays
+  on the list rather than being ticked.
+  - What changed instead: the invariant is now *tested*. **`test embkfs
+    shrink`** runs 12 shrinking writes over whatever extent shapes the volume
+    produces (truncate-to-empty, block-boundary and off-by-one cuts, a
+    hole-bearing file) and checks the surviving BYTES, not just the return
+    code. Verified green twice — once on a fresh volume *with* the trigger
+    shape, once on a churned volume without it.
+  - The lesson, recorded because it cost this investigation: the original
+    repro depended on the free-block bitmap state two *unrelated* tests
+    happened to leave behind. That is a coincidence with a procedure attached,
+    not a repro — and it decayed into a passing sequence that could no longer
+    distinguish "fixed" from "hidden". The replacement asserts the invariant
+    and *reports* which shapes it saw, so a run that missed the trigger cannot
+    read as one that hit it. (The first draft of the new test repeated the old
+    mistake — it demanded a shape and skipped when the allocator refused, and
+    7 of 9 cases went unexercised. It reported `try again` rather than green,
+    which is how the flaw was caught.)
 
 #### EMBKFS v2 (see `docs/EMBKFS_spec_v2.2.md` for full detail on all of these)
 - [ ] Snapshot allocator hold-back is conservative ("hold every freed block

@@ -2156,27 +2156,45 @@ static bool embk_bytes_all_zero(const uint8_t *p, uint64_t n)
  * Note the signature: len is now uint64_t (was uint32_t). Existing call sites
  * that pass a small length still compile.
  *
- * KNOWN BUG, found and reproduced while verifying Phase 0 of the v2 EMBKFS
- * work (docs/EMBKFS_spec_v2.2.md), NOT introduced by that work and NOT yet
- * root-caused: a shrinking write (embkfs_truncate_object() calling through
- * here) can fail with -EMBK_EINVAL specifically when the object's PRIOR
- * data happened to land as a single multi-block extent (as opposed to
- * several single-block extents covering the same byte range) -- confirmed
- * 100% reproducible via `test embkfs timestamps` immediately followed by
- * `test embkfs obj` on a freshly formatted volume (the first test's own
- * alloc/free activity leaves the free-block bitmap in a state that makes
- * the second test's 4103-byte write land as ONE 2-block extent instead of
- * two 1-block extents; the following truncate(2) then fails). Ruled out:
- * mid-transaction block reuse (embkfs_note_freed_run only queues blocks
- * into txn->frun -- the bitmap isn't updated, and old blocks can't be
- * reallocated, until embkfs_txn_end() runs after a successful commit) and
- * puts_cap sizing (both the single- and double-extent cases fit their
- * computed cap with room to spare). Needs GDB-based tracing through the
- * old-extent-supersede / embkfs_alloc_run() interaction (docs/
- * GDB_CHEATSHEET.md) to actually root-cause -- flagging here rather than
- * silently working around it, since Phase 3 (compression) and Phase 4
- * (encryption) both add MORE extent-shape variation on top of this exact
- * code path and could make the bug easier, not harder, to hit. */
+ * THE "EXTENT-SUPERSEDE" BUG: no longer reproducible, and NOT knowingly fixed.
+ * Read that second clause carefully before trusting this code.
+ *
+ * The original report (v2 Phase 0) said a shrinking write through
+ * embkfs_truncate_object() failed with -EMBK_EINVAL when the object's prior
+ * data happened to land as ONE multi-block extent instead of several
+ * single-block ones, and called itself "100% reproducible" via
+ * `test embkfs timestamps` immediately followed by `test embkfs obj` on a
+ * freshly formatted volume.
+ *
+ * Re-checked 2026-07-23: that sequence now passes, AND it passes with the
+ * triggering shape genuinely present -- the log shows the 4103-byte write
+ * landing as `1 extent, 2 blk`, exactly the geometry the report blames, and
+ * the following truncate succeeding. So the failure is gone from the case
+ * that produced it.
+ *
+ * What was NOT established: why. No fix was identified. The two things the
+ * original note suspected are unchanged in this function since the report --
+ * puts_cap is still `1 + old_n + max_new`, and the allocate/write/supersede
+ * loop is structurally what it was (checked against 00fa091). Something else
+ * in the intervening work moved, or the failure needed a bitmap state finer
+ * than "one extent vs several". Either way, "cannot reproduce" is not "fixed",
+ * and this comment will not pretend otherwise.
+ *
+ * What DID change is that the invariant is now tested instead of hoped for:
+ * `test embkfs shrink` (embkfs_run_shrink_selftests) runs twelve shrinking
+ * writes across whatever extent shapes the volume produces -- including
+ * truncate-to-empty, block-boundary and off-by-one cuts, and a hole-bearing
+ * file -- and checks the surviving BYTES, not just the return code. It reports
+ * which shapes it actually saw, so a run that never hit the single
+ * multi-block extent cannot be mistaken for one that did.
+ *
+ * The original repro's real defect is worth remembering: it depended on the
+ * free-block bitmap state two unrelated tests happened to leave behind. That
+ * is not a repro, it is a coincidence with a procedure attached, and it decayed
+ * into a passing sequence that could not tell "fixed" from "hidden". Phase 3
+ * (compression) and Phase 4 (encryption) still add extent-shape variation on
+ * this exact path, so if the failure returns, `test embkfs shrink` is where it
+ * should surface -- and it will name the shape it was holding at the time. */
 static int embkfs_write_file(struct embkfs_volume *vol, uint64_t oid,
                              const uint8_t *newdata, uint64_t len)
 {
@@ -5819,6 +5837,206 @@ int embkfs_run_object_selftests(void)
     }
 
     kprintf("EMBKFS: %s: object io stress: OK\n", vol->dev->name);
+    return EMBK_OK;
+}
+
+/* SHRINKING WRITES, over whatever extent shape the volume produces -- the test
+ * that should have existed when the "extent-supersede" bug was first reported.
+ *
+ * That bug (docs/TODO.md, and the comment above embkfs_write_file) said a
+ * shrinking write failed with -EINVAL when the object's prior data HAPPENED to
+ * land as one multi-block extent rather than several single-block ones, and
+ * called itself "100% reproducible" via `test embkfs timestamps` followed by
+ * `test embkfs obj`. The word doing the damage is HAPPENED: the trigger was
+ * never the tests, it was the free-block bitmap state they ran into, which is
+ * incidental to everything -- image contents, what mkfs packed, what ran
+ * before. A repro resting on allocator luck stops reproducing the moment the
+ * image changes, and then nobody can tell whether the bug was fixed or merely
+ * hidden. Which is exactly what happened: the sequence now passes, WITH the
+ * triggering shape present (see the note on the fix below).
+ *
+ * The lesson shapes this test. A first draft demanded a specific extent count
+ * per case and skipped when it did not get one -- which reproduced the very
+ * flaw it was written to replace (7 of 9 cases went unexercised on the first
+ * run, and the suite honestly reported "try again" rather than green). The
+ * fix is to stop testing a SHAPE and start testing the INVARIANT:
+ *
+ *     a shrinking write succeeds, and the surviving bytes are unchanged,
+ *     WHATEVER extent shape the prior contents happened to take.
+ *
+ * Every case therefore runs against whatever the allocator gives, records the
+ * shape it actually got, and passes or fails on behaviour alone. Shape
+ * coverage is reported separately: the suite says whether it ever managed to
+ * exercise the reported trigger (a single extent spanning >1 block), so a run
+ * that never hit it cannot be mistaken for one that did.
+ *
+ * Every case reads the data back. A shrink that "succeeds" and loses the
+ * surviving bytes is the worse of the two bugs, and only a content check
+ * catches it. */
+struct embk_shrink_stats {
+    int pass, fail;
+    int saw_single_multiblock;   /* the reported trigger: n==1 over >1 block */
+    int saw_multi_extent;        /* the shape it was contrasted against      */
+    uint32_t max_extents;
+};
+
+static int embk_shrink_case(struct embkfs_volume *vol, uint64_t oid, const char *tag,
+                            uint8_t *buf, uint64_t write_len, uint64_t new_len,
+                            struct embk_shrink_stats *st)
+{
+    /* A recognisable, non-repeating pattern: byte i is (i*31+7). Never all-zero
+     * across a block, so hole synthesis stays out of the way unless a case asks
+     * for it, and a misplaced byte is obvious rather than plausible. */
+    for (uint64_t i = 0; i < write_len; i++) buf[i] = (uint8_t)(i * 31 + 7);
+
+    int rc = embkfs_write_object(vol, oid, buf, write_len);
+    if (rc != EMBK_OK) {
+        kprintf("EMBKFS: shrink %s: initial write of %lu failed: %s\n",
+                tag, write_len, embk_strerror(rc));
+        st->fail++;
+        return rc;
+    }
+
+    /* Record the shape we actually got -- the case is defined by its behaviour,
+     * but the shape is what tells a reader which variant was covered. */
+    uint32_t n = 0;
+    rc = embkfs_count_extents(vol, oid, &n);
+    if (rc != EMBK_OK) { st->fail++; return rc; }
+    uint64_t blocks = (write_len + vol->block_size - 1) / vol->block_size;
+    if (n == 1 && blocks > 1) st->saw_single_multiblock++;
+    if (n > 1)                st->saw_multi_extent++;
+    if (n > st->max_extents)  st->max_extents = n;
+
+    rc = embkfs_truncate_object(vol, oid, new_len);
+    if (rc != EMBK_OK) {
+        kprintf("EMBKFS: shrink %s: %lu -> %lu (%u extent%s in) FAILED: %s\n",
+                tag, write_len, new_len, n, n == 1 ? "" : "s", embk_strerror(rc));
+        st->fail++;
+        return rc;
+    }
+
+    /* the survivors must be the original bytes, and the size exact */
+    uint64_t got = 0;
+    memset(buf, 0xA5, new_len ? new_len : 1);
+    rc = embkfs_read_object(vol, oid, buf, new_len, &got);
+    if (rc != EMBK_OK) { st->fail++; return rc; }
+    if (got != new_len) {
+        kprintf("EMBKFS: shrink %s: read back %lu bytes, want %lu\n", tag, got, new_len);
+        st->fail++;
+        return -EMBK_EINVAL;
+    }
+    for (uint64_t i = 0; i < new_len; i++) {
+        if (buf[i] != (uint8_t)(i * 31 + 7)) {
+            kprintf("EMBKFS: shrink %s: byte %lu is 0x%x, want 0x%x -- DATA LOST\n",
+                    tag, i, buf[i], (uint8_t)(i * 31 + 7));
+            st->fail++;
+            return -EMBK_EINVAL;
+        }
+    }
+    kprintf("EMBKFS: shrink %s: %lu -> %lu (%u extent%s in) OK\n",
+            tag, write_len, new_len, n, n == 1 ? "" : "s");
+    st->pass++;
+    return EMBK_OK;
+}
+
+int embkfs_run_shrink_selftests(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
+    struct embkfs_volume *vol = g_embkfs_live;
+    if (vol->read_only) return -EMBK_EROFS;
+
+    const uint64_t bs = vol->block_size;
+    kprintf("EMBKFS: %s: shrinking writes: begin (block_size %lu)\n", vol->dev->name, bs);
+
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f");
+    embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink");
+
+    uint64_t dir_oid = 0, oid = 0;
+    int rc = embkfs_mkdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink", &dir_oid);
+    if (rc != EMBK_OK) return rc;
+    rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f", &oid);
+    if (rc != EMBK_OK) return rc;
+
+    uint8_t *buf = kmalloc(bs * 4 + 16);
+    if (!buf) return -EMBK_ENOMEM;
+
+    struct embk_shrink_stats st = { 0, 0, 0, 0, 0 };
+    int last = EMBK_OK;
+    #define SHRINK(tag, wl, nl) do {                                    \
+        int r = embk_shrink_case(vol, oid, (tag), buf, (wl), (nl), &st); \
+        if (r != EMBK_OK) last = r;                                     \
+    } while (0)
+
+    /* (a) THE REPORTED TRIGGER's exact geometry: bs+7 bytes (the original was
+     * 4103 on a 4096 volume) shrunk to 2 bytes. */
+    SHRINK("a/bs+7->2",        bs + 7,     2);
+
+    /* (b) shrink landing exactly on a block boundary */
+    SHRINK("b/2bs+5->1bs",     bs * 2 + 5, bs);
+
+    /* (c) truncate-to-empty: every extent deleted, none created */
+    SHRINK("c/2bs+5->0",       bs * 2 + 5, 0);
+
+    /* (d) a 4-block object cut to three very different sizes */
+    SHRINK("d/4bs->3",         bs * 4,     3);
+    SHRINK("d/4bs->bs+1",      bs * 4,     bs + 1);
+    SHRINK("d/4bs->3bs",       bs * 4,     bs * 3);
+
+    /* (e) off-by-one either side of a block boundary -- the arithmetic most
+     * likely to be wrong in extent-splitting code */
+    SHRINK("e/2bs->bs-1",      bs * 2,     bs - 1);
+    SHRINK("e/2bs->bs+1",      bs * 2,     bs + 1);
+    SHRINK("e/2bs->bs",        bs * 2,     bs);
+
+    /* (f) single block down to one byte, and to zero */
+    SHRINK("f/bs->1",          bs,         1);
+    SHRINK("f/bs->0",          bs,         0);
+
+    /* (g) a HOLE-bearing file: the middle block is all zero, so write_file
+     * synthesises a logical-only extent (length 0, owning no blocks). Shrinking
+     * across that boundary runs the supersede path against an extent that has
+     * no run to free -- a case the byte-pattern cases cannot reach. */
+    {
+        for (uint64_t i = 0; i < bs * 3; i++) buf[i] = (uint8_t)(i * 31 + 7);
+        memset(buf + bs, 0, bs);                       /* middle block: a hole */
+        int r = embkfs_write_object(vol, oid, buf, bs * 3);
+        uint32_t n = 0;
+        if (r == EMBK_OK) r = embkfs_count_extents(vol, oid, &n);
+        if (r == EMBK_OK) r = embkfs_truncate_object(vol, oid, bs + 4);  /* cut inside the hole */
+        if (r == EMBK_OK) {
+            uint64_t got = 0;
+            memset(buf, 0xA5, bs + 4);
+            r = embkfs_read_object(vol, oid, buf, bs + 4, &got);
+            if (r == EMBK_OK && got != bs + 4) r = -EMBK_EINVAL;
+            for (uint64_t i = 0; r == EMBK_OK && i < bs; i++)
+                if (buf[i] != (uint8_t)(i * 31 + 7)) r = -EMBK_EINVAL;   /* real data */
+            for (uint64_t i = bs; r == EMBK_OK && i < bs + 4; i++)
+                if (buf[i] != 0) r = -EMBK_EINVAL;                       /* hole reads zero */
+        }
+        kprintf("EMBKFS: shrink g/hole 3bs->bs+4: %u extents in, %s\n",
+                n, r == EMBK_OK ? "OK" : embk_strerror(r));
+        if (r == EMBK_OK) st.pass++; else { st.fail++; last = r; }
+    }
+    #undef SHRINK
+
+    kfree(buf);
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f");
+    embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink");
+
+    /* Shape coverage is REPORTED, never asserted -- the volume decides it, and
+     * a run that never saw the reported trigger must not read like one that
+     * did. Both shapes appearing across a run is the useful signal: it means
+     * the invariant held on the shape that used to fail AND on its opposite. */
+    kprintf("EMBKFS: %s: shrinking writes: %d passed, %d failed "
+            "(shapes seen: single-multiblock %d, multi-extent %d, max %u extents)\n",
+            vol->dev->name, st.pass, st.fail,
+            st.saw_single_multiblock, st.saw_multi_extent, st.max_extents);
+    if (!st.saw_single_multiblock)
+        kprintf("EMBKFS: %s: shrinking writes: NOTE -- the reported trigger shape "
+                "(one extent over >1 block) did not occur this run; free space was "
+                "too fragmented to produce it\n", vol->dev->name);
+
+    if (st.fail) return (last == EMBK_OK) ? -EMBK_EINVAL : last;
     return EMBK_OK;
 }
 
