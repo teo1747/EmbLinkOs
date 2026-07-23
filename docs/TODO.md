@@ -831,11 +831,26 @@ how it came down" and BUILD.md §6.
       traffic (`/`; `/run` is epfs, a different filesystem). Splitting the lock
       per volume splits nothing. This was the obvious-sounding fix and the
       measurement killed it.
-    - **The cost is HOLD TIME, not granularity.** ~484 ms per wait is the
-      duration of another reader's *whole-object* load — EMBKFS pulls an entire
-      object into `rcache` inside one locked region. A waiter blocks for all of
-      it. Shortening the critical section is therefore a bigger and much
-      cheaper win than subdividing the lock.
+    - **The cost is HOLD TIME, not granularity** — and the hold time was the
+      *single-slot* whole-object cache thrashing. **Fixed:** `rcache` is now
+      4-way (LRU, 12 MB budget). Controlled A/B, same build and counters, only
+      `EMBKFS_RCACHE_SLOTS` changed:
+
+      | | 1 slot | 4 slots | |
+      |---|---:|---:|---|
+      | rcache misses | 63 | 8 | 7.9× fewer |
+      | …self-inflicted evictions | 61 | 4 | **96% of 1-slot misses** |
+      | device bounce reads | 228 | 16 | 14× fewer |
+      | **total ms blocked on the fs lock** | **172813** | **79108** | **2.2× less** |
+      | ms per wait | 1585 | 437 | 3.6× shorter |
+
+      96% of the old misses were evictions the cache inflicted on *itself* —
+      two readers alternating between two files evicted each other on every
+      switch, and each miss re-decoded a whole object while holding the global
+      lock. Note the wait *count* went UP (109 → 181): threads now make more
+      progress so they queue more often, while each wait is 3.6× shorter. Wait
+      count alone would have read as a regression; total blocked time is the
+      honest metric.
     - Prerequisite for per-OBJECT locking, if it is ever wanted: **34 shared
       `static uint8_t [4096]` scratch buffers in embkfs.c** would have to
       become per-caller first — *they* are what the lock actually protects

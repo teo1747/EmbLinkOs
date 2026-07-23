@@ -1688,8 +1688,14 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->total_blocks = sb->total_blocks;
     vol->free_blocks  = sb->free_blocks;
     vol->generation   = sb->generation;
-    /* read cache starts empty (rcache_gen=0 never matches a real generation) */
-    vol->rcache_buf = NULL; vol->rcache_oid = 0; vol->rcache_gen = 0; vol->rcache_len = 0;
+    /* read cache starts empty (gen=0 never matches a real generation) */
+    for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+        vol->rcache[i].buf = NULL; vol->rcache[i].oid = 0;
+        vol->rcache[i].gen = 0;    vol->rcache[i].len = 0;
+        vol->rcache[i].stamp = 0;
+    }
+    vol->rcache_clock = 0; vol->rcache_bytes = 0;
+    vol->rcache_hits = 0; vol->rcache_misses = 0; vol->rcache_evicts = 0;
     /* extent-map cache: same deal, same keying (see embkfs.h). Must be seeded --
      * read_object_range tests ecache_ext before ecache_gen, so a garbage pointer
      * from an uninitialised volume would be dereferenced. */
@@ -1745,7 +1751,18 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
 /* See struct embkfs_stat (embkfs.h). Attributes EMBKFS's block reads by cause. */
 static struct embkfs_stat g_efs_stat;
 void embkfs_stat_reset(void) { memset(&g_efs_stat, 0, sizeof g_efs_stat); }
-void embkfs_stat_get(struct embkfs_stat *out) { if (out) *out = g_efs_stat; }
+void embkfs_stat_get(struct embkfs_stat *out)
+{
+    if (!out) return;
+    /* rcache counters live per-VOLUME (the cache does); fold the live volume's
+     * in here so callers get one struct rather than two sources of truth. */
+    if (g_embkfs_live) {
+        g_efs_stat.rcache_hit   = g_embkfs_live->rcache_hits;
+        g_efs_stat.rcache_miss  = g_embkfs_live->rcache_misses;
+        g_efs_stat.rcache_evict = g_embkfs_live->rcache_evicts;
+    }
+    *out = g_efs_stat;
+}
 
 int embkfs_read_node(struct embkfs_volume *vol,
                      const struct embk_block_ptr *ptr,
@@ -4823,15 +4840,20 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
     /* Fast path: whole-object read cache. This is the O(n^2) fix -- previously
      * EVERY call re-decoded the entire [0, offset+want) prefix, so a file read
      * sequentially in K chunks re-read growing prefixes (K*(K+1)/2 blocks). */
-    if (vol->rcache_buf && vol->rcache_oid == oid && vol->rcache_gen == vol->generation) {
-        uint64_t total = vol->rcache_len;
+    for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+        struct embk_rcache_slot *sl = &vol->rcache[i];
+        if (!sl->buf || sl->oid != oid || sl->gen != vol->generation) continue;
+        sl->stamp = ++vol->rcache_clock;          /* LRU touch */
+        vol->rcache_hits++;
+        uint64_t total = sl->len;
         if (offset >= total) return EMBK_OK;
         uint64_t want = total - offset;
         if (want > len) want = len;
-        memcpy(buf, vol->rcache_buf + offset, want);
+        memcpy(buf, sl->buf + offset, want);
         *out_read = want;
         return EMBK_OK;
     }
+    vol->rcache_misses++;
 
     /* Size from the cached inode. This used to be
      * `embkfs_read_object_prefix(vol, oid, NULL, 0, &total, NULL)` -- want==0 so
@@ -4858,11 +4880,38 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
         if (nb) {
             rc = embkfs_read_object_prefix(vol, oid, nb, total, NULL, NULL);
             if (rc != EMBK_OK) { kfree(nb); return rc; }
-            if (vol->rcache_buf) kfree(vol->rcache_buf);
-            vol->rcache_buf = nb;
-            vol->rcache_oid = oid;
-            vol->rcache_gen = vol->generation;
-            vol->rcache_len = total;
+            /* Install. Take a FREE slot if there is one; otherwise evict the
+             * least-recently-used. Then keep evicting until the newcomer fits
+             * the total-bytes budget -- slots are for hit rate, the budget is
+             * what stops four big files pinning 32 MB. */
+            uint32_t victim = 0;
+            uint64_t oldest = (uint64_t)-1;
+            for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+                if (!vol->rcache[i].buf) { victim = i; oldest = 0; break; }
+                if (vol->rcache[i].stamp < oldest) { oldest = vol->rcache[i].stamp; victim = i; }
+            }
+            if (vol->rcache[victim].buf) {
+                vol->rcache_bytes -= vol->rcache[victim].len;
+                kfree(vol->rcache[victim].buf);
+                vol->rcache[victim].buf = NULL;
+                vol->rcache_evicts++;
+            }
+            while (vol->rcache_bytes + total > EMBKFS_RCACHE_BUDGET) {
+                uint32_t v2 = EMBKFS_RCACHE_SLOTS; uint64_t o2 = (uint64_t)-1;
+                for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++)
+                    if (vol->rcache[i].buf && vol->rcache[i].stamp < o2) { o2 = vol->rcache[i].stamp; v2 = i; }
+                if (v2 == EMBKFS_RCACHE_SLOTS) break;   /* nothing left to drop */
+                vol->rcache_bytes -= vol->rcache[v2].len;
+                kfree(vol->rcache[v2].buf);
+                vol->rcache[v2].buf = NULL;
+                vol->rcache_evicts++;
+            }
+            vol->rcache[victim].buf   = nb;
+            vol->rcache[victim].oid   = oid;
+            vol->rcache[victim].gen   = vol->generation;
+            vol->rcache[victim].len   = total;
+            vol->rcache[victim].stamp = ++vol->rcache_clock;
+            vol->rcache_bytes += total;
             memcpy(buf, nb + offset, want);
             *out_read = want;
             return EMBK_OK;

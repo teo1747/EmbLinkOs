@@ -660,9 +660,18 @@ int selftests_handle_command(const char *cmd)
                     (unsigned long long)wts,
                     (unsigned long long)(acq ? (wts * 100) / acq : 0),
                     (unsigned long long)(wus / 1000));
-            kprintf("[blockrace]   (this is the number that decides whether per-volume /\n"
-                    "               per-object fs locking is worth un-sharing 34 static\n"
-                    "               scratch buffers in embkfs.c -- measure, then decide)\n");
+            struct embkfs_stat es;
+            embkfs_stat_get(&es);
+            kprintf("[blockrace] rcache: %llu hit, %llu miss, %llu evict "
+                    "(%u slot%s, %u MB budget)\n",
+                    (unsigned long long)es.rcache_hit,
+                    (unsigned long long)es.rcache_miss,
+                    (unsigned long long)es.rcache_evict,
+                    EMBKFS_RCACHE_SLOTS, EMBKFS_RCACHE_SLOTS == 1 ? "" : "s",
+                    EMBKFS_RCACHE_BUDGET / (1024u * 1024u));
+            kprintf("[blockrace]   (an EVICTION is a miss the cache inflicted on itself, and\n"
+                    "               each miss re-decodes a whole object while holding the big\n"
+                    "               lock -- which is what the ms-blocked figure above IS)\n");
         }
 
         kprintf("\n[cmd] test blockrace: %s\n",

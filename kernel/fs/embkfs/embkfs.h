@@ -378,6 +378,18 @@ struct embk_snapshot_item {
 _Static_assert(sizeof(struct embk_snapshot_item) == 80, "snapshot item must be 80 bytes");
 
 
+/* Whole-object read cache geometry. FOUR slots: enough that the common
+ * concurrent pattern (a couple of readers over a couple of files) stops
+ * thrashing, small enough that a linear scan is cheaper than any index.
+ *
+ * The BUDGET matters more than the slot count. Per-object the cache admits
+ * anything up to EMBKFS_RCACHE_MAX (8 MB), so four slots could pin 32 MB --
+ * a real regression on a 512 MB machine. Instead the cache evicts LRU until
+ * the newcomer fits under a total-bytes cap, so slots buy hit rate without
+ * buying unbounded memory. */
+#define EMBKFS_RCACHE_SLOTS   4
+#define EMBKFS_RCACHE_BUDGET  (12u * 1024u * 1024u)
+
 /* ---- In-memory mount state ---------------------------------------- */
 
 struct embk_block_device;   /* forward decl — we only keep a pointer */
@@ -431,10 +443,23 @@ struct embkfs_volume {
      * Keyed by (oid, generation) -- every write commit bumps `generation`, so a
      * stale entry is detected and refreshed automatically, no manual
      * invalidation needed. */
-    uint64_t  rcache_oid;
-    uint64_t  rcache_gen;
-    uint64_t  rcache_len;
-    uint8_t  *rcache_buf;
+    /* N-WAY, since 2026-07-23. It was ONE slot, which is fine for a single
+     * reader walking one file and pathological the moment two readers alternate
+     * between two files: each miss re-decodes a WHOLE object, and that decode
+     * happens under the EMBKFS big lock, so the other reader is blocked for all
+     * of it. Measured before changing it (`test blockrace`): 65 waits totalling
+     * 31464 ms, ~484 ms per wait -- the duration of exactly one whole-object
+     * decode. Adding slots attacks that directly, without touching the lock. */
+    struct embk_rcache_slot {
+        uint64_t oid;
+        uint64_t gen;
+        uint64_t len;
+        uint64_t stamp;      /* LRU: bumped from vol->rcache_clock on every hit */
+        uint8_t *buf;
+    } rcache[EMBKFS_RCACHE_SLOTS];
+    uint64_t  rcache_clock;  /* monotonic tick for the LRU stamps   */
+    uint64_t  rcache_bytes;  /* live total, held under RCACHE_BUDGET */
+    uint64_t  rcache_hits, rcache_misses, rcache_evicts;
 
     /* Single-object EXTENT-MAP cache: the collected+validated extref array of
      * the most-recently ranged-over object. Same (oid, generation) keying as
@@ -506,6 +531,14 @@ struct embkfs_stat {
     uint64_t prefix_calls;   /* read_object_prefix: collects extents EVERY call */
     uint64_t ecache_hit;
     uint64_t ecache_miss;    /* each miss = count_extents + collect_extents */
+    /* Whole-object read cache. A MISS is expensive in a way the number alone
+     * hides: it decodes an entire object, under the EMBKFS big lock, so every
+     * other thread's fs I/O waits for it. That is why the miss and evict counts
+     * matter more than the hit count -- evictions are misses the cache caused
+     * itself, and they were the whole cost of the old single-slot design. */
+    uint64_t rcache_hit;
+    uint64_t rcache_miss;
+    uint64_t rcache_evict;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);
