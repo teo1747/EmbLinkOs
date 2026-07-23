@@ -721,7 +721,10 @@ Design/usage docs: `docs/EMUI_GUIDE.md` (how to build an app),
 `docs/EMUI_INTERNALS.md` (how the toolkit is built), `docs/BUILD_SETUP.md`
 (newlib + dynamic linking). Open items only — the toolkit itself, the
 compositor, and dynamic linking are all built and live-verified; what
-follows are known gaps and rough edges, not missing features.
+follows are known gaps and rough edges, not missing features. Since
+2026-07-23 the OS also **builds** EmUI apps on itself (`test tcc dyn`):
+tcc compiles and dynamically links against `libembk.so`, and the widget
+renders. See `docs/PORTS.md` § "The GUI wall, and how it came down".
 
 - [ ] **Dynamic linker: eager relocation only, no lazy PLT binding.** Every
   `R_X86_64_JUMP_SLOT` is resolved at load time in
@@ -1078,8 +1081,9 @@ substantially complete.
   convention, the ABI as ambient constants — the schema `test tcc tally`
   already executes hand-unrolled. Deliberately absent from v1: variables,
   pattern rules, parallelism (the real graph is ~50 explicit nodes). Honest
-  rebuild-self scope with TCC: static newlib C only — no `__thread` (no
-  linker scripts/PT_TLS), no `libembk.so` apps, no C++, kernel wants GCC.
+  rebuild-self scope with TCC: static newlib C, **and `libembk.so` GUI apps
+  since 2026-07-23** (`test tcc dyn`); still no `__thread` (no linker
+  scripts/PT_TLS), no C++, kernel wants GCC.
   make itself arrives later as opt-in compat with the foreign-tree ports
   story. Nice detail available: build it on the sval SDK, which is on-image
   and already proven self-rebuildable.

@@ -128,10 +128,23 @@ state == stale`), fd-3 convention as with every sval tool.
 
 "Rebuild-self" with TCC means the STATIC C userland: the shell, the
 sval tools, EmbBuild itself. Excluded, with reasons already proven in
-the tree: `__thread` (no PT_TLS via tcc link), `libembk.so` apps (the
-dynamic path is gcc-shaped), C++, and the kernel (wants GCC). None are
-EmbBuild's problem — they are compiler facts, and they do not shrink
-the claim: THE SYSTEM CAN REBUILD THE SYSTEM'S OWN PROGRAMS.
+the tree: `__thread` (no PT_TLS via tcc link), C++, and the kernel
+(wants GCC). None are EmbBuild's problem — they are compiler facts, and
+they do not shrink the claim: THE SYSTEM CAN REBUILD THE SYSTEM'S OWN
+PROGRAMS.
+
+**Amended 2026-07-23.** This list used to include `libembk.so` apps —
+"the dynamic path is gcc-shaped." That is no longer true: `test tcc dyn`
+compiles and dynamically links an EmUI widget on-OS and the kernel runs
+it (PORTS.md § "The GUI wall"). Two honest qualifications, so the
+correction does not overshoot:
+
+  - the capability is the **toolchain's**; no EmbBuild manifest builds a
+    GUI app yet, and until one does and is verified, "EmbBuild rebuilds
+    the GUI" is unproven, not merely unwritten;
+  - a GUI manifest needs the dynamic link line (`-rdynamic`, the `.so`
+    before `-lc`, `emlink_dynstubs.o`, `libtcc1.o`), which is a stanza
+    shape v1 has never executed.
 
 ## 7. Where make lives
 

@@ -6,15 +6,16 @@ grew the way it did to host them. For *how to build* them, see
 [BUILD_SETUP.md](BUILD_SETUP.md#optional-ports-c-cpython-git-tcc); this doc is
 the *what and why*.
 
-None of them is a fork. Between them they needed **one** patch each to CPython
-and TCC, and **zero** to git.
+None of them is a fork. CPython needed **one** patch and git **zero**; TCC
+needed **four**, and each of the four is a fact about this target rather than a
+disagreement with tcc — see the section below.
 
 | Port | Status | Proof it works | Needs |
 |---|---|---|---|
 | C++ / libstdc++ | runs | `test cxx` → 13/13 | — |
 | CPython 3.14 | runs | `test python` → "hello from CPython on EmbLink" | `-cpu max` |
 | git 2.49 | runs | `test git repo` → a real root commit | `-cpu max` |
-| **TCC 0.9.27** | **runs, and compiles real `#include` programs** | **`test tcc real` → `exit=42` + byte-exact stdio output** | — |
+| **TCC 0.9.27** | **runs; builds the OS's own tools *and* its GUI apps** | **`test tcc real` → `exit=42` + byte-exact stdio; `test tcc dyn` → a tcc-built EmUI widget renders a frame** | — |
 
 `-cpu max` is not a QEMU nicety: `getentropy()` here is RDRAND-backed and
 **refuses to fabricate entropy**, returning `ENOSYS` on a CPU without it. Both
@@ -147,7 +148,7 @@ interpreter to be exec'd — a Linux contract this OS does not implement and wil
 not. `e_phnum` (2 static, 5 dynamic) is printed by the test as the direct
 readout of that.
 
-### Our two TCC patches, and why a pristine tcc is dangerous
+### Our four TCC patches, and why a pristine tcc is dangerous
 
 `tools/tcc/0001-static-link-plt32-is-pc32.patch` — in a static link,
 `R_X86_64_PLT32` must become a plain `PC32` call.
@@ -179,16 +180,107 @@ undefined symbols — **and no `libgcc`** (measured: `libc.a` references no
 `__*ti3`-class intrinsics at all, so `-lgcc` is genuinely unnecessary on this
 target, not skipped on hope).
 
+`tools/tcc/0003-static-link-relocate-got.patch` — a **static** link never
+relocated its own GOT. Upstream walks the reloc sections but skips `s1->got`
+unless a dynamic loader will be present, which is right on Linux and wrong
+here: nothing else is going to fill those slots. So every GOTPCREL data access
+read a zero — and newlib reaches `stderr` and `errno` through `_impure_ptr`,
+which is exactly such an access. The program dies dereferencing NULL the first
+time it touches a stream or an error code.
+
+Note what found it: **EmbBuild rebuilding EmbBuild**. The toy tests and even
+`test tcc real` had passed; it took a program large enough to touch
+`_impure_ptr` on a path that mattered. That is the argument for the on-OS
+rebuild loop as a *test*, not just a feature.
+
+`tools/tcc/0004-dynexe-pull-shared-lib-libc-imports.patch` — a shared object's
+**undefined** symbols must be pulled into the dynamic executable that loads it.
+There is no runtime `libc.so` on this OS (newlib is static and non-PIC), so
+`libembk.so`'s imports — `vsnprintf`, `cosf`, `memcpy`, … — can only be
+satisfied from the app's own re-exported newlib. GNU `ld` does this pulling
+when the `.so` precedes `-lc` on the command line; tcc did not, and the link
+succeeded anyway, producing an app missing precisely the symbols the toolkit
+needed. The in-kernel loader then refused it at load time — the *right* failure,
+but one boot cycle away from the cause.
+
+### The GUI wall, and how it came down
+
+The static shape above builds tools. Every **EmUI** app needs the other shape:
+an `ET_EXEC` with a `PT_DYNAMIC`, bound to `/system/lib/libembk.so` by the
+in-kernel loader (there is no `ld.so` — see `docs/architecture/`). Until
+2026-07-23 the OS could not produce one, and that was the last thing its own
+toolchain could not do.
+
+`test tcc dyn` is the claim, and it is the same *kind* of claim as `exit=42` —
+the machine, not the artifact:
+
+```
+[tcc dyn] compile exit=0
+[tcc dyn] link exit=0
+[tcc dyn] clockw2.elf: 103704 bytes, ET_EXEC=1 phnum=5 (dynamic>2)
+ELF dynlink: /system/lib/libembk.so linked
+[tcc dyn] spawn tcc-built widget -> pid=8
+compositor: shared window 3 created (190x108, 21 pages) for pid 8
+Clock: widget up / Clock: widget first frame
+[tcc dyn] widget alive after run: YES (loaded + running)
+```
+
+It does not merely load: it takes a compositor window and **draws a frame**.
+`phnum=5` is the direct readout that the dynamic shape took (2 = static).
+
+Three things had to be true at once, and only one of them was tcc's fault:
+
+1. **`user/lib/emlink_dynstubs.s`** — the tcc-world equivalent of `newlib.ld`'s
+   `PROVIDE()`s. crt0 brackets its optional features with weak symbols
+   (`__ctors_start/end`, `__tls_image/filesz/memsz/align`); GNU `ld` binds an
+   unresolved weak reference to 0, but tcc turns it into a **dynamic import**
+   the loader cannot satisfy. Defining the six as **weak absolute 0** is the
+   correct geometry for an app with no static ctors and no `__thread` — which
+   is exactly what tcc can build. Weak, so a real definition still wins.
+2. **Patch 0004** (above) — the `.so`'s libc imports.
+3. **A kernel bug of our own**, which is the interesting one. The loader's
+   `resolve_sym()` returned the symbol's *value* and used `0` to mean "not
+   found" — so a symbol whose legitimate value **is** zero could not be told
+   apart from a missing one. The six bracket symbols are `SHN_ABS 0` by
+   construction. They were found, resolved correctly, and then reported
+   `UNRESOLVED` by their own caller. Splitting found-ness from value (return
+   `bool`, value through an out-param) fixed it, and reading that function with
+   the absolute case in mind surfaced two more real defects: `SHN_ABS` was
+   getting the load bias added (invisible for the app at bias 0; a wild pointer
+   inside `libembk.so` at `DYLIB_VA_BASE`), and a weak reference to a genuinely
+   absent symbol failed the load instead of binding to 0 — which is what weak
+   *means*.
+
+**The method is worth more than the fix.** The failing artifact was reproduced
+**on the host** by building a host-native tcc from the same patched source
+(`cp -r` the tree, configure without `--cross-prefix`) and running the identical
+compile and link. It produced a **byte-identical 103704-byte** binary, and one
+line of `readelf --dyn-syms` ended the investigation:
+
+```
+5: 0000000000000000  0 NOTYPE  WEAK  DEFAULT  ABS __tls_memsz
+   R_X86_64_GLOB_DAT  __tls_memsz + 0
+```
+
+Seconds, against a multi-minute boot-and-guess loop. The reason this was not
+tried sooner is that the on-image `tcc.elf` **cannot** run on the host — it is
+cross-linked at `0x400000` and segfaults — so "we have no host tcc" looked true
+and was not. Building a second, native one costs about a minute.
+
+`build/libtcc1.o` is packed to `/system/abi` for the same reason: it holds the
+float and 64-bit intrinsics tcc's codegen *emits* but gcc inlines, so they are
+absent from x86_64 `libgcc`. (An earlier edition of this document listed "no
+`libtcc1.a`" as a limit; it is cross-built here now.)
+
 ### Known limits (all real, none hidden)
 
 - **No `__thread` in tcc-built programs.** TCC has its own linker and reads no
   GNU linker script, so `newlib.ld`'s `PT_TLS` is unavailable. crt0 already
   copes: its TLS geometry symbols are weak, so `__tls_memsz == 0` and TLS setup
   does nothing. Bounded and understood.
-- **No `libtcc1.a`** (`__divdi3` and friends). Its Makefile builds it by *running*
-  the just-built tcc, which the host cannot execute. `-nostdlib` skips it; a
-  program needing those helpers would fail at link, loudly.
 - **`tcc -run` is out** — it wants `dlopen`, which this OS genuinely lacks.
+- **Codegen is tcc's**: no optimiser worth the name. Correct, not fast. Nothing
+  here has ever needed it to be fast.
 
 ## CPython: one patch, and a config.site that is real knowledge
 

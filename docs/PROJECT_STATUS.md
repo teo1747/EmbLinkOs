@@ -929,13 +929,21 @@ What's left:
    (snapshot → copy): pipelines that reach `/system/bin/shell.elf` now run
    through a shell the system built for itself (`test embbuild shell`).
    **Honest boundary, same shape as "self-hosting for C":** that C core is
-   the shell plus the sval-family tools — *not* the GUI. `home.elf` and
-   every EmUI app are dynamically linked against `libembk.so`, which TCC
-   cannot produce (no dynamic linking, no TLS, no C++); the kernel wants
-   GCC. So this is "rebuilds its own **static-C** userland," and what
-   remains for the *rest* of the userland is a capability question (dynamic
-   linking / a gcc-shaped or extended toolchain), not just breadth. The
-   original entry, for the record:
+   the shell plus the sval-family tools — *not* the GUI. So this is
+   "rebuilds its own **static-C** userland."
+
+   **Updated 2026-07-23 — the capability half of that boundary moved.**
+   This entry used to say TCC "cannot produce" `libembk.so` apps. It can:
+   `test tcc dyn` compiles an EmUI widget on-OS, dynamically links it
+   against `libembk.so`, and the kernel loads and renders it (PORTS.md
+   § "The GUI wall, and how it came down"). What that closed was a
+   *toolchain* gap; what it did **not** close is the rebuild-self claim
+   for the GUI, because no EmbBuild manifest builds a GUI app yet. Until
+   one does and is verified live, the accurate sentence stays "rebuilds
+   its own static-C userland" — the remaining work is now breadth
+   (a manifest with the dynamic link stanza), not capability. TLS and
+   C++ are still genuine TCC limits, and the kernel still wants GCC.
+   The original entry, for the record:
 
    **embbuild** — the make-equivalent, the last named item between
    "self-hosting for C" and rebuild-self, and the one with a design doc:
