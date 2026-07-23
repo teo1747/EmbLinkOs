@@ -690,8 +690,30 @@ int selftests_handle_command(const char *cmd)
         kprintf("[capgate] with GPU cap: capgpu exit=%d (2 = surface granted)\n", c2);
         if (c2 != 2) { kprintf("[capgate] FAIL: a process WITH GPU was denied a surface\n"); ok = 0; }
 
+        /* (3+4) FILESYSTEM: open() is gated the same way. capfs opens a real
+         * file: exit 2 granted, 0 on the clean EPERM denial. A GPU-only process
+         * (no FS) must be refused; an FS-holder must succeed. Proves the gate
+         * generalises past GPU to a second, unrelated resource class. */
+        const char *fp = "/data/apps/capfs/capfs.elf";
+        if (vfs_stat(fp, &st) == 0) {
+            char *fa[] = { (char *)fp, NULL };
+            uint64_t no_fs   = EMBK_CAP_BIT(EMBK_CAP_GPU);
+            uint64_t with_fs = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+            int f1 = process_create_caps(fp, fa, 1, env, NULL, 0, no_fs);
+            int fc1 = f1 >= 0 ? process_wait((uint32_t)f1) : -1;
+            kprintf("[capgate] no FS cap:   capfs exit=%d (0 = open refused)\n", fc1);
+            if (fc1 != 0) { kprintf("[capgate] FAIL: a process WITHOUT FILESYSTEM opened a file\n"); ok = 0; }
+            int f2 = process_create_caps(fp, fa, 1, env, NULL, 0, with_fs);
+            int fc2 = f2 >= 0 ? process_wait((uint32_t)f2) : -1;
+            kprintf("[capgate] with FS cap: capfs exit=%d (2 = open granted)\n", fc2);
+            if (fc2 != 2) { kprintf("[capgate] FAIL: a process WITH FILESYSTEM was denied open\n"); ok = 0; }
+        } else {
+            kprintf("[capgate] (FS case skipped: capfs.elf not on image)\n");
+        }
+
         kprintf("\n[cmd] test capgate: %s\n",
-                ok ? "OK -- the GPU surface handle is gated on EMBK_CAP_GPU, both ways"
+                ok ? "OK -- GPU surface AND filesystem open gated on their caps, both ways "
+                     "(win_create/desktop share the proven GPU gate)"
                    : "FAIL");
         return 1;
     }

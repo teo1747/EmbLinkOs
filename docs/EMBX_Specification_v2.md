@@ -1,6 +1,9 @@
 # EMBX (EmbLink Binary eXecutable) — Specification v2
 
-**Status:** design, byte-exact. No implementation exists.
+**Status:** design, byte-exact. The APP contract now has a working loader
+(kernel/arch/x86_64/syscall/embx.{h,c}) + producer (tools/embx/mkembx.py); the
+capability contract (§5) is live end to end. Amended 2026-07-24 with four review
+fixes -- see the ✎ markers.
 **Supersedes:** `EMBX_Specification_v1.md` (retained as the wishlist that produced
 the capability question — see §11).
 **Governing decision:** EmbCC `docs/DECISIONS.md` D-003, **reopened**. Building
@@ -31,8 +34,15 @@ Reserving all six kinds by name now costs one `uint16_t`. Defining semantics for
 kinds with no loader would cost correctness — semantics that cannot be tested are
 semantics that are wrong.
 
-**The extensibility mechanism, stated once:** the header is a **fixed 128 bytes,
-forever.** Everything else hangs off the segment table by segment *type*. Linkage
+**The extensibility mechanism, stated once:** the header is **fixed at 128
+bytes in v1**, and everything additive hangs off the segment table by segment
+*type*, never off a new header field. ✎ Growing the header is therefore NOT the
+extension path -- it would be a *major-version* break, and `header_size` is
+exactly the tripwire that lets a v1 loader reject such an image cleanly
+(step 4) instead of misreading a header it assumed it understood. So the field
+is not redundant with "128 forever"; it is what makes a future header change
+safe rather than silent. Ordinary new capability still arrives as segment
+types, with the header untouched. Linkage
 tables, TLS, notes and debug data arrive as new segment types, not new header
 fields. A v1 loader reading a v1.1 binary walks past segment types it does not
 know; it does not misparse a header it thought it understood.
@@ -87,7 +97,7 @@ arbitrary, the rule is the reason.
 | `0x20` | 8 | `feature_incompat` | §3.6 |
 | `0x28` | 8 | `feature_compat` | §3.6 |
 | `0x30` | 8 | `entry_point` | Virtual address. `0` for non-executable kinds |
-| `0x38` | 4 | `segment_table_offset` | File offset. **Should** be `128` (§4.5) |
+| `0x38` | 4 | `segment_table_offset` | File offset. ✎ **MUST** be `128` for `EMBX_TYPE_BOOT` (§4.5); free for other kinds |
 | `0x3C` | 2 | `segment_count` | |
 | `0x3E` | 2 | `segment_entry_size` | `64`. Stride; lets a future parser skip safely |
 | `0x40` | 4 | `capability_table_offset` | File offset, or `0` if `capability_count == 0` |
@@ -169,6 +179,7 @@ to a segment rather than reporting "the file is bad."
 | `3` | `EMBX_SEG_TLS` | no | Reserved |
 | `4` | `EMBX_SEG_NOTE` | no | Metadata. Producer-defined payload |
 | `5` | `EMBX_SEG_DEBUG` | no | Not mapped; may be stripped |
+| `6` | `EMBX_SEG_FIRMWARE` | no | ✎ Firmware payload (§4.3). Read by a subsystem manager, never mapped |
 
 An unknown segment type is **not** an error: the loader ignores it. This is the
 half of the extensibility mechanism that `feature_incompat` does not cover — a
@@ -272,6 +283,12 @@ defined precisely so that "not executable" is enforced rather than assumed:
 - The generic program loader, handed an `.embfw`, MUST refuse with
   `EMBX_ETYPE`. It does not attempt a best-effort load.
 
+- ✎ Firmware segments carry type `EMBX_SEG_FIRMWARE` (§3.3), **not** `LOAD`.
+  This matters because the constraints §3.2 states "for LOAD" -- `align >= 4096`
+  in particular -- do not apply to a firmware blob, which needs no page
+  alignment and is never mapped. The earlier draft left the firmware segment
+  type unstated, so a producer had no legal type to emit; naming it closes that.
+
 A subsystem manager reads segments by index and treats their bytes as opaque
 payload; `vaddr` is meaningless and MUST be `0`.
 
@@ -309,10 +326,11 @@ Two constraints this kind imposes on the container, both already honored above:
    correctly ignores `p_paddr`), so it is reserved at segment offset `0x38` and
    MUST be zero for every other kind.
 2. **The parse budget is tiny.** A stage-2 loader parses in a constrained
-   environment with almost no code space. Hence `segment_table_offset` **should**
-   be exactly `128`: header and segment table land contiguously at the front of
-   the file, so a minimal loader reads a couple of sectors and has everything it
-   needs. `capability_table_offset` points *after* the segments for the same
+   environment with almost no code space. Hence `segment_table_offset` ✎ **MUST**
+   be exactly `128` for a boot image (a §8 type guard, not advisory -- otherwise
+   the minimal loader still has to handle the general case and the whole
+   rationale collapses): header and segment table land contiguously at the front
+   of the file, so it reads a couple of sectors and has everything it needs. `capability_table_offset` points *after* the segments for the same
    reason — a boot image has no grantor and never reads it.
 
 The contract stays reserved until a loader is written for it.
@@ -402,6 +420,13 @@ are reserved for when that interface is real.
 | `7` | `EMBX_CAP_SERIAL` |
 | `8` | `EMBX_CAP_RAWDISK` |
 | `9` | `EMBX_CAP_KERNEL_EXT` |
+
+✎ **`EMBX_CAP_KERNEL_EXT` (9) has no consumer yet.** The only binaries that
+could use it -- `.embmod` / `.embdrv` -- are reserved kinds every loader
+refuses (§4.4), so nothing can currently *hold* or *check* it. It is reserved
+by name for when kernel-module loading exists; until then it is the one
+capability id that declares an authority no code can exercise, and a producer
+should not emit it.
 
 `0x100` and above are reserved for **parameterized** capabilities in v2 — a
 filesystem capability scoped to a path prefix, a serial capability scoped to one
@@ -498,6 +523,8 @@ the spec's real content — a format is defined as much by what it rejects.
   `vaddr`, or `capability_count` ≠ 0.
 - `EMBX_TYPE_APP` with `entry_point` = 0 or not inside an executable `LOAD`
   segment.
+- ✎ `EMBX_TYPE_BOOT` with `segment_table_offset` ≠ 128 (the contiguous-front
+  guarantee the tiny stage-2 parse budget depends on, §4.5).
 
 ---
 

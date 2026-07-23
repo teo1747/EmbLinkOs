@@ -204,7 +204,23 @@ out:
 /* open(path, flags, mode) -> fd, or -errno. `path` is copied in through a
  * bounded kernel buffer (copy_string_from_user) rather than resolved
  * directly from the user pointer. */
+/* The capability gate (ring 3+): a syscall that INSTALLS a resource handle
+ * refuses it to a process lacking the class. Returns 0 to proceed or -EMBK_EPERM
+ * to deny. Gate the INSTALL points only (open, surface/window create) -- ops on
+ * a handle already held are handle-scoped and need no re-check. A syscall always
+ * runs in a ring-3 process, so current_process is non-NULL. */
+static inline int cap_gate(uint32_t cap_id) {
+    return (current_process->cap_set & EMBK_CAP_BIT(cap_id)) ? 0 : -EMBK_EPERM;
+}
+
 static int64_t sys_open(struct regs *r) {
+    /* open() installs an fd handle -- the filesystem access point. Gate it here
+     * (not read/write, which are scoped to an fd already granted). stdio fds
+     * 0/1/2 are installed by fds_init_stdio at spawn, not through open, so a
+     * process without FILESYSTEM still has its console -- it just cannot open
+     * anything new. */
+    int cg = cap_gate(EMBK_CAP_FILESYSTEM);
+    if (cg) return cg;
     const char *user_path = (const char *)r->rdi;
     int flags = (int)r->rsi;
     uint32_t mode = (uint32_t)r->rdx;
@@ -1026,8 +1042,8 @@ static int64_t sys_surface_create(struct regs *r) {
      * init, so it holds GPU. Only a process DELIBERATELY spawned without it --
      * an EMBX binary that did not declare GPU, or a SET_CAPS-attenuated child --
      * is refused, which is the whole point. */
-    if (!(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_GPU)))
-        return -EMBK_EPERM;
+    int cg = cap_gate(EMBK_CAP_GPU);
+    if (cg) return cg;
 
     uint32_t w = (uint32_t)r->rdi, h = (uint32_t)r->rsi;
     uint32_t fmt = (uint32_t)r->rdx, n = (uint32_t)r->r10;
@@ -1253,6 +1269,8 @@ static int64_t sys_win_resize(struct regs *r) {
  * r9=out uint64_t* for the shared client VA (0 => plain copy window).
  * Returns a window id (>0) or -EMBK_*. */
 static int64_t sys_win_create(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_GPU);      /* a window is a GPU resource */
+    if (cg) return cg;
     /* Window-style flags ride the high bits of rdi (cw is <= 16 bits real). */
     uint32_t cw = (uint32_t)(r->rdi & 0xFFFFFFFFULL), ch = (uint32_t)r->rsi;
     int chromeless = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
@@ -1355,6 +1373,8 @@ static int64_t sys_screen_size(struct regs *r) {
  * window id; writes the client pixel VA to *[rdi] and the screen size to *[rsi]
  * (w) and *[rdx] (h) so the app learns the dimensions. */
 static int64_t sys_win_create_desktop(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_GPU);
+    if (cg) return cg;
     uint64_t cva = 0; uint32_t w = 0, h = 0;
     int64_t id = compositor_win_create_desktop(current_process, &cva, &w, &h);
     if (id < 0) return id;
