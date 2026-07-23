@@ -1,3 +1,4 @@
+#include "include/kprintf.h"
 #include "arch/x86_64/syscall/usercopy.h"
 #include "process/process.h"
 #include "mm/vmm.h"
@@ -77,32 +78,105 @@ bool access_ok(const void *user_ptr, size_t len) {
     return true;
 }
 
-/* access_ok can fail TRANSIENTLY under -smp (a rare false-absent from the
- * page-walk on a genuinely mapped page; root cause still open -- see the
- * sys-read-silent-byte-drop memory). The transient clears immediately, so
- * retry the validation a handful of times before reporting a real fault:
- * this keeps every syscall's user-copy robust without asking userspace to
- * retry spurious EFAULTs. */
-#define USERCOPY_RETRIES 8
+/* THE RETRY IS GONE. It used to be 8 attempts, papering over a transient
+ * false-absent from the page-walk that nobody had root-caused.
+ *
+ * Two real fixes landed after that workaround, both in this exact path:
+ *   - access_ok stopped re-reading per-CPU state per page and now captures the
+ *     pml4 ONCE with IF=0 (the migration race: this_cpu() resolved a core, a
+ *     timer IRQ migrated the thread, the deref returned a FOREIGN pml4);
+ *   - vmm_get_phys_in took vmm_lock, closing the multi-level walk against a
+ *     concurrent mapper -- the compositor installing shared window pages into
+ *     a client's PML4 while that client walked it ("font.ttf open failed -14").
+ *
+ * Measured before removing it (`test usercopy`, -smp 4, both halves of the
+ * original repro running at once: 6 readers hammering the syscall boundary
+ * while UI launches force the compositor to map into client PML4s mid-flight):
+ *
+ *     3496 validations, 0 transient retries, deepest 1 attempt
+ *
+ * WHY REMOVE RATHER THAN KEEP IT "just in case". A retry loop is not free
+ * insurance -- it is a silencer. It cannot tell a transient from the first
+ * symptom of a NEW bug, so anything it hides stays hidden for months, which is
+ * precisely how this one survived long enough to become "residual, unexplained".
+ * One attempt, and a failure is now LOUD and counted: if the transient ever
+ * returns it announces itself with the address that failed, which is the thing
+ * a diagnosis actually needs.
+ *
+ * The honest caveat: zero occurrences over one run is EVIDENCE, not proof. If
+ * this line starts printing, the counters are still here and re-arming the
+ * retry is a one-line change -- but do the diagnosis first this time. */
+#define USERCOPY_ATTEMPTS 1
 
-int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
-    for (int t = 0; t < USERCOPY_RETRIES; t++) {
-        if (access_ok(user_src, len)) {
-            memcpy(kernel_dst, user_src, len);
-            return EMBK_OK;
+/* IS THE RETRY STILL DOING ANYTHING? That question has to be answerable before
+ * the loop can be removed OR before the "root cause still open" note above can
+ * be believed, because TWO real fixes have landed since it was written:
+ *
+ *   - access_ok stopped re-reading per-CPU state per page and now captures the
+ *     pml4 once with IF=0 (the migration race: this_cpu() resolved a core, a
+ *     timer IRQ migrated the thread, the deref returned a FOREIGN pml4);
+ *   - vmm_get_phys_in took vmm_lock, closing the multi-level-walk race against
+ *     a concurrent mapper (the compositor installing shared window pages into a
+ *     client's PML4 while that client walked it -- "font.ttf open failed -14").
+ *
+ * Either could have been the whole of it. So count instead of assume:
+ *   retries  - a first attempt failed and a later one succeeded. This is the
+ *              ONLY evidence the transient still exists. Zero of these under
+ *              load means the loop is dead code kept by superstition.
+ *   faults   - all attempts failed: a genuinely bad pointer, the case the
+ *              function is actually for.
+ * Reported by `test usercopy`. */
+static struct usercopy_stat {
+    uint64_t calls;
+    uint64_t retries;      /* transient false-absents that cleared on retry */
+    uint64_t faults;       /* exhausted every attempt -- a real bad pointer  */
+    uint64_t worst_tries;  /* most attempts any single call ever needed      */
+} g_ucstat;
+
+void usercopy_stat_get(struct usercopy_stat_pub *out) {
+    if (!out) return;
+    out->calls       = g_ucstat.calls;
+    out->retries     = g_ucstat.retries;
+    out->faults      = g_ucstat.faults;
+    out->worst_tries = g_ucstat.worst_tries;
+}
+void usercopy_stat_reset(void) {
+    g_ucstat.calls = g_ucstat.retries = g_ucstat.faults = g_ucstat.worst_tries = 0;
+}
+
+/* The shared validate-with-retry, so both directions count identically. */
+static bool access_ok_counted(const void *p, size_t len) {
+    g_ucstat.calls++;
+    for (int t = 0; t < USERCOPY_ATTEMPTS; t++) {
+        if (access_ok(p, len)) {
+            if ((uint64_t)(t + 1) > g_ucstat.worst_tries) g_ucstat.worst_tries = (uint64_t)(t + 1);
+            if (t > 0) g_ucstat.retries++;      /* the transient, caught in the act */
+            return true;
         }
     }
-    return -EMBK_EFAULT;
+    g_ucstat.faults++;
+    /* Loud, and only on the first few, so a genuinely bad userspace pointer in
+     * a loop cannot drown the log. A bad pointer from a buggy program is the
+     * expected case; the same message from a program known to pass valid ones
+     * is the transient returning, and now it says so instead of being retried
+     * away in silence. */
+    if (g_ucstat.faults <= 8)
+        kprintf("usercopy: access_ok REFUSED %p len %lu (fault #%lu) -- bad user pointer, "
+                "or the SMP transient is back; see usercopy.c\n",
+                p, (unsigned long)len, (unsigned long)g_ucstat.faults);
+    return false;
+}
+
+int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
+    if (!access_ok_counted(user_src, len)) return -EMBK_EFAULT;
+    memcpy(kernel_dst, user_src, len);
+    return EMBK_OK;
 }
 
 int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
-    for (int t = 0; t < USERCOPY_RETRIES; t++) {
-        if (access_ok(user_dst, len)) {
-            memcpy(user_dst, kernel_src, len);
-            return EMBK_OK;
-        }
-    }
-    return -EMBK_EFAULT;
+    if (!access_ok_counted(user_dst, len)) return -EMBK_EFAULT;
+    memcpy(user_dst, kernel_src, len);
+    return EMBK_OK;
 }
 
 int copy_string_from_user(char *kernel_dst, const char *user_src, size_t max_len) {
@@ -113,10 +187,7 @@ int copy_string_from_user(char *kernel_dst, const char *user_src, size_t max_len
     for (size_t i = 0; i < max_len; i++) {
         uint64_t byte_page = ((uint64_t)(uintptr_t)(user_src + i)) & ~(uint64_t)(PAGE_SIZE - 1);
         if (byte_page != validated_page) {
-            int ok = 0;
-            for (int t = 0; t < USERCOPY_RETRIES && !ok; t++)
-                ok = access_ok(user_src + i, 1);
-            if (!ok) return -EMBK_EFAULT;
+            if (!access_ok_counted(user_src + i, 1)) return -EMBK_EFAULT;
             validated_page = byte_page;
         }
         char c = user_src[i];

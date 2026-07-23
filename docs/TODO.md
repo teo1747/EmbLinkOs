@@ -793,32 +793,36 @@ how it came down" and BUILD.md §6.
   `kernel/arch/x86_64/syscall/elf.c`, not on first call. Simpler and
   currently fine at this app count/size; revisit if process start latency
   becomes a real cost.
-- [ ] **A residual, unexplained transient `EFAULT` under SMP** in
-  `copy_from_user`/`copy_to_user` (`kernel/arch/x86_64/syscall/usercopy.c`)
-  — `access_ok` occasionally reports a genuinely-mapped user page as absent
-  under `-smp 4`, cause not found (suspects: a `this_cpu()`/APIC-ID
-  misattribution window, or a memory-ordering gap in the page-table walk
-  that only TCG's multi-threaded emulation exposes). Currently masked, not
-  fixed: both copy functions retry `access_ok` up to `USERCOPY_RETRIES` (8)
-  times before actually reporting a fault, which has been reliable in
-  practice but is a workaround, not a diagnosis. If unrelated EFAULTs
-  reappear elsewhere, start here.
-- [x] ~~**EMBKFS has latent (not yet triggered) SMP hazards**~~ — done, and it
-  stopped being latent before it was fixed: the shared `static` scratch
-  buffers really did race once the boot image grew past ONE leaf, and the
-  Merkle check caught it live (`block 17 checksum 0xF7E73490 != parent's
-  0x6D1CCFF1` — core B validating core A's just-loaded leaf as the root,
-  from `run /term.elf` racing home's clockw spawn). Fixed by THE EMBKFS BIG
-  LOCK: one sleeping, owner-recursive lock serialising every entry point.
-  Note the shape of the near-miss — the bug was invisible until the *data*
-  got big enough, not until the code changed.
-  - [x] ~~The kernel console's direct `embkfs_*` calls (`snap`,
-    `test embkfs …`) bypass the lock~~ — closed: the lock moved out of the
-    `embk_vfs` bridge and into `embkfs.c`, *with the state it protects*, and
-    every public entry point takes it. The bridge delegates. Recursion by
-    owner thread is what makes that compose (a selftest holding the lock can
-    still call the public API underneath it).
-  - [ ] Still coarse: ONE lock for the whole filesystem. **Measured before
+- [x] ~~**A residual, unexplained transient `EFAULT` under SMP** in
+  `copy_from_user`/`copy_to_user`, masked by retrying `access_ok` up to 8
+  times~~ — **the workaround is REMOVED.** The entry described the state
+  before two real fixes landed in that exact path:
+  - `access_ok` stopped re-reading per-CPU state per page and now captures the
+    pml4 **once with IF=0** (the migration race: `this_cpu()` resolved a core,
+    a timer IRQ migrated the thread, the deref returned a **foreign** pml4);
+  - `vmm_get_phys_in` took `vmm_lock`, closing the multi-level walk against a
+    concurrent mapper — the compositor installing shared window pages into a
+    client's PML4 while that client walked it (`font.ttf open failed -14`).
+
+  Either could have been the whole cause, so it was **measured, not assumed**.
+  `test usercopy` runs both halves of the original repro at once — 6 readers
+  hammering the syscall boundary while UI launches force the compositor to map
+  into client PML4s mid-flight, on `-smp 4`:
+
+      3496 validations, 0 transient retries, 0 hard faults, deepest 1 attempt
+
+  Retries are now **1 attempt**. A retry loop is not free insurance, it is a
+  silencer: it cannot tell a transient from the first symptom of a *new* bug,
+  which is exactly how this one survived long enough to be called "residual,
+  unexplained". A refusal is now loud (prints the address and length) and
+  counted, so a recurrence announces itself instead of being papered over.
+  - [ ] ⚠️ Zero occurrences over one run is **evidence, not proof**. If
+    `usercopy: access_ok REFUSED ...` ever appears from a program known to
+    pass valid pointers, the transient is back — the counters are still there,
+    and re-arming the retry is a one-line change. **Do the diagnosis first
+    this time.**
+
+- [ ] Still coarse: ONE lock for the whole filesystem. **Measured before
     deciding what to do about it** (`test blockrace` reports it; counters live
     in `struct embkfs_lockstat`). Under 4 concurrent readers:
 

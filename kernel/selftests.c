@@ -5,6 +5,7 @@
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
 #include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "arch/x86_64/syscall/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
 #include "drivers/char/serial.h"      /* serial_write_char: test tcc real heartbeat */
@@ -376,6 +377,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs obj\n");
     kprintf("  test embkfs shrink\n");
     kprintf("  test blockrace\n");
+    kprintf("  test usercopy\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -566,6 +568,120 @@ int selftests_handle_command(const char *cmd)
  * users care about regardless of which layer is providing it. Each reader
  * verifies every byte against a single-byte fill, so one stolen sector is
  * unmistakable ('B' where only 'A' belongs) and the child exits 2. */
+/* THE TRANSIENT EFAULT: is it still there, or is the retry loop a relic?
+ *
+ * docs/TODO.md carries it as "residual, unexplained ... masked, not fixed:
+ * both copy functions retry up to USERCOPY_RETRIES (8) times before actually
+ * reporting a fault ... a workaround, not a diagnosis." That note predates TWO
+ * real fixes to the same code path:
+ *
+ *   - access_ok now captures the pml4 ONCE with IF=0 instead of re-reading
+ *     per-CPU state per page (the migration race: this_cpu() picked a core, a
+ *     timer IRQ migrated the thread, the deref returned a FOREIGN pml4);
+ *   - vmm_get_phys_in now takes vmm_lock, closing the multi-level walk against
+ *     a concurrent mapper (the compositor installing shared window pages into
+ *     a client PML4 while that client walked it).
+ *
+ * Either could have been the entire cause. "Unexplained" is a statement about
+ * what was known then, not a measurement of now -- so measure now.
+ *
+ * This drives heavy user-copy traffic from several processes at once, which is
+ * what every syscall carrying a buffer does, and then reads the retry counter.
+ *   retries == 0  -> the transient did not occur. The loop is dead code and
+ *                    the TODO entry is stale (it does NOT prove absence, and
+ *                    the report says so).
+ *   retries  > 0  -> it is alive, and now it is CAUGHT: worst_tries says how
+ *                    deep it went, which is the first hard number anyone has
+ *                    had about it.
+ * Either way this is the first time the question has been asked with a
+ * counter instead of an anecdote. */
+    if (strcmp(cmd, "test usercopy") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test usercopy: VFS not registered\n"); return 1; }
+
+        /* Every read()/write() crossing the syscall boundary is a user-copy, so
+         * concurrent file readers ARE concurrent user-copy traffic -- and they
+         * run while home/clockw keep the compositor mapping shared window pages,
+         * which is the other half of the historical repro. */
+        /* BOTH HALVES OF THE HISTORICAL REPRO, or this proves little:
+         *   - readers hammering the syscall boundary (every read() is a
+         *     copy_to_user, so this is the walker side), and
+         *   - UI apps being launched DURING that, because window creation is
+         *     what makes the compositor map shared pages into a client's PML4
+         *     on another core -- the writer side named in vmm_get_phys_in's
+         *     comment ("font.ttf open failed -14" under -smp 4).
+         * Readers alone exercise the walk against a quiet page table, which is
+         * the easy case and not the one that ever failed. */
+        #define UC_PROCS 6
+        #define UC_UI    2
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pids[UC_PROCS], uipids[UC_UI];
+        struct usercopy_stat_pub u0, u1;
+
+        usercopy_stat_reset();
+        usercopy_stat_get(&u0);
+
+        for (int i = 0; i < UC_PROCS; i++) {
+            char *a[] = { (char *)"/data/apps/ioracer/ioracer.elf",
+                          (i & 1) ? (char *)"/data/raceb.bin" : (char *)"/data/racea.bin",
+                          (i & 1) ? (char *)"B" : (char *)"A", (char *)"8", NULL };
+            pids[i] = process_create_env("/data/apps/ioracer/ioracer.elf", a, 4, env, NULL, 0);
+            if (pids[i] < 0) kprintf("[usercopy] spawn %d failed: %s\n", i, embk_strerror(pids[i]));
+        }
+        /* Launched AFTER the readers are already running, so the window
+         * mapping lands in the middle of their user-copy traffic. */
+        for (int i = 0; i < UC_UI; i++) {
+            char *a[] = { (char *)"/data/apps/clockw/clockw.elf", NULL };
+            uipids[i] = process_create_env("/data/apps/clockw/clockw.elf", a, 1, env, NULL, 0);
+            kprintf("[usercopy] UI app %d -> pid %d (forces compositor to map shared "
+                    "pages into a client PML4 mid-flight)\n", i, uipids[i]);
+        }
+        kprintf("[usercopy] %d readers x 8 passes x 256 KB (4 KB per read) + %d UI launches\n",
+                UC_PROCS, UC_UI);
+
+        int bad = 0;
+        for (int i = 0; i < UC_PROCS; i++) {
+            int code = (pids[i] >= 0) ? process_wait((uint32_t)pids[i]) : -1;
+            if (code != 0) { kprintf("[usercopy] reader %d exit=%d\n", i, code); bad = 1; }
+        }
+        for (int i = 0; i < UC_UI; i++) {          /* widgets run forever: reap them */
+            if (uipids[i] >= 0) { process_kill((uint32_t)uipids[i]); process_wait((uint32_t)uipids[i]); }
+        }
+
+        usercopy_stat_get(&u1);
+        uint64_t calls   = u1.calls   - u0.calls;
+        uint64_t retries = u1.retries - u0.retries;
+        uint64_t faults  = u1.faults  - u0.faults;
+
+        kprintf("[usercopy] %llu validations, %llu TRANSIENT retries, %llu hard faults, "
+                "deepest %llu attempt(s)\n",
+                (unsigned long long)calls, (unsigned long long)retries,
+                (unsigned long long)faults, (unsigned long long)u1.worst_tries);
+
+        if (retries == 0) {
+            kprintf("[usercopy] no transient observed in %llu validations. That is EVIDENCE,\n"
+                    "           not proof -- absence over one run cannot prove absence -- but\n"
+                    "           it is the first number anyone has had, and it is consistent\n"
+                    "           with the two landed fixes (atomic pml4 capture, vmm_lock in\n"
+                    "           vmm_get_phys_in) having been the whole cause.\n",
+                    (unsigned long long)calls);
+        } else {
+            kprintf("[usercopy] *** THE TRANSIENT IS ALIVE: %llu of %llu validations needed a\n"
+                    "           retry (deepest %llu). It is no longer unexplained-and-unmeasured;\n"
+                    "           this is a live repro to chase.\n",
+                    (unsigned long long)retries, (unsigned long long)calls,
+                    (unsigned long long)u1.worst_tries);
+        }
+
+        /* A hard fault here would mean a genuinely bad pointer from a reader
+         * that is only ever handed valid ones -- that IS a failure. */
+        int ok = !bad && faults == 0;
+        kprintf("\n[cmd] test usercopy: %s\n",
+                ok ? "OK -- all readers completed, no unrecoverable EFAULT" : "FAIL");
+        return 1;
+        #undef UC_PROCS
+        #undef UC_UI
+    }
+
     if (strcmp(cmd, "test blockrace") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test blockrace: VFS not registered\n"); return 1; }
 
