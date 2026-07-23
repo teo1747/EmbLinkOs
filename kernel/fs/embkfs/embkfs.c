@@ -260,7 +260,20 @@ static int embkfs_extent_validate(const struct embkfs_volume *vol,
  * vol->block_bitmap. Each node is verified against its parent pointer on the
  * way down (embkfs_read_node) — walking an unverified tree would prove nothing.
  * Recursion depth is tree height (a handful of levels), not block count. */
+/* Walk a tree marking every block it reaches into vol->block_bitmap, and -- if
+ * `also` is non-NULL -- into that second bitmap too. The second one is how the
+ * snapshot-pinned set gets built: same walk, two destinations, so the pinned
+ * set can never disagree with the used set about what a snapshot reaches. */
+static int embkfs_mark_tree_into(struct embkfs_volume *vol,
+                                 const struct embk_block_ptr *ptr, uint8_t *also);
+
 static int embkfs_mark_tree(struct embkfs_volume *vol, const struct embk_block_ptr *ptr)
+{
+    return embkfs_mark_tree_into(vol, ptr, NULL);
+}
+
+static int embkfs_mark_tree_into(struct embkfs_volume *vol,
+                                 const struct embk_block_ptr *ptr, uint8_t *also)
 {
     const char *dev = vol->dev->name;
     static uint8_t nodebuf[4096];          /* ONE shared buffer (kernel stack is tiny) */
@@ -272,6 +285,7 @@ static int embkfs_mark_tree(struct embkfs_volume *vol, const struct embk_block_p
 
     /* 2. mark the node's own block used */
     embk_bm_set(vol->block_bitmap, ptr->block);
+    if (also) embk_bm_set(also, ptr->block);
 
     const struct embk_node_header *h = (const struct embk_node_header *)nodebuf;
 
@@ -293,7 +307,7 @@ static int embkfs_mark_tree(struct embkfs_volume *vol, const struct embk_block_p
             memcpy(&children[i], &slots[i].ptr, sizeof children[i]);   /* aligned copy out */
 
         for (uint32_t i = 0; i < n; i++) {
-            rc = embkfs_mark_tree(vol, &children[i]);                  /* nodebuf reused here */
+            rc = embkfs_mark_tree_into(vol, &children[i], also);       /* nodebuf reused here */
             if (rc != EMBK_OK)
                 return rc;
         }
@@ -330,6 +344,7 @@ static int embkfs_mark_tree(struct embkfs_volume *vol, const struct embk_block_p
                 continue;
             for (uint64_t b = 0; b < len; b++) {
                 embk_bm_set(vol->block_bitmap, start + b);
+                if (also) embk_bm_set(also, start + b);
             }
         }
     }
@@ -546,25 +561,58 @@ static void embkfs_txn_end(struct embkfs_volume *vol, struct embk_txn *t, bool c
      * t->alloc/t->arun (the committed=false rollback case) are always
      * safe to reclaim immediately regardless -- they were never part of
      * any committed tree a snapshot could possibly reference. */
-    bool should_reclaim = !committed || vol->snapshot_count == 0;
+    /* PER-BLOCK, since 2026-07-23. `should_reclaim` used to be the whole
+     * decision: any snapshot at all and nothing came back. Now the question is
+     * asked of each block -- is THIS block reachable from some snapshot's tree
+     * (snap_pinned) -- so a write that supersedes blocks no snapshot ever saw
+     * returns them immediately even with snapshots retained.
+     *
+     * Rollback (committed == false) frees t->alloc/t->arun, blocks that were
+     * never in any committed tree, so no snapshot can reference them and the
+     * pinned check is skipped entirely.
+     *
+     * Without snap_pinned (allocation failed at mount) this collapses back to
+     * the old all-or-nothing rule: correct, just less eager. */
+    bool snapshots = (vol->snapshot_count > 0);
+    bool exact     = committed && snapshots && vol->snap_pinned;
+    bool blanket_hold = committed && snapshots && !vol->snap_pinned;
 
     /* per-block node lists */
     const uint64_t *blk = committed ? t->freed   : t->alloc;
     uint32_t        bn  = committed ? t->freed_n : t->alloc_n;
-    if (should_reclaim) {
+    if (!blanket_hold) {
         for (uint32_t i = 0; i < bn; i++) {
+            if (exact && embk_bm_test(vol->snap_pinned, blk[i])) continue;  /* a snapshot needs it */
             int rc = embkfs_free_run(vol, blk[i], 1);
             if (rc != EMBK_OK) free_err = true;
         }
     }
 
-    /* data-run lists */
+    /* data-run lists. A run is freed block by block when snapshots exist,
+     * because a run can be PARTIALLY pinned -- an extent whose blocks a
+     * snapshot shares only some of. Freeing the whole run would hand a
+     * snapshot's block back to the allocator; refusing the whole run would
+     * leak the rest. The all-or-nothing policy never had to make this
+     * distinction, which is precisely what made it lossy. */
     const struct embk_run *run = committed ? t->frun   : t->arun;
     uint32_t               rn  = committed ? t->frun_n : t->arun_n;
-    if (should_reclaim) {
+    if (!blanket_hold) {
         for (uint32_t i = 0; i < rn; i++) {
-            int rc = embkfs_free_run(vol, run[i].start, run[i].len);
-            if (rc != EMBK_OK) free_err = true;
+            if (!exact) {
+                int rc = embkfs_free_run(vol, run[i].start, run[i].len);
+                if (rc != EMBK_OK) free_err = true;
+                continue;
+            }
+            uint64_t b = 0;
+            while (b < run[i].len) {
+                while (b < run[i].len && embk_bm_test(vol->snap_pinned, run[i].start + b)) b++;
+                uint64_t seg = b;
+                while (b < run[i].len && !embk_bm_test(vol->snap_pinned, run[i].start + b)) b++;
+                if (b > seg) {
+                    int rc = embkfs_free_run(vol, run[i].start + seg, b - seg);
+                    if (rc != EMBK_OK) free_err = true;
+                }
+            }
         }
     }
 
@@ -594,13 +642,28 @@ static int embkfs_txn_new_free(struct embkfs_volume *vol, uint64_t *new_free)
     for (uint32_t i = 0; i < t->arun_n; i++) allocated += t->arun[i].len;
     for (uint32_t i = 0; i < t->frun_n; i++) freed     += t->frun[i].len;
 
-    /* Snapshot hold-back (v2.2 Phase 5b): embkfs_txn_end() won't actually
-     * reclaim freed blocks while any snapshot is retained, so they must
-     * not be counted as newly-free here either -- otherwise the
-     * superblock's free_blocks would overstate what the bitmap actually
-     * has free (this is the same conservative policy, applied to the
-     * count instead of the bitmap). */
-    if (vol->snapshot_count > 0) freed = 0;
+    /* This number must agree EXACTLY with what embkfs_txn_end() will put back
+     * into the bitmap -- the mount-time oracle compares the superblock's
+     * free_blocks against a fresh walk, so any disagreement surfaces as a loud
+     * MISMATCH. So the same per-block question is asked here: count a freed
+     * block as newly-free only if no snapshot's tree still reaches it.
+     *
+     * Note this runs BEFORE the commit, while snap_pinned still describes the
+     * snapshots as they are now -- which is right, because those are exactly
+     * the snapshots txn_end will consult a moment later. */
+    if (vol->snapshot_count > 0) {
+        if (!vol->snap_pinned) {
+            freed = 0;                       /* no pinned set: old blanket policy */
+        } else {
+            uint64_t keep = 0;
+            for (uint32_t i = 0; i < t->freed_n; i++)
+                if (embk_bm_test(vol->snap_pinned, t->freed[i])) keep++;
+            for (uint32_t i = 0; i < t->frun_n; i++)
+                for (uint64_t b = 0; b < t->frun[i].len; b++)
+                    if (embk_bm_test(vol->snap_pinned, t->frun[i].start + b)) keep++;
+            freed = (keep >= freed) ? 0 : freed - keep;
+        }
+    }
 
     int64_t net = (int64_t)allocated - (int64_t)freed;     /* >0 grew, <0 shrank */
     *new_free = (uint64_t)((int64_t)vol->free_blocks - net);
@@ -3438,6 +3501,12 @@ static int embkfs_snapshot_create_impl(struct embkfs_volume *vol, const char *na
             return rc;
         }
         vol->snapshot_count = n + 1;
+        /* Pin what was just frozen. si.root is the CURRENT tree, every block of
+         * which is already marked used -- this walk adds them to snap_pinned so
+         * the next write's superseded blocks are held only where this snapshot
+         * genuinely needs them. Incremental union, not a full rebuild: pinning
+         * only ever grows on create. */
+        if (vol->snap_pinned) embkfs_mark_tree_into(vol, &si.root, vol->snap_pinned);
         kprintf("EMBKFS: %s: snapshot '%s' created (slot %u, gen %lu, %u snapshot%s retained)\n",
                 vol->dev->name, name, n, si.generation,
                 (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
@@ -3470,6 +3539,7 @@ static int embkfs_snapshot_create_impl(struct embkfs_volume *vol, const char *na
          * next write to reuse this space would silently corrupt the
          * "frozen" snapshot). Rolled back below if the commit fails. */
         vol->snapshot_count++;
+        if (vol->snap_pinned) embkfs_mark_tree_into(vol, &si.root, vol->snap_pinned);
         uint64_t new_free;
         rc = embkfs_txn_new_free(vol, &new_free);
         if (rc == EMBK_OK)
@@ -3514,10 +3584,15 @@ static int embkfs_snapshot_delete_impl(struct embkfs_volume *vol, const char *na
         kprintf("EMBKFS: %s: snapshot '%s' deleted (slot %u, %u snapshot%s remaining)\n",
                 vol->dev->name, name, slot,
                 (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
-        if (vol->snapshot_count == 0) {
-            embkfs_bitmap_build(vol);
-            embkfs_free_index_rebuild(vol);
-        }
+        /* Rebuild on EVERY delete, not just the last one. snap_pinned is a
+         * union, and you cannot subtract one member's contribution from a
+         * union -- the deleted snapshot may have shared most of its blocks
+         * with the survivors. Recomputing from the remaining roots is the only
+         * correct answer, and it is the same walk mount does. (Before per-block
+         * reclaim this only mattered when the LAST snapshot went, because until
+         * then nothing was reclaimed anyway.) */
+        embkfs_bitmap_build(vol);
+        embkfs_free_index_rebuild(vol);
         return EMBK_OK;
     }
 
@@ -3549,12 +3624,11 @@ static int embkfs_snapshot_delete_impl(struct embkfs_volume *vol, const char *na
             vol->dev->name, name, slot,
             (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
 
-    if (vol->snapshot_count == 0) {
-        /* Last snapshot gone: reclaim everything the hold-back policy
-         * deferred, instead of waiting for the next remount. */
-        embkfs_bitmap_build(vol);
-        embkfs_free_index_rebuild(vol);
-    }
+    /* Rebuild after ANY delete: snap_pinned is a union and cannot have one
+     * member subtracted from it. Also reclaims whatever the hold-back deferred,
+     * instead of waiting for the next remount. */
+    embkfs_bitmap_build(vol);
+    embkfs_free_index_rebuild(vol);
     return EMBK_OK;
 }
 
@@ -6913,6 +6987,160 @@ static int embkfs_run_snapshot_selftests_impl(void)
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
+/* PER-BLOCK RECLAMATION WITH A SNAPSHOT RETAINED.
+ *
+ * The old policy: while ANY snapshot exists, reclaim NOTHING. Safe, and lossy
+ * in a way that compounds -- one snapshot froze the free count for the entire
+ * volume, so a long-lived snapshot plus ordinary write traffic meant space
+ * that no snapshot could possibly want was never returned until that snapshot
+ * was deleted.
+ *
+ * What replaced it is not refcounting but the answer refcounting approximates:
+ * snap_pinned, the union of every retained snapshot's tree. A freed block is
+ * reusable exactly when no snapshot reaches it.
+ *
+ * THE TEST HAS TO SEPARATE TWO KINDS OF FREED BLOCK, because the old policy
+ * treated them identically and the new one must not:
+ *
+ *   PINNED   - blocks a snapshot froze. Overwrite the file the snapshot
+ *              captured; its old extent must STAY held, and the snapshot's
+ *              content must still read back correctly afterwards. This is the
+ *              safety half, and it is the half a naive "reclaim everything"
+ *              change would break silently.
+ *   UNPINNED - blocks of a file created and destroyed entirely AFTER the
+ *              snapshot was taken. No snapshot ever saw them, so they must come
+ *              back immediately, snapshot or not. Under the old policy they did
+ *              not. This is the improvement half.
+ *
+ * Asserting only the second would pass on a broken implementation that freed a
+ * snapshot's blocks too; asserting only the first is what the old test already
+ * did. Both, or the change is unproven. */
+int embkfs_run_snapreclaim_selftests(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
+    struct embkfs_volume *vol = g_embkfs_live;
+    if (vol->read_only) return -EMBK_EROFS;
+    if (!vol->snap_pinned) {
+        kprintf("EMBKFS: %s: snapreclaim: SKIP -- no pinned bitmap (alloc failed at mount), "
+                "volume is on the conservative fallback\n", vol->dev->name);
+        return -EMBK_ENOTSUP;
+    }
+
+    kprintf("EMBKFS: %s: snapreclaim: begin\n", vol->dev->name);
+    bool ok = true;
+    int rc;
+
+    /* a payload big enough to occupy several blocks, so a held-vs-freed
+     * difference shows up clearly in the free count rather than in the noise */
+    const uint64_t PAYLOAD = 16 * 1024;
+    uint8_t *big = kmalloc(PAYLOAD);
+    if (!big) return -EMBK_ENOMEM;
+    for (uint64_t i = 0; i < PAYLOAD; i++) big[i] = (uint8_t)(i * 7 + 3);
+
+    embkfs_snapshot_delete(vol, "reclaim1");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_keep");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_temp");
+
+    uint64_t keep_oid = 0;
+    rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_keep", &keep_oid);
+    if (rc == EMBK_OK) rc = embkfs_write_object(vol, keep_oid, big, PAYLOAD);
+    if (rc != EMBK_OK) { kfree(big); kprintf("EMBKFS: snapreclaim: FAIL setup: %s\n", embk_strerror(rc)); return rc; }
+
+    rc = embkfs_snapshot_create(vol, "reclaim1");
+    if (rc != EMBK_OK) { kfree(big); kprintf("EMBKFS: snapreclaim: FAIL snapshot: %s\n", embk_strerror(rc)); return rc; }
+
+    /* ---- (1) PINNED: overwrite the snapshotted file. Its old blocks are
+     * frozen, so the free count must NOT grow. ---- */
+    uint64_t free_before = vol->free_blocks;
+    for (uint64_t i = 0; i < PAYLOAD; i++) big[i] = (uint8_t)(i * 11 + 5);   /* different bytes */
+    rc = embkfs_write_object(vol, keep_oid, big, PAYLOAD);
+    if (rc != EMBK_OK) { kfree(big); kprintf("EMBKFS: snapreclaim: FAIL overwrite: %s\n", embk_strerror(rc)); return rc; }
+    if (vol->free_blocks > free_before) {
+        kprintf("EMBKFS: snapreclaim: FAIL -- overwriting a SNAPSHOTTED file returned blocks "
+                "(free %lu -> %lu); the snapshot's data was handed to the allocator\n",
+                free_before, vol->free_blocks);
+        ok = false;
+    } else {
+        kprintf("EMBKFS: snapreclaim: (1) pinned blocks HELD across overwrite (free %lu -> %lu) OK\n",
+                free_before, vol->free_blocks);
+    }
+
+    /* ---- (2) UNPINNED: a file created AND deleted entirely after the
+     * snapshot. No snapshot ever referenced its blocks, so they must come back
+     * NOW -- with a snapshot retained. This is the case the old all-or-nothing
+     * policy got wrong. ---- */
+    if (ok) {
+        uint64_t before_tmp = vol->free_blocks;
+        uint64_t tmp_oid = 0;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_temp", &tmp_oid);
+        if (rc == EMBK_OK) rc = embkfs_write_object(vol, tmp_oid, big, PAYLOAD);
+        if (rc != EMBK_OK) { kfree(big); kprintf("EMBKFS: snapreclaim: FAIL temp: %s\n", embk_strerror(rc)); return rc; }
+        uint64_t with_tmp = vol->free_blocks;
+        if (with_tmp >= before_tmp) {
+            kprintf("EMBKFS: snapreclaim: FAIL -- writing %lu bytes did not consume blocks "
+                    "(free %lu -> %lu)\n", PAYLOAD, before_tmp, with_tmp);
+            ok = false;
+        }
+        if (ok) {
+            rc = embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_temp");
+            if (rc != EMBK_OK) { kfree(big); kprintf("EMBKFS: snapreclaim: FAIL unlink: %s\n", embk_strerror(rc)); return rc; }
+            uint64_t after_rm = vol->free_blocks;
+            kprintf("EMBKFS: snapreclaim: (2) temp file: free %lu -> %lu (write) -> %lu (delete), "
+                    "snapshot still retained\n", before_tmp, with_tmp, after_rm);
+            if (after_rm <= with_tmp) {
+                kprintf("EMBKFS: snapreclaim: FAIL -- deleting a file NO snapshot ever saw returned "
+                        "nothing; reclamation is still all-or-nothing\n");
+                ok = false;
+            } else {
+                kprintf("EMBKFS: snapreclaim: (2) unpinned blocks RECLAIMED with a snapshot live "
+                        "(+%lu blocks) OK\n", after_rm - with_tmp);
+            }
+        }
+    }
+
+    /* ---- (3) the snapshot still works. Reclaiming the wrong block would show
+     * up here as corrupt or unreadable snapshot content, which is the failure
+     * that matters most and the one a free-count check alone cannot see. ---- */
+    if (ok) {
+        rc = embkfs_snapshot_rollback(vol, "reclaim1");
+        if (rc != EMBK_OK) { kprintf("EMBKFS: snapreclaim: FAIL rollback: %s\n", embk_strerror(rc)); ok = false; }
+    }
+    if (ok) {
+        uint64_t o2 = 0, got = 0;
+        /* Read back into `big`, the buffer already on the heap. A second
+         * 16 KB `static` would have been easier and is exactly the habit that
+         * gave this file 34 shared scratch buffers and the big lock that
+         * guards them -- no need to add the 35th for a readback. */
+        uint8_t *back = big;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_keep", &o2);
+        if (rc == EMBK_OK) rc = embkfs_read_object(vol, o2, back, PAYLOAD, &got);
+        if (rc != EMBK_OK || got != PAYLOAD) {
+            kprintf("EMBKFS: snapreclaim: FAIL -- snapshot content unreadable after rollback "
+                    "(rc=%s, %lu of %lu bytes)\n", embk_strerror(rc), got, PAYLOAD);
+            ok = false;
+        } else {
+            for (uint64_t i = 0; i < PAYLOAD; i++) {
+                if (back[i] != (uint8_t)(i * 7 + 3)) {     /* the ORIGINAL pattern */
+                    kprintf("EMBKFS: snapreclaim: FAIL -- snapshot byte %lu is 0x%x, want 0x%x; "
+                            "a pinned block was reused\n", i, back[i], (uint8_t)(i * 7 + 3));
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) kprintf("EMBKFS: snapreclaim: (3) snapshot content byte-exact after rollback OK\n");
+        }
+    }
+
+    kfree(big);
+    embkfs_snapshot_delete(vol, "reclaim1");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_keep");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstrec_temp");
+
+    kprintf("EMBKFS: %s: snapreclaim: %s\n", vol->dev->name,
+            ok ? "OK -- pinned blocks held, unpinned blocks reclaimed, snapshot intact" : "FAIL");
+    return ok ? EMBK_OK : -EMBK_EINVAL;
+}
+
 /* ROLLBACK IS NOT A ONE-WAY DOOR (v2.3, EMBKFS_INCOMPAT_SNAPREG).
  *
  * The defect this asserts against, in one sentence: with the registry stored
@@ -7397,8 +7625,15 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
     uint32_t n_snaps = 0;
     embkfs_snapshot_list_internal(vol, snaps, EMBKFS_MAX_SNAPSHOTS, &n_snaps);
     if (n_snaps > EMBKFS_MAX_SNAPSHOTS) n_snaps = EMBKFS_MAX_SNAPSHOTS;
+
+    /* Snapshot trees are marked into the used bitmap AND into snap_pinned, in
+     * one walk. snap_pinned is what lets embkfs_txn_end() reclaim per block
+     * instead of all-or-nothing: a freed block is reusable exactly when no
+     * snapshot's tree reaches it. Cleared first so a deleted snapshot's blocks
+     * actually stop being pinned -- this set is rebuilt, never patched. */
+    if (vol->snap_pinned) memset(vol->snap_pinned, 0, nbytes);
     for (uint32_t i = 0; i < n_snaps; i++) {
-        rc = embkfs_mark_tree(vol, &snaps[i].root);
+        rc = embkfs_mark_tree_into(vol, &snaps[i].root, vol->snap_pinned);
         if (rc != EMBK_OK) return rc;
     }
     vol->snapshot_count = n_snaps;   /* authoritative recount, not incremental */
@@ -7424,6 +7659,17 @@ static int embkfs_alloc_init(struct embkfs_volume *vol)
 
     vol->block_bitmap = kmalloc(nbytes);
     if (!vol->block_bitmap) { kprintf("EMBKFS: %s: bitmap alloc failed\n", dev); return -EMBK_ENOMEM; }
+    if (vol->snap_pinned) { kfree(vol->snap_pinned); vol->snap_pinned = NULL; }
+    vol->snap_pinned = kmalloc(nbytes);
+    if (!vol->snap_pinned) {
+        /* Not fatal: without the pinned set the volume falls back to the old
+         * conservative policy (hold everything back while a snapshot exists).
+         * Slower to reclaim, never unsafe -- degrade, do not refuse to mount. */
+        kprintf("EMBKFS: %s: snapshot-pinned bitmap alloc failed -- "
+                "falling back to conservative hold-back\n", dev);
+    } else {
+        memset(vol->snap_pinned, 0, nbytes);
+    }
 
     int rc = embkfs_bitmap_build(vol);
     if (rc != EMBK_OK) { kfree(vol->block_bitmap); vol->block_bitmap = NULL; return rc; }

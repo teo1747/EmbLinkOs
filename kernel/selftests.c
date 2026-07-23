@@ -382,6 +382,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs selfheal\n");
     kprintf("  test embkfs snapshot\n");
     kprintf("  test embkfs snapreg\n");
+    kprintf("  test embkfs snapreclaim\n");
     kprintf("  test embkfs provenance\n");
     kprintf("  test embkfs verifyboot\n");
     kprintf("  stat <path>\n");
@@ -744,6 +745,12 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embkfs snapreg") == 0) {
         int rc = embkfs_run_snapreg_selftests();
         kprintf("\n[cmd] test embkfs snapreg: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs snapreclaim") == 0) {
+        int rc = embkfs_run_snapreclaim_selftests();
+        kprintf("\n[cmd] test embkfs snapreclaim: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
         return 1;
     }
 

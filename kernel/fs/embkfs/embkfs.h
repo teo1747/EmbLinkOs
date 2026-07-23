@@ -407,6 +407,26 @@ struct embkfs_volume {
     uint64_t free_blocks;            /* read from the superblock at mount (next to total_blocks) */
     uint64_t next_oid;               /* next object id to hand out (max in tree + 1, set at mount) */
     uint8_t *block_bitmap;           /* 1 bit per block: 1 = used, 0 = free */
+
+    /* SNAPSHOT-PINNED blocks: the union of every retained snapshot's frozen
+     * tree, one bit per block. This is what makes reclamation exact instead of
+     * all-or-nothing.
+     *
+     * The old policy was "while ANY snapshot exists, reclaim NOTHING" -- safe,
+     * but it meant one snapshot froze the free count for the entire volume and
+     * space returned only when the last snapshot was deleted. What a snapshot
+     * actually needs is the blocks its own tree references and nothing else; a
+     * block freed by a write no snapshot ever saw is free immediately.
+     *
+     * DERIVED, NOT COUNTED -- the design choice worth stating. Per-block
+     * refcounts are the textbook answer, but a refcount is only an incremental
+     * way to compute "does anything still reference this block", and it must be
+     * persisted, updated on every alloc/free, and repaired when it drifts. The
+     * union is that same answer computed directly from the roots the registry
+     * already names: no on-disk format change, no counter to skew, rebuilt by
+     * the same tree walk mount already performs. One bit per block -- 2 KB on a
+     * 64 MB volume. */
+    uint8_t *snap_pinned;
     struct embk_run *free_ext;       /* sorted/coalesced free runs built from bitmap */
     uint32_t free_ext_n;
     uint32_t free_ext_cap;
@@ -673,6 +693,7 @@ int embkfs_run_compress_selftests(void);
 int embkfs_run_selfheal_selftests(void);
 int embkfs_run_snapshot_selftests(void);
 int embkfs_run_snapreg_selftests(void);
+int embkfs_run_snapreclaim_selftests(void);
 int embkfs_run_provenance_selftests(void);
 int embkfs_run_verifyboot_selftests(void);
 int embkfs_run_namespace_selftests(void);
