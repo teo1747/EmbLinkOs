@@ -48,8 +48,16 @@
 #define EMBKFS_INCOMPAT_COMPRESSION   0x0000000000000001ULL
 #define EMBKFS_INCOMPAT_ENCRYPTED     0x0000000000000002ULL
 #define EMBKFS_INCOMPAT_VERIFIED_ROOT 0x0000000000000004ULL
+/* SNAPREG (v2.3): the snapshot registry lives in a FIXED block outside the
+ * CoW tree instead of as items inside it (see the snapshot section below).
+ * INCOMPAT, not ro_compat, for a blunt reason: a reader that does not know
+ * about the bit would see that block as free and hand it to the allocator,
+ * overwriting the registry. Refusing the mount is the only safe answer. A
+ * volume WITHOUT this bit still mounts and still works -- it uses the legacy
+ * in-tree registry, with the rollback limitation that implies. */
+#define EMBKFS_INCOMPAT_SNAPREG       0x0000000000000008ULL
 #define EMBKFS_KNOWN_INCOMPAT   (EMBKFS_INCOMPAT_COMPRESSION | EMBKFS_INCOMPAT_ENCRYPTED | \
-                                 EMBKFS_INCOMPAT_VERIFIED_ROOT)
+                                 EMBKFS_INCOMPAT_VERIFIED_ROOT | EMBKFS_INCOMPAT_SNAPREG)
 #define EMBKFS_KNOWN_RO_COMPAT  0ULL
 
 /* Highest major version we know how to read. */
@@ -314,18 +322,51 @@ _Static_assert(sizeof(struct embk_verify_header) == 48, "verify header must be 4
  * same transactional put/commit machinery as everything else, rather than
  * inventing a separate registry format.
  *
- * KNOWN LIMITATION (documented, not silently worked around): because the
- * registry lives INSIDE the same versioned tree it's tracking versions
- * of, rolling back to an OLDER snapshot reverts the ENTIRE tree including
- * the registry itself -- any snapshot taken AFTER the rollback target
- * stops existing in the restored tree (the same way `git reset --hard`
- * to an old commit drops refs that only existed in now-abandoned history
- * unless kept somewhere else). A follow-up could fix this by keeping the
- * registry in superblock-adjacent space instead of the tree; out of scope
- * here. Single create-then-rollback workflows (this phase's own verify
- * criteria) are unaffected. */
+ * THE ROLLBACK LIMITATION, and its fix (v2.3, EMBKFS_INCOMPAT_SNAPREG).
+ *
+ * Storing the registry as ordinary tree items is elegant -- it reuses the
+ * put/commit machinery instead of inventing a second format -- but it puts
+ * the list of versions INSIDE the thing being versioned. Rolling back to an
+ * older snapshot therefore reverts the registry too, and every snapshot taken
+ * AFTER the rollback target stops existing in the restored tree (the way
+ * `git reset --hard` drops refs that lived only in now-abandoned history).
+ * Rollback was a one-way door: you could go back, but not back again.
+ *
+ * v2.3 moves the registry OUT of the tree, into one fixed block
+ * (EMBKFS_SNAPREG_BLOCK) that no transaction ever rewrites. Rollback then
+ * swaps the root and simply does not touch the registry, so snapshots on both
+ * sides of the target survive and rollback becomes navigable in both
+ * directions. The block is fixed rather than allocated for the same reason the
+ * superblock's location is fixed: a pointer to it would itself have to live
+ * somewhere durable, and a registry you must already have the registry to find
+ * is no better off.
+ *
+ * The legacy in-tree layout is still read and written when the feature bit is
+ * absent, so older volumes keep working exactly as before -- with the
+ * limitation above intact, because on those volumes it is still true. */
 #define EMBKFS_MAX_SNAPSHOTS    16
 #define EMBKFS_SNAPSHOT_NAME_MAX 31   /* +1 reserved pad byte = 32 total */
+
+/* Block 1: inside the pre-superblock region (blocks 1..15), which the
+ * formatter has always left unused. Reserving one of those costs nothing and
+ * needs no allocator support -- embkfs_bitmap_build() marks it alongside the
+ * superblock and the backup, in the same "fixed metadata outside the tree"
+ * step. Block 0 stays the null-pointer sentinel. */
+#define EMBKFS_SNAPREG_BLOCK    1ULL
+#define EMBKFS_SNAPREG_MAGIC    0x3147455250414E53ULL /* "SNAPREG1" */
+
+/* On-disk registry block. checksum covers everything after it, exactly the
+ * node-header convention (§8.1), so a torn or corrupted registry is DETECTED
+ * rather than served as a list of plausible-looking roots -- which would be
+ * worse than losing it, since a bad root_ptr sends the allocator marking
+ * garbage as in-use. */
+struct embk_snapshot_registry {
+    uint64_t checksum;     /*  0  CRC32C over [8 .. sizeof(registry)-1] */
+    uint64_t magic;        /*  8  EMBKFS_SNAPREG_MAGIC                  */
+    uint32_t count;        /* 16  live entries in slots[0..count-1]     */
+    uint32_t reserved;     /* 20  must be 0                             */
+    /* slots follow: EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item) */
+};
 
 struct embk_snapshot_item {
     uint8_t  name[32];       /*  0  NUL-padded; NOT guaranteed NUL-terminated
@@ -563,6 +604,7 @@ int embkfs_run_multivol_selftests(void);
 int embkfs_run_compress_selftests(void);
 int embkfs_run_selfheal_selftests(void);
 int embkfs_run_snapshot_selftests(void);
+int embkfs_run_snapreg_selftests(void);
 int embkfs_run_provenance_selftests(void);
 int embkfs_run_verifyboot_selftests(void);
 int embkfs_run_namespace_selftests(void);

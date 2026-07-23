@@ -301,13 +301,56 @@ def main(path, passphrase=None):
     print(f"  version {vmaj}.{vmin}, block_size {block_size}, total_blocks {tot_blocks}, "
           f"free {free_blocks}, gen {generation}")
 
-    KNOWN_INCOMPAT = L.EMBKFS_INCOMPAT_COMPRESSION | L.EMBKFS_INCOMPAT_ENCRYPTED   # v2.2 Phase 3/4
+    KNOWN_INCOMPAT = (L.EMBKFS_INCOMPAT_COMPRESSION | L.EMBKFS_INCOMPAT_ENCRYPTED |
+                      L.EMBKFS_INCOMPAT_VERIFIED_ROOT | L.EMBKFS_INCOMPAT_SNAPREG)
     KNOWN_RO_COMPAT = 0
     if fincompat & ~KNOWN_INCOMPAT:
         die(f"unknown incompat features 0x{fincompat:016X} — refuse mount")
     read_only = bool(fro & ~KNOWN_RO_COMPAT)
     print(f"  features compat=0x{fcompat:X} ro_compat=0x{fro:X} incompat=0x{fincompat:X}"
           f"  -> {'READ-ONLY' if read_only else 'read-write'}")
+
+    # ---------------------------------------------------------------
+    # 1a. SNAPSHOT REGISTRY (v2.3) -- the block that makes rollback reversible.
+    #
+    # Checked HERE, before the tree walk, because §2's allocator oracle depends
+    # on it: the kernel reserves this block, so if the image did not account
+    # for it the free-block count would be off by one and the mismatch would
+    # surface as a confusing arithmetic error instead of a missing feature.
+    #
+    # Independent of the kernel on purpose (the point of this verifier): the
+    # checksum is recomputed here from the raw bytes rather than trusted.
+    # ---------------------------------------------------------------
+    snapreg_entries = []
+    if fincompat & L.EMBKFS_INCOMPAT_SNAPREG:
+        print("\n== 1a. Snapshot registry (v2.3, out of the CoW tree) ==")
+        reg = img[L.SNAPREG_BLOCK * block_size:(L.SNAPREG_BLOCK + 1) * block_size]
+        body = reg[:L.SNAPREG_BODY_SIZE]
+        csum, magic, count, reserved = struct.unpack(L.SNAPREG_HDR_FMT, body[:L.SNAPREG_HDR_SIZE])
+        if magic != L.SNAPREG_MAGIC:
+            die(f"INCOMPAT_SNAPREG set but registry magic at block {L.SNAPREG_BLOCK} "
+                f"is 0x{magic:016X}, want 0x{L.SNAPREG_MAGIC:016X}")
+        want = crc32c(body[8:])
+        if (csum & 0xFFFFFFFF) != want:
+            die(f"snapshot registry checksum 0x{csum:08X} != computed 0x{want:08X}")
+        if reserved != 0:
+            die(f"snapshot registry reserved field is {reserved}, must be 0")
+        if count > L.MAX_SNAPSHOTS:
+            die(f"snapshot registry count {count} exceeds MAX_SNAPSHOTS {L.MAX_SNAPSHOTS}")
+        print(f"  block {L.SNAPREG_BLOCK}: magic OK, checksum OK (0x{want:08X}), "
+              f"{count}/{L.MAX_SNAPSHOTS} slot(s) in use")
+        for i in range(count):
+            off = L.SNAPREG_HDR_SIZE + i * L.SNAPSHOT_ITEM_SIZE
+            ent = body[off:off + L.SNAPSHOT_ITEM_SIZE]
+            name = ent[:32].split(b"\x00")[0].decode("ascii", "replace")
+            root_blk, root_csum = struct.unpack_from("<QQ", ent, 32)[0], None
+            gen_at, ts = struct.unpack_from("<QQ", ent, 64)
+            if root_blk == 0 or root_blk >= tot_blocks:
+                die(f"snapshot '{name}' root block {root_blk} is out of range")
+            print(f"    [{i}] '{name}' -> root block {root_blk}, gen {gen_at}")
+            snapreg_entries.append((name, root_blk))
+        if count == 0:
+            print("    (empty -- a freshly formatted volume)")
 
     # ---------------------------------------------------------------
     # 1b. ENCRYPTION (v2.2 Phase 4) -- independent Python-side unlock,

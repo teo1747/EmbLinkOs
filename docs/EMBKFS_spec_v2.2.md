@@ -379,22 +379,72 @@ reconciling that specific transaction's frees (rolled back if the commit
 itself fails) — caught by `test embkfs snapshot`'s free-count assertions
 before it could reach a release image.
 
-**KNOWN LIMITATION (documented, not silently worked around):** because
-the snapshot registry lives *inside* the same versioned tree it's
-tracking versions of, rolling back to an older snapshot reverts the
-**entire** tree, including the registry itself — any snapshot taken
-*after* the rollback target stops existing in the restored tree (the
-snapshot being rolled back *to* also loses its own registry entry, since
-that entry was necessarily added by a *later* commit than the one it
-records). The same way `git reset --hard` to an old commit drops refs
-that only existed in now-abandoned history unless kept somewhere else. A
-follow-up could fix this by keeping the registry in superblock-adjacent
-space instead of inside the tree; out of scope here. Single
-create-then-rollback workflows (this phase's own verification) are
-unaffected — and blocks orphaned by a rollback (e.g. from writes made
-*after* the snapshot point) are correctly reclaimed by the same
-bitmap-rebuild mechanism, since they're no longer reachable from the
-restored root or its own registry.
+**THE ROLLBACK LIMITATION (v2.2), and its fix (v2.3).** Because the v2.2
+registry lives *inside* the same versioned tree it is tracking versions
+of, rolling back to an older snapshot reverts the **entire** tree,
+including the registry — any snapshot taken *after* the rollback target
+stops existing in the restored tree (the snapshot rolled back *to* also
+loses its own entry, since that entry was necessarily written by a
+*later* commit than the one it records). The same way `git reset --hard`
+drops refs that lived only in now-abandoned history. Rollback was a
+one-way door: you could go back, never forward again.
+
+### v2.3 — the registry moves out of the tree (`INCOMPAT_SNAPREG`)
+
+The registry now lives in **one fixed block (block 1)** that no
+transaction rewrites. Rollback swaps the root and does not touch it, so
+snapshots on **both sides** of the target survive and rollback becomes
+navigable in both directions.
+
+| | v2.2 (legacy) | v2.3 (`INCOMPAT_SNAPREG`) |
+|---|---|---|
+| Registry location | items in the CoW tree | block 1, outside it |
+| Create/delete cost | a full CoW commit | one block write |
+| After rollback | newer snapshots gone | all snapshots intact |
+| Integrity | tree node checksums | own CRC32C over the block |
+
+*Why a fixed block, not superblock-adjacent bytes.* The crypto (offset
+200) and verify (260) headers share the superblock's 512-byte sector,
+but 16 slots × 80 bytes = 1280 does not fit; shrinking the entry to make
+it fit would have cost either the name length or the snapshot count. A
+fixed block costs one of the 15 blocks the formatter already leaves
+unused before the superblock. It is fixed rather than allocated for the
+same reason the superblock's location is: a pointer to it would need to
+live somewhere durable, and a registry you must already have the
+registry to find is no better off.
+
+*Why INCOMPAT rather than ro_compat.* A reader that does not know the
+bit would see block 1 as free and hand it to the allocator, overwriting
+the registry. Refusing the mount is the only safe answer. `mkfs` sets
+the bit and formats the block; `embkfs_bitmap_build()` reserves it
+alongside the superblock and the backup, and the free-block hint counts
+it (`used = 4 + …`), so the mount-time allocator oracle still agrees
+exactly.
+
+*Integrity.* The block carries its own CRC32C over everything after the
+checksum field, the node-header convention. A registry that fails magic
+or checksum is reported as **empty**, not guessed at: a bogus root
+pointer would send `embkfs_bitmap_build()` marking arbitrary blocks
+in-use, which is worse than losing the list. `verify_embkfs.py` §1a
+recomputes that checksum independently and range-checks every root.
+
+*Legacy volumes still work.* Without the bit, both kernel and verifier
+use the in-tree registry and the v2.2 limitation above still applies —
+because on those volumes it is still true.
+
+**Proof:** `test embkfs snapreg` — write A, snapshot s1, write B,
+snapshot s2, write C; roll back to s1 (content A); **assert s2 still
+exists**; roll *forward* to s2 (content B); roll back to s1 again; then
+confirm the registry survives a full bitmap rebuild. Rolling forward is
+the step that could not previously happen at all, and it proves more
+than the registry: s2's frozen tree must still be physically intact,
+i.e. its blocks stayed marked in-use across a rollback that made them
+unreachable from the live root.
+
+Blocks orphaned by a rollback (writes made *after* the snapshot point,
+held by no snapshot) are still correctly reclaimed by the same
+bitmap-rebuild mechanism, since they are reachable from neither the
+restored root nor any registry entry.
 
 **Shell:** `snap create|list|delete|rollback <name>`.
 

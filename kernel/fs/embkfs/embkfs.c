@@ -727,6 +727,94 @@ static void embk_snapshot_name_pad(const char *name, uint8_t out[32]) {
     memcpy(out, name, n);
 }
 
+/* ---- The registry, v2.3: one fixed block outside the CoW tree -------------
+ *
+ * Why a block and not superblock-adjacent bytes: the crypto (offset 200) and
+ * verify (260) headers share the superblock's 512-byte sector, but 16 slots x
+ * 80 bytes is 1280 -- it does not fit, and shrinking the entry to make it fit
+ * would have cost either the name length or the snapshot count. A fixed block
+ * costs one block out of the 15 the formatter already leaves unused before the
+ * superblock, and nothing else.
+ *
+ * These two helpers are the whole seam between layouts. Everything above them
+ * works on an in-memory array of slots and does not know or care where it came
+ * from, which is what keeps the legacy in-tree path alive without duplicating
+ * create/delete/list/rollback. */
+static bool embk_snapreg_enabled(const struct embkfs_volume *vol)
+{
+    return (vol->feature_incompat & EMBKFS_INCOMPAT_SNAPREG) != 0;
+}
+
+/* Read the registry block into `out` (EMBKFS_MAX_SNAPSHOTS slots), returning
+ * the live count. A registry that fails its magic or checksum is reported as
+ * EMPTY rather than guessed at: a bogus root pointer would send
+ * embkfs_bitmap_build() marking arbitrary blocks in use, which is a worse
+ * outcome than losing the list of snapshots. Loud, because silently having no
+ * snapshots is exactly the kind of thing that should not pass unremarked. */
+static int embkfs_snapreg_load(struct embkfs_volume *vol,
+                               struct embk_snapshot_item *out, uint32_t *out_n)
+{
+    static uint8_t blk[4096];
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    if (vol->block_size > sizeof blk) return -EMBK_EINVAL;
+
+    int rc = embk_block_read(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+    if (rc != EMBK_OK) return rc;
+
+    const struct embk_snapshot_registry *hdr = (const struct embk_snapshot_registry *)blk;
+    uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
+    if (body > vol->block_size) return -EMBK_EINVAL;
+
+    if (hdr->magic != EMBKFS_SNAPREG_MAGIC) {
+        kprintf("EMBKFS: %s: snapshot registry block %lu has bad magic -- "
+                "treating as empty\n", vol->dev->name, EMBKFS_SNAPREG_BLOCK);
+        *out_n = 0;
+        return EMBK_OK;
+    }
+    uint32_t want = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
+    if ((uint32_t)hdr->checksum != want) {
+        kprintf("EMBKFS: %s: snapshot registry checksum 0x%x != 0x%x -- "
+                "treating as empty (snapshots lost, live tree unaffected)\n",
+                vol->dev->name, (unsigned)hdr->checksum, (unsigned)want);
+        *out_n = 0;
+        return EMBK_OK;
+    }
+    uint32_t n = hdr->count;
+    if (n > EMBKFS_MAX_SNAPSHOTS) n = EMBKFS_MAX_SNAPSHOTS;   /* never trust a count */
+    const struct embk_snapshot_item *slots =
+        (const struct embk_snapshot_item *)(blk + sizeof *hdr);
+    for (uint32_t i = 0; i < n; i++) out[i] = slots[i];
+    *out_n = n;
+    return EMBK_OK;
+}
+
+/* Write `n` slots back. One block write, no transaction: the registry is not
+ * part of the tree, so it has no CoW machinery to ride and needs none -- it is
+ * a single sector-aligned block whose checksum makes a torn write detectable.
+ * The failure mode that matters (power loss mid-write) yields a checksum
+ * mismatch, which load() reports as empty rather than as garbage. */
+static int embkfs_snapreg_store(struct embkfs_volume *vol,
+                                const struct embk_snapshot_item *slots, uint32_t n)
+{
+    static uint8_t blk[4096];
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    if (vol->block_size > sizeof blk) return -EMBK_EINVAL;
+    if (n > EMBKFS_MAX_SNAPSHOTS) return -EMBK_EINVAL;
+
+    memset(blk, 0, vol->block_size);
+    struct embk_snapshot_registry *hdr = (struct embk_snapshot_registry *)blk;
+    hdr->magic = EMBKFS_SNAPREG_MAGIC;
+    hdr->count = n;
+    hdr->reserved = 0;
+    struct embk_snapshot_item *dst = (struct embk_snapshot_item *)(blk + sizeof *hdr);
+    for (uint32_t i = 0; i < n; i++) dst[i] = slots[i];
+
+    uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
+    hdr->checksum = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
+
+    return embk_block_write(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+}
+
 /* Collects every currently-registered snapshot. out_items/max may be
  * NULL/0 to just get a count. Used both by the public embkfs_snapshot_list()
  * and internally by embkfs_bitmap_build() to protect snapshot-only blocks. */
@@ -734,6 +822,17 @@ static int embkfs_snapshot_list_internal(struct embkfs_volume *vol,
                                          struct embk_snapshot_item *out_items,
                                          uint32_t max, uint32_t *out_n)
 {
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        for (uint32_t i = 0; out_items && i < n && i < max; i++) out_items[i] = slots[i];
+        if (out_n) *out_n = n;
+        return EMBK_OK;
+    }
+
+    /* legacy: items inside the versioned tree (pre-v2.3 volumes) */
     static uint8_t buf[4096];
     uint32_t n = 0;
     for (uint32_t slot = 0; slot < EMBKFS_MAX_SNAPSHOTS; slot++) {
@@ -754,6 +853,21 @@ static int embkfs_snapshot_find_slot(struct embkfs_volume *vol, const char *name
 {
     uint8_t padded[32];
     embk_snapshot_name_pad(name, padded);
+
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        for (uint32_t i = 0; i < n; i++) {
+            if (memcmp(slots[i].name, padded, sizeof padded) == 0) {
+                if (out_slot) *out_slot = i;
+                if (out_item) *out_item = slots[i];
+                return EMBK_OK;
+            }
+        }
+        return -EMBK_ENOENT;
+    }
 
     static uint8_t buf[4096];
     for (uint32_t slot = 0; slot < EMBKFS_MAX_SNAPSHOTS; slot++) {
@@ -3156,16 +3270,45 @@ int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
 
     if (embkfs_snapshot_find_slot(vol, name, NULL, NULL) == EMBK_OK) return -EMBK_EEXIST;
 
-    uint32_t slot;
-    int rc = embkfs_snapshot_find_free_slot(vol, &slot);
-    if (rc != EMBK_OK) return rc;
-
     struct embk_snapshot_item si;
     memset(&si, 0, sizeof si);
     embk_snapshot_name_pad(name, si.name);
     si.root       = vol->root;         /* captured by VALUE before this commit moves vol->root */
     si.generation = vol->generation;
     si.timestamp  = rtc_now_ns();
+
+    /* v2.3 (SNAPREG): the registry is a plain block outside the tree, so
+     * creating a snapshot writes ONE block and commits nothing. Note what that
+     * removes: with the in-tree registry, the put that recorded the snapshot
+     * was itself a CoW write that superseded the very tree the snapshot had
+     * just frozen -- which is why the legacy path below has to bump
+     * snapshot_count before reconciling its own frees. Here the frozen tree is
+     * never rewritten, so that hazard does not exist. Order still matters for
+     * a different reason: the count must be live before anything can free a
+     * block, so the registry write comes first and the count follows it. */
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        if (n >= EMBKFS_MAX_SNAPSHOTS) return -EMBK_ENOSPC;
+        slots[n] = si;
+        rc = embkfs_snapreg_store(vol, slots, n + 1);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: %s: snapshot create '%s' failed: %s\n",
+                    vol->dev->name, name, embk_strerror(rc));
+            return rc;
+        }
+        vol->snapshot_count = n + 1;
+        kprintf("EMBKFS: %s: snapshot '%s' created (slot %u, gen %lu, %u snapshot%s retained)\n",
+                vol->dev->name, name, n, si.generation,
+                (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
+        return EMBK_OK;
+    }
+
+    uint32_t slot;
+    int rc = embkfs_snapshot_find_free_slot(vol, &slot);
+    if (rc != EMBK_OK) return rc;
 
     uint64_t new_gen = vol->generation + 1;
     struct embk_txn txn;
@@ -3216,6 +3359,30 @@ int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
     int rc = embkfs_snapshot_find_slot(vol, name, &slot, NULL);
     if (rc != EMBK_OK) return rc;
 
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        if (slot >= n) return -EMBK_ENOENT;
+        for (uint32_t i = slot; i + 1 < n; i++) slots[i] = slots[i + 1];   /* keep it dense */
+        rc = embkfs_snapreg_store(vol, slots, n - 1);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: %s: snapshot delete '%s' failed: %s\n",
+                    vol->dev->name, name, embk_strerror(rc));
+            return rc;
+        }
+        vol->snapshot_count = n - 1;
+        kprintf("EMBKFS: %s: snapshot '%s' deleted (slot %u, %u snapshot%s remaining)\n",
+                vol->dev->name, name, slot,
+                (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
+        if (vol->snapshot_count == 0) {
+            embkfs_bitmap_build(vol);
+            embkfs_free_index_rebuild(vol);
+        }
+        return EMBK_OK;
+    }
+
     uint64_t new_gen = vol->generation + 1;
     struct embk_txn txn;
     rc = embkfs_txn_begin(vol, &txn);
@@ -3262,12 +3429,20 @@ int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
     int rc = embkfs_snapshot_find_slot(vol, name, NULL, &si);
     if (rc != EMBK_OK) return rc;
 
-    /* Compute the post-rollback free count by temporarily pointing vol->root
-     * at the snapshot's root and rebuilding the bitmap from it (+ whatever
-     * OTHER snapshots that historical tree's own registry still names --
-     * see the KNOWN LIMITATION on embk_snapshot_item). Pure in-memory/disk-
-     * READ work up to this point -- nothing durable changes yet, so on any
-     * failure we can just restore vol->root and walk away. */
+    /* Compute the post-rollback free count by temporarily pointing vol->root at
+     * the snapshot's root and rebuilding the bitmap from it, plus every
+     * snapshot the registry names. Pure in-memory/disk-READ work up to this
+     * point -- nothing durable changes yet, so on any failure we just restore
+     * vol->root and walk away.
+     *
+     * Note what is NOT here on a v2.3 volume: any handling of the registry.
+     * Rollback swaps the root and leaves the registry block alone, so every
+     * snapshot -- older AND newer than the target -- is still listed and still
+     * protected afterwards. Rollback stops being a one-way door: you can roll
+     * back to an earlier snapshot and then forward again to a later one,
+     * because the later one still exists to roll forward TO. On a legacy
+     * volume the registry rides inside the tree being replaced, so the newer
+     * ones vanish with the abandoned future (see embkfs.h). */
     struct embk_block_ptr saved_root = vol->root;
     vol->root = si.root;
     rc = embkfs_bitmap_build(vol);
@@ -3294,11 +3469,11 @@ int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
 
     embkfs_free_index_rebuild(vol);
 
-    /* vol->snapshot_count was already set authoritatively as a side effect
-     * of the embkfs_bitmap_build() call above (it recounts from whatever
-     * root is current at the time -- si.root, since it ran before this
-     * commit). Per the KNOWN LIMITATION this can be FEWER than before the
-     * rollback if newer snapshots existed only in the abandoned future. */
+    /* vol->snapshot_count was already set authoritatively as a side effect of
+     * the embkfs_bitmap_build() call above. On a v2.3 volume that count is
+     * unchanged by the rollback (the registry did not move); on a legacy
+     * volume it can be FEWER than before, if newer snapshots existed only in
+     * the abandoned future. */
 
     kprintf("EMBKFS: %s: rolled back to snapshot '%s' (gen now %lu, %u snapshot%s retained)\n",
             vol->dev->name, name, vol->generation,
@@ -6543,14 +6718,162 @@ int embkfs_run_snapshot_selftests(void)
         }
     }
 
-    /* Cleanup -- best-effort; the snapshot's own registry entry is
-     * expected to already be gone post-rollback (see the KNOWN LIMITATION
-     * on embk_snapshot_item), so don't treat delete failing here as a
-     * test failure. */
+    /* Cleanup -- best-effort. On a LEGACY volume the snapshot's own registry
+     * entry is expected to be gone post-rollback (it lived in the tree that
+     * was just replaced); on a v2.3 volume it is expected to still be there.
+     * Either way a failing delete here is not a test failure. */
     embkfs_snapshot_delete(vol, "tstsnap1");
     embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnap");
 
     kprintf("EMBKFS: %s: snapshot: %s\n", vol->dev->name, ok ? "OK" : "FAIL");
+    return ok ? EMBK_OK : -EMBK_EINVAL;
+}
+
+/* ROLLBACK IS NOT A ONE-WAY DOOR (v2.3, EMBKFS_INCOMPAT_SNAPREG).
+ *
+ * The defect this asserts against, in one sentence: with the registry stored
+ * as items INSIDE the versioned tree, rolling back to an older snapshot
+ * reverted the registry too, so every snapshot taken AFTER the target silently
+ * stopped existing -- you could go back, but never forward again.
+ *
+ * The shape of the test is the shape of the bug:
+ *
+ *   write A, snapshot "s1"
+ *   write B, snapshot "s2"      <- taken AFTER s1; the one that used to vanish
+ *   write C                     <- live content, belongs to no snapshot
+ *   rollback to s1              -> content is A
+ *   s2 MUST STILL EXIST         <- the assertion; this is the whole fix
+ *   rollback to s2              -> content is B     (forward again)
+ *   rollback to s1              -> content is A     (and back; not one-shot)
+ *
+ * Rolling FORWARD to s2 after having rolled back to s1 is the part that could
+ * not previously happen at all, and it checks more than the registry: s2's
+ * frozen tree must still be intact on disk, which means bitmap_build kept its
+ * blocks marked in-use across a rollback that made them unreachable from the
+ * live root. A registry entry pointing at recycled blocks would pass a
+ * "snapshot still listed" check and fail this one.
+ *
+ * On a volume WITHOUT the feature bit this test SKIPS rather than fails: the
+ * old behaviour is correct for the old format, and reporting a legacy volume
+ * as broken would be a lie in the other direction. */
+int embkfs_run_snapreg_selftests(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
+    struct embkfs_volume *vol = g_embkfs_live;
+    if (vol->read_only) return -EMBK_EROFS;
+
+    if (!embk_snapreg_enabled(vol)) {
+        kprintf("EMBKFS: %s: snapreg: SKIP -- volume has no INCOMPAT_SNAPREG "
+                "(legacy in-tree registry; rollback-drops-newer is correct there)\n",
+                vol->dev->name);
+        return -EMBK_ENOTSUP;
+    }
+
+    kprintf("EMBKFS: %s: snapreg: begin (registry block %lu, outside the tree)\n",
+            vol->dev->name, EMBKFS_SNAPREG_BLOCK);
+    bool ok = true;
+
+    static const uint8_t A[] = "A: the oldest content, frozen by s1.\n";
+    static const uint8_t B[] = "B: written after s1, frozen by s2.\n";
+    static const uint8_t C[] = "C: live content, held by no snapshot at all.\n";
+
+    embkfs_snapshot_delete(vol, "sr1");        /* best-effort: prior failed run */
+    embkfs_snapshot_delete(vol, "sr2");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg");
+
+    uint64_t oid = 0;
+    int rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg", &oid);
+    if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL create: %s\n", embk_strerror(rc)); return rc; }
+
+    #define SR_STEP(what, expr) do { if (ok) { rc = (expr); \
+        if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL %s: %s\n", (what), embk_strerror(rc)); ok = false; } } } while (0)
+
+    SR_STEP("write A",   embkfs_write_object(vol, oid, A, sizeof A - 1));
+    SR_STEP("create s1", embkfs_snapshot_create(vol, "sr1"));
+    SR_STEP("write B",   embkfs_write_object(vol, oid, B, sizeof B - 1));
+    SR_STEP("create s2", embkfs_snapshot_create(vol, "sr2"));
+    SR_STEP("write C",   embkfs_write_object(vol, oid, C, sizeof C - 1));
+
+    /* Read the file through a fresh path lookup and compare against `want`.
+     * Looking the path up each time (rather than reusing oid) matters: a
+     * rollback replaces the whole tree, and the object id is only meaningful
+     * relative to the tree that is live now. */
+    #define SR_EXPECT(tag, want, wantlen) do { if (ok) {                        \
+        uint64_t o2 = 0; uint8_t rb[128]; uint64_t g = 0;                       \
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg", &o2);\
+        if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL lookup %s: %s\n",   \
+                                     (tag), embk_strerror(rc)); ok = false; }   \
+        else {                                                                  \
+            rc = embkfs_read_object(vol, o2, rb, sizeof rb, &g);                \
+            if (rc != EMBK_OK || g != (wantlen) || memcmp(rb, (want), g) != 0) {\
+                kprintf("EMBKFS: snapreg: FAIL %s: content is not what the "    \
+                        "snapshot froze (got %lu bytes)\n", (tag), g);          \
+                ok = false;                                                     \
+            } else kprintf("EMBKFS: snapreg: %s content OK\n", (tag));          \
+        } } } while (0)
+
+    SR_EXPECT("live=C", C, sizeof C - 1);
+
+    /* (1) back to the OLDER snapshot */
+    SR_STEP("rollback to s1", embkfs_snapshot_rollback(vol, "sr1"));
+    SR_EXPECT("after rollback to s1: A", A, sizeof A - 1);
+
+    /* (2) THE ASSERTION: s2 was taken after s1 and must have survived. */
+    if (ok) {
+        struct embk_snapshot_item si;
+        rc = embkfs_snapshot_find_slot(vol, "sr2", NULL, &si);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: snapreg: FAIL -- 's2' did not survive the rollback to 's1' "
+                    "(%s). This is the exact defect the out-of-tree registry fixes.\n",
+                    embk_strerror(rc));
+            ok = false;
+        } else {
+            kprintf("EMBKFS: snapreg: 's2' survived the rollback to 's1' (root block %lu)\n",
+                    si.root.block);
+        }
+    }
+    if (ok) {
+        uint32_t n = 0;
+        embkfs_snapshot_list_internal(vol, NULL, 0, &n);
+        if (n != 2) {
+            kprintf("EMBKFS: snapreg: FAIL -- registry lists %u snapshot(s) after rollback, want 2\n", n);
+            ok = false;
+        }
+    }
+
+    /* (3) FORWARD again -- impossible before, and it proves s2's frozen tree
+     * is still physically intact, not merely still named. */
+    SR_STEP("rollback FORWARD to s2", embkfs_snapshot_rollback(vol, "sr2"));
+    SR_EXPECT("after rollback to s2: B", B, sizeof B - 1);
+
+    /* (4) and back again, to show it is not a single extra step */
+    SR_STEP("rollback BACK to s1", embkfs_snapshot_rollback(vol, "sr1"));
+    SR_EXPECT("after second rollback to s1: A", A, sizeof A - 1);
+
+    /* (5) the registry survives a full bitmap rebuild -- the same computation
+     * a remount performs -- so this is durable, not an in-memory illusion. */
+    if (ok) {
+        rc = embkfs_bitmap_build(vol);
+        uint32_t n = 0;
+        embkfs_snapshot_list_internal(vol, NULL, 0, &n);
+        if (rc != EMBK_OK || n != 2 || vol->snapshot_count != 2) {
+            kprintf("EMBKFS: snapreg: FAIL -- after bitmap rebuild: rc=%s, %u listed, count %u (want 2/2)\n",
+                    embk_strerror(rc), n, (unsigned)vol->snapshot_count);
+            ok = false;
+        } else {
+            kprintf("EMBKFS: snapreg: registry intact across a full bitmap rebuild (2 snapshots)\n");
+        }
+        embkfs_free_index_rebuild(vol);
+    }
+    #undef SR_STEP
+    #undef SR_EXPECT
+
+    embkfs_snapshot_delete(vol, "sr2");
+    embkfs_snapshot_delete(vol, "sr1");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg");
+
+    kprintf("EMBKFS: %s: snapreg: %s\n", vol->dev->name,
+            ok ? "OK -- rollback preserves snapshots on both sides of the target" : "FAIL");
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
@@ -6860,9 +7183,14 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
      * (blocks 1..15) stays free, matching the formatter. */
     embk_bm_set(vol->block_bitmap, 0);
 
-    /* Fixed metadata outside the tree: primary + backup superblock. */
+    /* Fixed metadata outside the tree: primary + backup superblock, and (v2.3)
+     * the snapshot registry. The registry MUST be marked here: it is not
+     * reachable from the tree walk below, so without this the allocator would
+     * see a free block and hand out the one place the snapshot list lives. */
     embk_bm_set(vol->block_bitmap, EMBKFS_SB_OFFSET / vol->block_size);
     embk_bm_set(vol->block_bitmap, vol->total_blocks - 1);
+    if (embk_snapreg_enabled(vol))
+        embk_bm_set(vol->block_bitmap, EMBKFS_SNAPREG_BLOCK);
 
     /* Mark every block the live tree references — and, in the same walk, record
      * the highest object_id in use (accumulated into vol->next_oid). */
@@ -6872,9 +7200,15 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
 
     /* Also protect every retained snapshot's frozen tree (v2.2 Phase 5b) --
      * a block can be unreachable from the LIVE tree yet still be exactly
-     * what a snapshot needs. Reads vol->root's OWN registry, so this stays
-     * correct even when vol->root is temporarily a snapshot's root during
-     * embkfs_snapshot_rollback()'s free-count computation. */
+     * what a snapshot needs.
+     *
+     * With SNAPREG (v2.3) this reads the out-of-tree registry, which is the
+     * same list no matter what vol->root currently points at -- including
+     * during embkfs_snapshot_rollback()'s temporary root swap. That is
+     * precisely what makes snapshots survive a rollback: their blocks stay
+     * marked in-use because the registry still names them. On a legacy volume
+     * it reads vol->root's OWN in-tree registry instead, which is why rollback
+     * there loses the snapshots the abandoned future was holding. */
     struct embk_snapshot_item snaps[EMBKFS_MAX_SNAPSHOTS];
     uint32_t n_snaps = 0;
     embkfs_snapshot_list_internal(vol, snaps, EMBKFS_MAX_SNAPSHOTS, &n_snaps);

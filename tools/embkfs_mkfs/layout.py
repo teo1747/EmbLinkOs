@@ -177,6 +177,40 @@ EMBKFS_EXTENT_F_HOLE = EXTENT_FLAG_HOLE
 # fields at different offsets). Mirrors embkfs.h exactly (v2.2 Phase 3/4).
 EMBKFS_INCOMPAT_COMPRESSION = 1 << 0
 EMBKFS_INCOMPAT_ENCRYPTED   = 1 << 1
+EMBKFS_INCOMPAT_VERIFIED_ROOT = 1 << 2
+# SNAPREG (v2.3): the snapshot registry lives in a fixed block outside the CoW
+# tree, so a rollback no longer erases the snapshots taken after its target.
+# INCOMPAT because a reader that doesn't know the block is reserved would hand
+# it to the allocator. See kernel/fs/embkfs/embkfs.h's snapshot section.
+EMBKFS_INCOMPAT_SNAPREG     = 1 << 3
+
+SNAPREG_BLOCK  = 1              # inside the pre-superblock region (blocks 1..15)
+SNAPREG_MAGIC  = 0x3147455250414E53   # "SNAPREG1" little-endian
+MAX_SNAPSHOTS  = 16
+SNAPSHOT_ITEM_SIZE = 80         # name[32] + block_ptr[32] + gen[8] + time[8]
+SNAPREG_HDR_FMT = "<QQII"       # checksum, magic, count, reserved
+SNAPREG_HDR_SIZE = struct.calcsize(SNAPREG_HDR_FMT)
+assert SNAPREG_HDR_SIZE == 24, SNAPREG_HDR_SIZE
+SNAPREG_BODY_SIZE = SNAPREG_HDR_SIZE + MAX_SNAPSHOTS * SNAPSHOT_ITEM_SIZE
+assert SNAPREG_BODY_SIZE <= BLOCK_SIZE, "snapshot registry must fit one block"
+
+
+def build_snapreg_block(entries=()) -> bytes:
+    """An empty (or populated) snapshot-registry block. The checksum covers
+    everything after itself, matching the node-header convention -- a torn
+    registry is DETECTED rather than served as plausible-looking roots."""
+    from crc32c import crc32c as _crc
+    blk = bytearray(BLOCK_SIZE)
+    body = bytearray(SNAPREG_BODY_SIZE)
+    struct.pack_into(SNAPREG_HDR_FMT, body, 0, 0, SNAPREG_MAGIC, len(entries), 0)
+    for i, e in enumerate(entries):
+        assert len(e) == SNAPSHOT_ITEM_SIZE
+        off = SNAPREG_HDR_SIZE + i * SNAPSHOT_ITEM_SIZE
+        body[off:off + SNAPSHOT_ITEM_SIZE] = e
+    csum = _crc(bytes(body[8:]))
+    struct.pack_into("<Q", body, 0, csum)
+    blk[0:len(body)] = body
+    return bytes(blk)
 
 # ---- Crypto header (v2.2 Phase 4) ----------------------------------------
 # Lives at a fixed offset within the SAME 512-byte sector as the superblock

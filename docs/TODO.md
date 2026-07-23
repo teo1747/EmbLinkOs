@@ -533,11 +533,20 @@ interrupt-driven.
   (never frees something a snapshot needs) but can delay reclaiming space
   that isn't actually still needed. True refcounting would need tracking,
   per block, which snapshot(s) if any still reference it.
-- [ ] Rolling back to a snapshot reverts the snapshot registry too (it
-  lives inside the same versioned tree it's tracking versions of) — any
-  snapshot taken AFTER the rollback target becomes inaccessible. Fix would
-  mean moving the registry to superblock-adjacent space instead of inside
-  the CoW tree itself — a real structural change, not attempted here.
+- [x] ~~Rolling back to a snapshot reverts the snapshot registry too — any
+  snapshot taken AFTER the rollback target becomes inaccessible~~ — **DONE
+  (v2.3, `EMBKFS_INCOMPAT_SNAPREG`)**: the registry moved out of the CoW tree
+  into one fixed block (block 1, in the pre-superblock region the formatter
+  already left unused) that no transaction rewrites. Rollback swaps the root
+  and never touches it, so snapshots on both sides of the target survive and
+  rollback is navigable in both directions. Own CRC32C (a failed check reports
+  EMPTY rather than serving bogus roots at the allocator); `bitmap_build`
+  reserves the block and mkfs counts it, so the mount-time free-count oracle
+  still agrees exactly. Legacy volumes without the bit keep the old in-tree
+  path and the old limitation. Proof: **`test embkfs snapreg`** — s2 survives
+  a rollback to s1, then rolls *forward* to s2 and back again (which also
+  proves s2's frozen tree stayed physically intact), and survives a full
+  bitmap rebuild. `verify_embkfs.py` §1a validates the block independently.
 - [ ] Verified-root boot check uses one HMAC key embedded in the kernel
   binary (authentication against OFFLINE tampering), not real asymmetric
   signing (which would also defend against someone who has the kernel

@@ -263,7 +263,8 @@ def build_extent_items(oid: int, blk: int, data: bytes, gen: int) -> list:
 
 
 def build_superblock(total_blocks: int, free_blocks: int, generation: int,
-                     uuid16: bytes, root_block: int, root_csum: int) -> bytes:
+                     uuid16: bytes, root_block: int, root_csum: int,
+                     feat_incompat: int = 0) -> bytes:
     """
     Build the superblock block (4 KiB): body per spec §5.2 plus the trailing
     checksum over all preceding bytes. The rest of the block is reserved (zero).
@@ -280,6 +281,7 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
         generation=generation,
         root_ptr32=root_ptr,
         checkpoint_ptr32=checkpoint_ptr,
+        feat_incompat=feat_incompat,
     )
 
     sb_csum = crc32c(body)
@@ -337,15 +339,19 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
 
     # free_blocks hint: block 0 (reserved null-pointer sentinel) + superblock +
     # every metadata block (root + leaves) + backup superblock, plus all file
-    # data blocks. Block 0 is never written but counted used so the kernel's
-    # allocator oracle (which reserves it) agrees with this hint.
-    used = 3 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
+    # data blocks -- and, since v2.3, the snapshot registry block. Block 0 is
+    # never written but counted used so the kernel's allocator oracle (which
+    # reserves it) agrees with this hint. The registry is counted for exactly
+    # the same reason: embkfs_bitmap_build() marks it, so if this hint did not,
+    # every mount would print an allocator MISMATCH.
+    used = 4 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
     free_blocks = total_blocks - used
 
     superblock = build_superblock(total_blocks=total_blocks,
                                   free_blocks=free_blocks, generation=gen,
                                   uuid16=uuidlib.uuid4().bytes,
-                                  root_block=root_block, root_csum=root_csum)
+                                  root_block=root_block, root_csum=root_csum,
+                                  feat_incompat=L.EMBKFS_INCOMPAT_SNAPREG)
 
     # --- assemble the full image ---
     img = bytearray(size_bytes)  # all zeros
@@ -355,6 +361,7 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
         img[off:off + len(block_bytes)] = block_bytes
 
     put(SB_BLOCK, superblock)
+    put(L.SNAPREG_BLOCK, L.build_snapreg_block())   # v2.3: empty snapshot registry
     for b, d in meta_blocks:            # root + leaves
         put(b, d)
     for b, d in data_blocks:
@@ -368,6 +375,8 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
     n_leaves = n_meta - 1 if n_meta > 1 else 1
     print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs})")
     print(f"  superblock      : block {SB_BLOCK} (byte {SB_BLOCK*bs})")
+    print(f"  snapshot registry: block {L.SNAPREG_BLOCK} (empty, "
+          f"{L.MAX_SNAPSHOTS} slots, INCOMPAT_SNAPREG set)")
     if n_meta == 1:
         print(f"  metadata        : single leaf at block {root_block} "
               f"(csum 0x{root_csum:08X}, {len(items)} items)")
