@@ -354,6 +354,15 @@ build/posixdemo.o: user/bin/posixdemo.c | $(BUILD)
 build/posixdemo.elf: build/crt0.o build/syscalls.o build/posixdemo.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/posixdemo.o -lc -lgcc -o $@
 
+# ioracer.elf -- contends for the block layer's shared DMA bounce buffer and
+# verifies it got its OWN file's bytes back. Static-newlib console program like
+# posixdemo (no UI), spawned N-up by `test blockrace`.
+build/ioracer.o: user/bin/ioracer.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/ioracer.elf: build/crt0.o build/syscalls.o build/ioracer.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/ioracer.o -lc -lgcc -o $@
+
 # --- shell.elf: the EmbLink structured shell (shell/) --------------------------
 # Static newlib link (hello.elf's shape, not the EmUI dynamic one -- the shell
 # has no UI dependency). Kernel-convention includes: one -Ishell root,
@@ -509,7 +518,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -665,7 +674,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
+EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

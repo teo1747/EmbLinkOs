@@ -299,11 +299,32 @@ left to do.
   Verified: boots (the pre-scheduler partition scan is the thing that would hang),
   `test posix` **ALL PASS**, `test ioperf` unchanged (440 ms/MB cold, 194%
   amplification, disk still 1% of wall).
-  - [ ] ⚠️ **The race itself is NOT covered by a test.** Every test above is
-    single-threaded, so the lock is never contended — they prove no deadlock and
-    no regression, not that the corruption is gone. A genuine concurrent-I/O
-    test (two processes reading different files at once, checking neither gets
-    the other's bytes) is the missing piece.
+  - [x] ~~⚠️ **The race itself is NOT covered by a test.**~~ — written, and it
+    found something better than a pass. **`test blockrace`** spawns 4 readers
+    (`ioracer.elf`) before waiting on any, each verifying every byte of a
+    single-byte-filled fixture, so one stolen sector is unmistakable. All four
+    get their own bytes — **and the bounce lock is contended ZERO times.**
+    - **That is not a weak test, it is a finding:** the **EMBKFS big lock
+      serialises every filesystem operation**, so two processes cannot be
+      inside the block layer at once *by way of the filesystem*. The bounce
+      lock sits underneath a lock that already excludes the concurrency it
+      defends against. Asserting "contention > 0" would have been demanding a
+      race the architecture currently forbids — no amount of hammering
+      produces it.
+    - So the test asserts the **relationship** instead: contention through the
+      fs path must be **zero**, because the big lock serialises above it. If it
+      ever fires non-zero, the layering changed — a finer-grained fs lock (the
+      open item above), a second filesystem alongside EMBKFS (`fat32.c` does
+      **not** take the EMBKFS lock), or a non-fs block user — and the bounce
+      lock stopped being defence-in-depth. The test is how that transition
+      announces itself instead of being found by corruption.
+    - Instrumentation added to make any of this checkable: `blkstat` now counts
+      `bounce_reads` / `bounce_writes` / `bounce_contended`. Measured: a single
+      `test posix` takes the bounce path **8617 times** — it is the hot path,
+      not an edge case, because kmalloc memory is in the direct map while ATA
+      needs the kernel range. Also visible: ~3 MB of logical reads produced only
+      216 device bounce reads, the rest served by EMBKFS's object cache — a
+      test assuming "bytes read == device reads" would be measuring the cache.
   - [ ] Bounce always copies; multi-PRD scatter-gather (page-walk via
     `vmm_get_phys`) would be the zero-copy alternative, and would retire the
     shared buffer — and this lock with it. Also: bounce always copies; multi-PRD scatter-gather (page-walk

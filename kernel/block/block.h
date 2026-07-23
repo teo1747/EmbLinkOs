@@ -98,6 +98,16 @@ struct embk_blkstat {
     uint64_t reads;        /* requests that reached a driver */
     uint64_t read_blocks;  /* 512-byte blocks those requests moved */
     uint64_t read_us;      /* microseconds spent INSIDE dev->read */
+    /* Bounce-path instrumentation. The shared bounce buffer is the block
+     * layer's one piece of global mutable state, and its lock could only ever
+     * be justified by traffic actually going through it -- so count it rather
+     * than assume. `bounce_contended` is the number of acquisitions that found
+     * the buffer already held: it is the ONLY direct evidence that the race the
+     * lock prevents is reachable at all. Zero contention means every test of
+     * that lock is vacuous, however green it looks. */
+    uint64_t bounce_reads;      /* embk_block_read calls taking the bounce path  */
+    uint64_t bounce_writes;     /* embk_block_write calls taking the bounce path */
+    uint64_t bounce_contended;  /* acquisitions that had to WAIT for the buffer  */
 };
 void embk_blkstat_reset(void);
 void embk_blkstat_get(struct embk_blkstat *out);

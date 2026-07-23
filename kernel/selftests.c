@@ -375,6 +375,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs tree\n");
     kprintf("  test embkfs obj\n");
     kprintf("  test embkfs shrink\n");
+    kprintf("  test blockrace\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -522,6 +523,128 @@ int selftests_handle_command(const char *cmd)
         int rc = embkfs_run_object_selftests();
         kprintf("\n[cmd] test embkfs obj: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
         return 1;
+    }
+
+/* CONCURRENT READERS, AND WHAT THE BOUNCE BUFFER'S LOCK IS ACTUALLY FOR.
+ *
+ * block.c has ONE shared DMA bounce buffer, taken whenever a caller's
+ * destination is not DMA-safe for the device -- the common case here, not an
+ * exotic one: kmalloc memory lives in the direct map and the ATA driver needs
+ * the kernel range, so nearly all filesystem I/O bounces (a single
+ * `test posix` run takes that path 8617 times). Two concurrent bounce
+ * transfers would memcpy over each other and each return the OTHER's sectors:
+ * silent corruption, no fault, no error code.
+ *
+ * TODO.md asked for the test that was missing: "the race itself is NOT covered
+ * ... every test above is single-threaded, so the lock is never contended".
+ * This is that test, and writing it turned up something better than a pass.
+ *
+ * WHAT IT FOUND. Four readers, spawned before any is waited on, hammering two
+ * files -- and the bounce lock is contended ZERO times. Not a flaw in the
+ * test: a fact about the system. The EMBKFS big lock serialises every
+ * filesystem operation, so two processes CANNOT be inside the block layer at
+ * once by way of the filesystem. The bounce lock sits underneath a lock that
+ * already excludes the concurrency it defends against.
+ *
+ * So the honest assertion is not "contention must be > 0" -- that would be
+ * demanding a race the architecture currently forbids, and no amount of
+ * hammering would produce it. It is the RELATIONSHIP:
+ *
+ *     contention through the filesystem path must be ZERO, because the
+ *     EMBKFS big lock serialises above it.
+ *
+ * That is the stronger check. If it ever fires non-zero, something real
+ * changed -- the fs lock got finer-grained (per-volume/per-path, an open
+ * TODO item), a second filesystem mounted alongside EMBKFS (fat32.c does NOT
+ * take the EMBKFS lock), or a non-fs block user appeared -- and the bounce
+ * lock stopped being defence-in-depth and became load-bearing. This test is
+ * how that transition announces itself instead of being discovered by
+ * corruption.
+ *
+ * The content check is not redundant either: it proves end-to-end that four
+ * concurrent readers each get their OWN file's bytes, which is the property
+ * users care about regardless of which layer is providing it. Each reader
+ * verifies every byte against a single-byte fill, so one stolen sector is
+ * unmistakable ('B' where only 'A' belongs) and the child exits 2. */
+    if (strcmp(cmd, "test blockrace") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test blockrace: VFS not registered\n"); return 1; }
+
+        #define RACERS 4
+        static const char *files[RACERS] = { "/data/racea.bin", "/data/raceb.bin",
+                                             "/data/racea.bin", "/data/raceb.bin" };
+        static const char *fills[RACERS] = { "A", "B", "A", "B" };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pids[RACERS], codes[RACERS];
+        int ok = 1, mismatch = 0;
+
+        struct embk_blkstat b0, b1;
+        embk_blkstat_get(&b0);
+
+        /* Spawn ALL of them before waiting on any. Waiting between spawns
+         * would serialise them in the TEST, which would hide whether the
+         * SYSTEM serialises them -- the very thing being measured. */
+        for (int i = 0; i < RACERS; i++) {
+            char *a[] = { (char *)"/data/apps/ioracer/ioracer.elf",
+                          (char *)files[i], (char *)fills[i], (char *)"3", NULL };
+            pids[i] = process_create_env("/data/apps/ioracer/ioracer.elf", a, 4, env, NULL, 0);
+            if (pids[i] < 0) {
+                kprintf("[blockrace] spawn %d failed: %s\n", i, embk_strerror(pids[i]));
+                ok = 0;
+            }
+        }
+        kprintf("[blockrace] %d readers spawned before any wait (2 files, 256 KB each,\n"
+                "            3 passes each; the bounce buffer is 32 KB)\n", RACERS);
+
+        for (int i = 0; i < RACERS; i++) {
+            codes[i] = (pids[i] >= 0) ? process_wait((uint32_t)pids[i]) : -1;
+            if (codes[i] == 2) mismatch = 1;
+            kprintf("[blockrace] reader %d (%s, '%s') exit=%d%s\n",
+                    i, files[i], fills[i], codes[i],
+                    codes[i] == 2 ? "  <-- GOT ANOTHER READER'S BYTES" : "");
+            if (codes[i] != 0) ok = 0;
+        }
+
+        embk_blkstat_get(&b1);
+        uint64_t breads = b1.bounce_reads - b0.bounce_reads;
+        uint64_t bcont  = b1.bounce_contended - b0.bounce_contended;
+        kprintf("[blockrace] bounce path: %llu read(s), %llu contended\n",
+                (unsigned long long)breads, (unsigned long long)bcont);
+
+        /* The architectural assertion. Zero is CORRECT here and is what makes
+         * the bounce lock defence-in-depth rather than the thing holding the
+         * system together. Non-zero is not a failure of correctness -- the
+         * lock did its job -- but it means the layering changed, and whoever
+         * changed it needs to know this lock is now load-bearing. */
+        if (bcont == 0) {
+            kprintf("[blockrace] bounce lock never contended -- EXPECTED: the EMBKFS big\n"
+                    "            lock serialises fs I/O above it, so two readers cannot be\n"
+                    "            inside the block layer at once. The bounce lock is\n"
+                    "            defence-in-depth for callers that do not hold that lock\n"
+                    "            (fat32.c, the boot partition scan, a future finer-grained\n"
+                    "            fs lock).\n");
+        } else {
+            kprintf("[blockrace] *** bounce lock WAS contended (%llu). The fs no longer\n"
+                    "            serialises above it -- this lock is now LOAD-BEARING.\n"
+                    "            That is fine, but docs/TODO.md's block-layer entry and\n"
+                    "            the EMBKFS big-lock comment both need updating.\n",
+                    (unsigned long long)bcont);
+        }
+
+        /* Also worth seeing: the bounce read count is far below the 3 MB these
+         * readers logically consumed, because EMBKFS's whole-object cache
+         * serves repeat passes without reaching the block layer at all. A
+         * concurrency test that assumed "bytes read == device reads" would be
+         * measuring the cache, not the disk. */
+        kprintf("[blockrace] (%llu device bounce reads for ~3 MB logical -- the rest was\n"
+                "            served by EMBKFS's object cache, never reaching block.c)\n",
+                (unsigned long long)breads);
+
+        kprintf("\n[cmd] test blockrace: %s\n",
+                ok ? "OK -- 4 concurrent readers, every byte its own"
+                   : (mismatch ? "FAIL -- A READER GOT ANOTHER'S BYTES (bounce buffer raced)"
+                               : "FAIL"));
+        return 1;
+        #undef RACERS
     }
 
     if (strcmp(cmd, "test embkfs shrink") == 0) {
@@ -2602,6 +2725,12 @@ int selftests_handle_command(const char *cmd)
         kprintf("[blkstat] %llu device reads, %llu blocks (%llu KB), avg %llu blocks/req\n",
                 (unsigned long long)nreq, (unsigned long long)nblk,
                 (unsigned long long)(nblk / 2), (unsigned long long)(nreq ? nblk / nreq : 0));
+        kprintf("[blkstat] bounce path: %llu read(s), %llu write(s), %llu contended\n"
+                "          (contended > 0 is the only proof the bounce lock is\n"
+                "           reachable; 0 means every test of it is vacuous)\n",
+                (unsigned long long)(bs1.bounce_reads - bs0.bounce_reads),
+                (unsigned long long)(bs1.bounce_writes - bs0.bounce_writes),
+                (unsigned long long)(bs1.bounce_contended - bs0.bounce_contended));
         kprintf("[blkstat] %llu ms INSIDE dev->read, %llu us/req -- anything above\n"
                 "          this in the test's wall clock is NOT the disk\n",
                 (unsigned long long)(nus / 1000),

@@ -797,6 +797,20 @@ def discover_userland_objects(build_dir="build"):
     if ckm is not None:
         objects.append((b"data/src/ui/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ckm))
 
+    # Fixtures for `test blockrace`: two files, each filled with ONE distinct
+    # byte. The block layer's shared DMA bounce buffer corrupts by handing a
+    # reader the OTHER reader's sectors, which is silent -- no fault, no error
+    # code, just wrong bytes. A single-byte fill makes that unmistakable: a
+    # racing read yields 'B' where every byte must be 'A', and the offset says
+    # exactly which sector was stolen.
+    #
+    # 256 KB each, deliberately: the bounce buffer is 32 KB, so one pass over a
+    # fixture is 8+ full buffer loads with a lock acquire/release around each
+    # read call -- a wide window for two processes to interleave. A small file
+    # could be read in a single chunk and might never overlap.
+    for name, fill in ((b"data/racea.bin", b"A"), (b"data/raceb.bin", b"B")):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, fill * (256 * 1024)))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single

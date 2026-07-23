@@ -25,6 +25,9 @@ static uint32_t disk_letters = 0;
 // Sized to the max single transfer the adapters issue (64 sectors = 32KB).
 static uint8_t block_bounce[64 * 512] __attribute__((aligned(16)));
 
+/* Defined before bounce_acquire(): that helper counts contention. */
+static struct embk_blkstat blkstat;
+
 /* --- the bounce buffer's lock -------------------------------------------
  * ONE buffer, shared by every caller. It was unlocked, on the reasoning that
  * block I/O is "synchronous". That reasoning expired: there are now SMP,
@@ -40,15 +43,27 @@ static uint8_t block_bounce[64 * 512] __attribute__((aligned(16)));
  * open-coded right here.) Pre-scheduler safe: boot callers are single-threaded,
  * so the mutex is never contended and never sleeps. */
 static struct mutex bounce_lock = MUTEX_INIT;
-static inline void bounce_acquire(void) { mutex_lock(&bounce_lock); }
+
+/* Counted, not assumed. mutex_trylock first: if it succeeds the buffer was
+ * free, and if it fails we were about to block -- which IS the contention this
+ * lock exists for, and the only direct evidence that the race is reachable.
+ * A concurrency test that never bumps bounce_contended has not tested the
+ * lock, however green it prints. */
+static inline void bounce_acquire(void) {
+    if (mutex_trylock(&bounce_lock)) return;
+    blkstat.bounce_contended++;
+    mutex_lock(&bounce_lock);
+}
 static inline void bounce_release(void) { mutex_unlock(&bounce_lock); }
 
 // Request counters (see block.h). Counts requests that actually reach a
 // driver -- the bounce path issues several per call, so this is incremented at the
 // dev->read sites, NOT at entry to embk_block_read.
-static struct embk_blkstat blkstat;
 
-void embk_blkstat_reset(void) { blkstat.reads = 0; blkstat.read_blocks = 0; blkstat.read_us = 0; }
+void embk_blkstat_reset(void) {
+    blkstat.reads = 0; blkstat.read_blocks = 0; blkstat.read_us = 0;
+    blkstat.bounce_reads = 0; blkstat.bounce_writes = 0; blkstat.bounce_contended = 0;
+}
 void embk_blkstat_get(struct embk_blkstat *out) { if (out) *out = blkstat; }
 
 // Microseconds, straight off the HPET. Only used to attribute wall time to the
@@ -154,6 +169,7 @@ int embk_block_read(struct embk_block_device *dev,
     // would let another caller reuse the buffer mid-transfer, which is the exact
     // corruption we are here to prevent.
     bounce_acquire();
+    blkstat.bounce_reads++;
     uint32_t max_blocks = sizeof(block_bounce) / dev->block_size;
     uint8_t *dst = (uint8_t *)buffer;
     while (count > 0) {
@@ -189,6 +205,7 @@ int embk_block_write(struct embk_block_device *dev,
     }
 
     bounce_acquire();          /* same one buffer as the read path -- same lock */
+    blkstat.bounce_writes++;
     uint32_t max_blocks = sizeof(block_bounce) / dev->block_size;
     const uint8_t *src = (const uint8_t *)buffer;
     while (count > 0) {
