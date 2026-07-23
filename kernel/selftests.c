@@ -569,10 +569,22 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test blockrace") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test blockrace: VFS not registered\n"); return 1; }
 
-        #define RACERS 4
+        /* Six readers, two workloads. The four 256 KB fixtures are the
+         * content-verified ones and live in the whole-object rcache. The two
+         * BIG readers exist for a different reason: cxxdemo.elf is 9 MB, past
+         * EMBKFS_RCACHE_MAX, so it bypasses rcache entirely and drives the
+         * extent-map cache (ecache) instead -- the only workload on this image
+         * that does. Without them the ecache numbers below would be all zeros
+         * and any claim about it would be unfounded. They read in '*' mode:
+         * a real binary has no fill byte, so they drive the path without
+         * pretending to a content check. */
+        #define RACERS 6
         static const char *files[RACERS] = { "/data/racea.bin", "/data/raceb.bin",
-                                             "/data/racea.bin", "/data/raceb.bin" };
-        static const char *fills[RACERS] = { "A", "B", "A", "B" };
+                                             "/data/racea.bin", "/data/raceb.bin",
+                                             "/data/apps/cxxdemo/cxxdemo.elf",
+                                             "/data/apps/cxxdemo/cxxdemo.elf" };
+        static const char *fills[RACERS] = { "A", "B", "A", "B", "*", "*" };
+        static const char *passes[RACERS] = { "3", "3", "3", "3", "2", "2" };
         char *env[] = { (char *)"HOME=/", NULL };
         int pids[RACERS], codes[RACERS];
         int ok = 1, mismatch = 0;
@@ -587,15 +599,17 @@ int selftests_handle_command(const char *cmd)
          * SYSTEM serialises them -- the very thing being measured. */
         for (int i = 0; i < RACERS; i++) {
             char *a[] = { (char *)"/data/apps/ioracer/ioracer.elf",
-                          (char *)files[i], (char *)fills[i], (char *)"3", NULL };
+                          (char *)files[i], (char *)fills[i], (char *)passes[i], NULL };
             pids[i] = process_create_env("/data/apps/ioracer/ioracer.elf", a, 4, env, NULL, 0);
             if (pids[i] < 0) {
                 kprintf("[blockrace] spawn %d failed: %s\n", i, embk_strerror(pids[i]));
                 ok = 0;
             }
         }
-        kprintf("[blockrace] %d readers spawned before any wait (2 files, 256 KB each,\n"
-                "            3 passes each; the bounce buffer is 32 KB)\n", RACERS);
+        kprintf("[blockrace] %d readers spawned before any wait: 4 over two 256 KB\n"
+                "            fixtures (rcache path, content-verified) + 2 over a 9 MB\n"
+                "            binary (>8 MB, so the ecache path). Bounce buffer is 32 KB.\n",
+                RACERS);
 
         for (int i = 0; i < RACERS; i++) {
             codes[i] = (pids[i] >= 0) ? process_wait((uint32_t)pids[i]) : -1;
@@ -662,11 +676,18 @@ int selftests_handle_command(const char *cmd)
                     (unsigned long long)(wus / 1000));
             struct embkfs_stat es;
             embkfs_stat_get(&es);
-            kprintf("[blockrace] rcache: %llu hit, %llu miss, %llu evict "
-                    "(%u slot%s, %u MB budget)\n",
+            kprintf("[blockrace] ecache: %llu hit, %llu miss | icache: %llu hit, %llu miss "
+                    "(both still 1 slot)\n",
+                    (unsigned long long)es.ecache_hit, (unsigned long long)es.ecache_miss,
+                    (unsigned long long)es.icache_hit, (unsigned long long)es.icache_miss);
+            kprintf("[blockrace] rcache: %llu hit, %llu miss, %llu evict, %llu BYPASS "
+                    "(>%u MB, uncacheable by policy)\n"
+                    "[blockrace]         %u slot%s, %u MB budget\n",
                     (unsigned long long)es.rcache_hit,
                     (unsigned long long)es.rcache_miss,
                     (unsigned long long)es.rcache_evict,
+                    (unsigned long long)es.rcache_bypass,
+                    (unsigned)(EMBKFS_RCACHE_MAX_MB),
                     EMBKFS_RCACHE_SLOTS, EMBKFS_RCACHE_SLOTS == 1 ? "" : "s",
                     EMBKFS_RCACHE_BUDGET / (1024u * 1024u));
             kprintf("[blockrace]   (an EVICTION is a miss the cache inflicted on itself, and\n"

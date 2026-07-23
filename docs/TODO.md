@@ -851,6 +851,29 @@ how it came down" and BUILD.md §6.
       progress so they queue more often, while each wait is 3.6× shorter. Wait
       count alone would have read as a regression; total blocked time is the
       honest metric.
+    - **The other two caches were checked and left alone.** `ecache` (extent
+      map) and `icache` (inode) are *also* single-slot, and "same shape as the
+      rcache bug" looked obvious. Measured instead — with a real >8 MB workload
+      (`cxxdemo.elf`, the only file on the image past `RCACHE_MAX`, which is
+      what drives the ecache path at all):
+
+          ecache: 1608 hit, 11 miss  |  icache: 10784 hit, 11 miss  (1 slot each)
+
+      **99.3% and 99.9% hit on one slot.** No thrash, so no change. The
+      hypothesis was wrong, which is the useful outcome — an N-way rewrite of
+      either would have been churn with a plausible story attached.
+      - ⚠️ **Bounded claim:** there is only ONE >8 MB file on the image, so two
+        big files never alternate — the pattern that *would* thrash ecache is
+        untested because it cannot be built here today. If a second large file
+        appears, re-run `test blockrace` before assuming ecache is still fine.
+    - **The rcache counter was lying, and it was my counter.** That same run
+      reported `rcache: 806 hit, 9186 miss` — an apparent 8% hit rate on a cache
+      that had just been shown to work. Nearly all of those "misses" were reads
+      of the 9 MB file, which is **over `RCACHE_MAX` and therefore uncacheable
+      by policy** — a bypass, not a failure (predicted 9169, reported 9186; the
+      17-difference is the real misses). Now counted separately. A broken
+      instrument is worse than none: this one invited "fixing" a cache that was
+      already fine.
     - Prerequisite for per-OBJECT locking, if it is ever wanted: **34 shared
       `static uint8_t [4096]` scratch buffers in embkfs.c** would have to
       become per-caller first — *they* are what the lock actually protects

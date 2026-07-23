@@ -27,8 +27,16 @@
  * single swapped sector is unmistakable: you get 'B' where 'A' belongs, and
  * the report says which offset and what arrived.
  *
- * usage: ioracer <path> <fill-char> [iterations]
- * exit:  0 = every byte of every pass was ours
+ * A fill-char of '*' means READ WITHOUT VERIFYING. That exists for one
+ * specific job: files larger than EMBKFS_RCACHE_MAX (8 MB) bypass the
+ * whole-object cache entirely and take the extent-map (ecache) path instead,
+ * and the only such files on the image are real binaries, which have no fill
+ * byte to check. Reading one still drives the path, which is what a cache
+ * measurement needs; it just cannot make the content claim, and says so by
+ * being a different mode rather than by quietly checking nothing.
+ *
+ * usage: ioracer <path> <fill-char|*> [iterations]
+ * exit:  0 = every byte of every pass was ours (or, in '*' mode, read cleanly)
  *        1 = usage/open/read error (a real failure, but NOT the race)
  *        2 = CONTENT MISMATCH -- the thing this program exists to catch
  */
@@ -48,6 +56,7 @@ int main(int argc, char **argv)
     }
     const char *path = argv[1];
     unsigned char want = (unsigned char)argv[2][0];
+    int verify = (want != '*');
     int iters = (argc > 3) ? atoi(argv[3]) : 4;
     if (iters <= 0) iters = 4;
 
@@ -72,7 +81,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             if (n == 0) break;
-            for (ssize_t i = 0; i < n; i++) {
+            for (ssize_t i = 0; verify && i < n; i++) {
                 if (buf[i] != want) {
                     /* The whole point. Report enough to identify the intruder:
                      * which file we were reading, what we expected, what we got
@@ -93,7 +102,11 @@ int main(int argc, char **argv)
         close(fd);
     }
 
-    printf("ioracer: %s OK -- %llu bytes verified over %d pass(es), all '%c'\n",
-           path, checked, iters, want);
+    if (verify)
+        printf("ioracer: %s OK -- %llu bytes verified over %d pass(es), all '%c'\n",
+               path, checked, iters, want);
+    else
+        printf("ioracer: %s OK -- %llu bytes read over %d pass(es) (no content claim)\n",
+               path, checked, iters);
     return 0;
 }

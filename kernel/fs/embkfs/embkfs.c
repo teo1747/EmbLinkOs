@@ -1696,6 +1696,7 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     }
     vol->rcache_clock = 0; vol->rcache_bytes = 0;
     vol->rcache_hits = 0; vol->rcache_misses = 0; vol->rcache_evicts = 0;
+    vol->rcache_bypass = 0;
     /* extent-map cache: same deal, same keying (see embkfs.h). Must be seeded --
      * read_object_range tests ecache_ext before ecache_gen, so a garbage pointer
      * from an uninitialised volume would be dereferenced. */
@@ -1704,6 +1705,7 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
      * true here would serve a stale/garbage inode on the very first read. */
     vol->icache_valid = false; vol->icache_oid = 0; vol->icache_gen = 0;
+    vol->icache_hits = 0; vol->icache_misses = 0;
     /* Read-ahead window: wcache_buf is the gate (NULL = unallocated), same shape
      * as rcache/ecache, so a garbage pointer here would be read as a live cache. */
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
@@ -1760,6 +1762,9 @@ void embkfs_stat_get(struct embkfs_stat *out)
         g_efs_stat.rcache_hit   = g_embkfs_live->rcache_hits;
         g_efs_stat.rcache_miss  = g_embkfs_live->rcache_misses;
         g_efs_stat.rcache_evict = g_embkfs_live->rcache_evicts;
+        g_efs_stat.rcache_bypass = g_embkfs_live->rcache_bypass;
+        g_efs_stat.icache_hit   = g_embkfs_live->icache_hits;
+        g_efs_stat.icache_miss  = g_embkfs_live->icache_misses;
     }
     *out = g_efs_stat;
 }
@@ -4724,9 +4729,11 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (vol->icache_valid && vol->icache_oid == oid &&
         vol->icache_gen == vol->generation) {
+        vol->icache_hits++;
         *out = vol->icache_ino;
         return EMBK_OK;
     }
+    vol->icache_misses++;
 
     const struct embk_item_header *ii =
         embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe_i, sizeof probe_i);
@@ -4783,7 +4790,7 @@ int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
 
 /* Cap on the whole-object read cache (embkfs_read_object_at): files up to this
  * size are cached for fast sequential reads; larger ones use the direct path. */
-#define EMBKFS_RCACHE_MAX (8u * 1024u * 1024u)
+#define EMBKFS_RCACHE_MAX (EMBKFS_RCACHE_MAX_MB * 1024u * 1024u)
 
 /* Read-ahead window for objects too big for the whole-object cache above.
  * MUST be a power of two (the lookup masks the offset) and a multiple of the
@@ -4853,7 +4860,6 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
         *out_read = want;
         return EMBK_OK;
     }
-    vol->rcache_misses++;
 
     /* Size from the cached inode. This used to be
      * `embkfs_read_object_prefix(vol, oid, NULL, 0, &total, NULL)` -- want==0 so
@@ -4871,6 +4877,16 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
 
     uint64_t want = total - offset;
     if (want > len) want = len;
+
+    /* A lookup that failed is only a MISS if the object was cacheable at all.
+     * An object over EMBKFS_RCACHE_MAX can never be in this cache by policy, so
+     * every read of it would otherwise be scored as a miss -- and one 9 MB file
+     * read twice buries the real number under ~9200 phantom misses, making a
+     * 99%-effective cache read as 8%. That is a broken instrument, and a broken
+     * instrument is worse than none: it invites "fixing" a cache that is fine.
+     * Bypasses are counted separately. */
+    if (total > EMBKFS_RCACHE_MAX) vol->rcache_bypass++;
+    else                           vol->rcache_misses++;
 
     /* Decode the whole object ONCE into the cache (capped so a huge file can't
      * pin unbounded RAM), then serve. On a miss for a >cap file, or on OOM,

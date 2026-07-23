@@ -387,6 +387,9 @@ _Static_assert(sizeof(struct embk_snapshot_item) == 80, "snapshot item must be 8
  * a real regression on a 512 MB machine. Instead the cache evicts LRU until
  * the newcomer fits under a total-bytes cap, so slots buy hit rate without
  * buying unbounded memory. */
+/* Mirrors EMBKFS_RCACHE_MAX (embkfs.c) for reporting; kept next to the slot
+ * geometry so the two cannot drift apart unnoticed. */
+#define EMBKFS_RCACHE_MAX_MB  8
 #define EMBKFS_RCACHE_SLOTS   4
 #define EMBKFS_RCACHE_BUDGET  (12u * 1024u * 1024u)
 
@@ -460,6 +463,7 @@ struct embkfs_volume {
     uint64_t  rcache_clock;  /* monotonic tick for the LRU stamps   */
     uint64_t  rcache_bytes;  /* live total, held under RCACHE_BUDGET */
     uint64_t  rcache_hits, rcache_misses, rcache_evicts;
+    uint64_t  rcache_bypass;   /* object > RCACHE_MAX: not cacheable, not a miss */
 
     /* Single-object EXTENT-MAP cache: the collected+validated extref array of
      * the most-recently ranged-over object. Same (oid, generation) keying as
@@ -498,6 +502,7 @@ struct embkfs_volume {
     uint64_t  icache_oid;
     uint64_t  icache_gen;
     bool      icache_valid;
+    uint64_t  icache_hits, icache_misses;
     struct embk_inode_item icache_ino;
 
     /* Windowed read-ahead cache. rcache is all-or-nothing: it caches the WHOLE
@@ -539,6 +544,13 @@ struct embkfs_stat {
     uint64_t rcache_hit;
     uint64_t rcache_miss;
     uint64_t rcache_evict;
+    uint64_t rcache_bypass;  /* too big to cache -- NOT a cache failure */
+    /* icache: the third (oid,generation)-keyed cache, still SINGLE-slot -- the
+     * same shape as the rcache bug. Counted before being changed, because
+     * "same shape" is a hypothesis, not a measurement: icache is only consulted
+     * when rcache MISSES, so it may well be cold in practice. (ecache already
+     * had hit/miss counters above.) */
+    uint64_t icache_hit, icache_miss;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);
