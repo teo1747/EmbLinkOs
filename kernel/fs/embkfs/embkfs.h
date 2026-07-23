@@ -576,6 +576,16 @@ uint32_t embkfs_volume_count(void);
 struct embkfs_volume *embkfs_volume_at(uint32_t index);
 int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 
+/* THE EMBKFS BIG LOCK (see the long comment in embkfs.c). Sleeping, recursive
+ * by owner thread, one for the whole filesystem. Every public entry point in
+ * this header takes it; these are exported for callers that need a WIDER
+ * critical section than a single call -- the VFS bridge (several API calls
+ * that must not interleave) and any future multi-step operation.
+ *
+ * Never hold it across a wait on another thread that does fs I/O. */
+void embkfs_lock(void);
+void embkfs_unlock(void);
+
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
  * EMBKFS volume (or its superblock is corrupt). */

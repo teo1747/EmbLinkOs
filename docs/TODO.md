@@ -490,11 +490,13 @@ interrupt-driven.
   them. STILL OPEN (the "STRONGER" tier): an on-disk orphan list for
   crash-safe deferred delete, replayed on mount — bigger, only worth it if
   crash-safety of the unlinked-open window specifically matters.
-- [ ] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
-  array with linear scan and NO lock. SMP now exists (see Process &
-  Scheduling) but nothing currently opens EMBKFS objects from more than
-  one core concurrently — revisit before that changes. Same class as the
-  block-layer bounce buffer below.
+- [~] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
+  array with linear scan and no lock **of its own** — but it is no longer
+  unprotected: `obj_get`/`obj_put` reach it through public entry points that
+  all take the EMBKFS big lock, so concurrent access is serialised with the
+  rest of the filesystem. What remains is the FIXED SIZE (64) and the linear
+  scan, which are capacity/efficiency limits, not races. The block-layer
+  bounce buffer below is still the genuinely unprotected one.
 - [ ] `embkfs_parent_dir_oid` resolves `..` by a full-tree scan (O(tree) per
   `..`). VFS now does dot-dot itself with a breadcrumb stack, so this path is
   only hit by EMBKFS-internal callers — but if those stay, a stored parent
@@ -780,14 +782,31 @@ how it came down" and BUILD.md §6.
   times before actually reporting a fault, which has been reliable in
   practice but is a workaround, not a diagnosis. If unrelated EFAULTs
   reappear elsewhere, start here.
-- [ ] **EMBKFS has latent (not yet triggered) SMP hazards from the UI
-  bring-up's heavier concurrent I/O.** Several `embkfs.c` functions use
-  `static uint8_t probe[4096]`/`datablk[4096]` scratch buffers shared across
-  calls, and the per-volume whole-object read cache (`vol->rcache_*`) is
-  unlocked — both are use-after-free/data-race risks if two cores genuinely
-  race a read against that cache's replace/free path. Worth a per-volume
-  lock at the `embk_vfs` bridge before apps start doing more concurrent
-  filesystem I/O than they do today.
+- [x] ~~**EMBKFS has latent (not yet triggered) SMP hazards**~~ — done, and it
+  stopped being latent before it was fixed: the shared `static` scratch
+  buffers really did race once the boot image grew past ONE leaf, and the
+  Merkle check caught it live (`block 17 checksum 0xF7E73490 != parent's
+  0x6D1CCFF1` — core B validating core A's just-loaded leaf as the root,
+  from `run /term.elf` racing home's clockw spawn). Fixed by THE EMBKFS BIG
+  LOCK: one sleeping, owner-recursive lock serialising every entry point.
+  Note the shape of the near-miss — the bug was invisible until the *data*
+  got big enough, not until the code changed.
+  - [x] ~~The kernel console's direct `embkfs_*` calls (`snap`,
+    `test embkfs …`) bypass the lock~~ — closed: the lock moved out of the
+    `embk_vfs` bridge and into `embkfs.c`, *with the state it protects*, and
+    every public entry point takes it. The bridge delegates. Recursion by
+    owner thread is what makes that compose (a selftest holding the lock can
+    still call the public API underneath it).
+  - [ ] Still coarse: ONE lock for the whole filesystem, not per-volume or
+    per-path. Correctness first; nothing has yet asked for the concurrency.
+    Two known consequences, both latency not correctness: `test embkfs
+    timestamps` holds it across a ~2s RTC-resolution wait, and any long
+    selftest blocks unrelated fs I/O for its duration.
+  - ⚠️ **The rule that keeps it safe:** never hold this lock across a wait on
+    *another thread* doing fs I/O (spawn-and-wait, say) — the child's ops take
+    the same lock from a different thread and would block on a holder that is
+    itself blocked on the child. This is exactly why the selftest dispatcher
+    does not wrap commands wholesale; the leaf entry points lock instead.
 - [x] ~~**`mkfs_embkfs.py`'s single-leaf image builder overflows past ~7
   packed files.**~~ — done: `build_btree()` (with `pack_items_into_leaves()`)
   greedily packs metadata items into as many level-0 leaves as they need and

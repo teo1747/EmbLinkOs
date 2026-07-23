@@ -14,6 +14,85 @@
 #include "drivers/input/keyboard.h"  /* keyboard_getchar — mount-time passphrase prompt */
 #include "process/process.h"   /* current_process->pid — writer provenance (v2.2 Phase 5c) */
 
+/* --------------------------------------------------------------------------
+ * THE EMBKFS BIG LOCK.
+ *
+ * This file is full of shared `static uint8_t buf[4096]` node/probe scratch
+ * buffers ("the kernel stack is tiny"), and the per-volume read cache
+ * (vol->rcache_*) is likewise shared. Fine while every caller was the one boot
+ * CPU; a genuine data race once two cores descend the tree at once.
+ *
+ * It stayed LATENT while the boot image was a single-leaf tree -- racing
+ * descents read the SAME block into the shared buffer, identical bytes,
+ * invisible. The first 2-leaf image made concurrent descents read DIFFERENT
+ * blocks, and the Merkle check caught core B validating core A's just-loaded
+ * leaf as the root (observed live: `run /term.elf` racing home's clockw spawn,
+ * "block 17 checksum 0xF7E73490 != parent's 0x6D1CCFF1", where F7E73490 was
+ * leaf 19's csum). Worth restating: the bug was invisible until the DATA got
+ * big enough, not until the code changed.
+ *
+ * A SLEEPING lock, not a spinlock: these ops block on disk I/O, so waiters are
+ * ordinary schedulable threads on a wait queue. Coarse by design -- one lock
+ * for the whole filesystem. Correctness first; per-volume or per-path locking
+ * is a later optimization nothing has yet asked for.
+ *
+ * WHY IT LIVES HERE and not at the VFS bridge, where it started: the bridge
+ * covered everything userspace and the ELF loader do, but the kernel console's
+ * DIRECT calls -- `snap`, `test embkfs ...` -- went around it, which was
+ * documented at the time and left unfixed. A lock belongs with the data it
+ * protects, so it now sits in this file and the bridge delegates to it. The
+ * console paths lock because the entry points they call do.
+ *
+ * RECURSIVE BY OWNER THREAD, deliberately: vfs_ls's readdir CALLBACK stats
+ * each entry (the boot dump's size column), so stat legitimately nests inside
+ * a locked readdir -- a non-recursive lock self-deadlocked the boot at `ls /:`
+ * on the very first locked build. That same recursion is what lets a selftest
+ * take the lock and still call the public API underneath it.
+ *
+ * Owner identity is current_thread; the only NULL-current context that runs fs
+ * code is the single pre-adoption boot CPU, so NULL==NULL cannot alias two
+ * threads.
+ *
+ * NEVER hold this across something that waits on ANOTHER thread doing fs I/O
+ * (spawning a process and waiting for it, say): the child's ops take this same
+ * lock from a different thread and would block on a holder that is itself
+ * blocked on the child. That is why the selftest dispatcher does NOT wrap
+ * commands wholesale -- the lock is taken by the leaf entry points instead.
+ * -------------------------------------------------------------------------- */
+static int g_fs_busy = 0;
+static struct thread *g_fs_owner = 0;   /* valid only while busy */
+static int g_fs_depth = 0;
+static struct wait_queue g_fs_wq;       /* zero-init = empty */
+
+void embkfs_lock(void)
+{
+    sched_lock();
+    if (g_fs_busy && g_fs_owner == current_thread) {
+        g_fs_depth++;
+        sched_unlock();
+        return;
+    }
+    while (g_fs_busy) {
+        sched_block_current_locked(&g_fs_wq);   /* returns UNLOCKED */
+        sched_lock();
+    }
+    g_fs_busy = 1;
+    g_fs_owner = current_thread;
+    g_fs_depth = 1;
+    sched_unlock();
+}
+
+void embkfs_unlock(void)
+{
+    sched_lock();
+    if (--g_fs_depth == 0) {
+        g_fs_busy = 0;
+        g_fs_owner = 0;
+        wait_queue_wake_one(&g_fs_wq);
+    }
+    sched_unlock();
+}
+
 _Static_assert(sizeof(struct aes_xts_ctx) <= sizeof(((struct embkfs_volume *)0)->xts_opaque),
                "embkfs_volume.xts_opaque too small for struct aes_xts_ctx");
 
@@ -3262,7 +3341,7 @@ static int embkfs_rename(struct embkfs_volume *vol,
  * v2.x follow-up, flagged here rather than silently approximated.
  * =================================================================== */
 
-int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_create_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3350,7 +3429,7 @@ int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
     return EMBK_OK;
 }
 
-int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_delete_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3420,7 +3499,7 @@ int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
     return EMBK_OK;
 }
 
-int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_rollback_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3485,7 +3564,10 @@ int embkfs_snapshot_list(struct embkfs_volume *vol, struct embk_snapshot_item *o
                          uint32_t max, uint32_t *out_n)
 {
     if (!vol || !vol->mounted) return -EMBK_ENODEV;
-    return embkfs_snapshot_list_internal(vol, out_items, max, out_n);
+    embkfs_lock();
+    int rc = embkfs_snapshot_list_internal(vol, out_items, max, out_n);
+    embkfs_unlock();
+    return rc;
 }
 
 
@@ -5727,14 +5809,14 @@ static void embkfs_path_norm_smoke(struct embkfs_volume *vol)
                 vol->dev->name, r1, r2, a, b);
 }
 
-int embkfs_run_path_selftests(void)
+static int embkfs_run_path_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     embkfs_path_norm_smoke(g_embkfs_live);
     return EMBK_OK;
 }
 
-int embkfs_run_allocator_selftests(void)
+static int embkfs_run_allocator_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5834,7 +5916,7 @@ static void embk_tree_case_path(char *out, const char *prefix, uint32_t idx)
     out[12] = '\0';
 }
 
-int embkfs_run_tree_selftests(void)
+static int embkfs_run_tree_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5906,7 +5988,7 @@ fail:
     return rc;
 }
 
-int embkfs_run_object_selftests(void)
+static int embkfs_run_object_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6114,7 +6196,7 @@ static int embk_shrink_case(struct embkfs_volume *vol, uint64_t oid, const char 
     return EMBK_OK;
 }
 
-int embkfs_run_shrink_selftests(void)
+static int embkfs_run_shrink_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6224,7 +6306,7 @@ int embkfs_run_shrink_selftests(void)
  * between the two stats to guarantee a visible difference -- not flaky
  * because it isn't racing anything, just waiting out the clock's own
  * granularity. */
-int embkfs_run_timestamp_selftests(void)
+static int embkfs_run_timestamp_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6337,7 +6419,7 @@ int embkfs_run_timestamp_selftests(void)
  * device at boot (`make run-multivol`); with only one volume mounted this
  * degrades to a SKIP rather than a FAIL, since most boots (plain `make run`)
  * only attach one EMBKFS-formatted drive. */
-int embkfs_run_multivol_selftests(void)
+static int embkfs_run_multivol_selftests_impl(void)
 {
     uint32_t n = embkfs_volume_count();
     if (n < 2) {
@@ -6426,7 +6508,7 @@ int embkfs_run_multivol_selftests(void)
  * if compression actually ran, so it's an equally rigorous proof. Also
  * covers the low-value case that must NOT shrink (proving the "only keep
  * it if it helps" policy actually runs, not just exists). */
-int embkfs_run_compress_selftests(void)
+static int embkfs_run_compress_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6539,7 +6621,7 @@ int embkfs_run_compress_selftests(void)
  * cleanly. Corrupting/repairing the on-disk backup doesn't touch the
  * already-mounted live volume's in-memory state (root/generation), so
  * this is safe to run against g_embkfs_live without disturbing it. */
-int embkfs_run_selfheal_selftests(void)
+static int embkfs_run_selfheal_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6633,7 +6715,7 @@ int embkfs_run_selfheal_selftests(void)
  * away block is HELD (not reclaimed) by both the txn_end hold-back AND a
  * full bitmap rebuild (the same computation a remount performs), proving
  * the allocator-side half of this phase, not just the registry bookkeeping. */
-int embkfs_run_snapshot_selftests(void)
+static int embkfs_run_snapshot_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6756,7 +6838,7 @@ int embkfs_run_snapshot_selftests(void)
  * On a volume WITHOUT the feature bit this test SKIPS rather than fails: the
  * old behaviour is correct for the old format, and reporting a legacy volume
  * as broken would be a lie in the other direction. */
-int embkfs_run_snapreg_selftests(void)
+static int embkfs_run_snapreg_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6886,7 +6968,7 @@ int embkfs_run_snapreg_selftests(void)
  * generalizes trivially to whichever process is really calling; a
  * dedicated cross-process check belongs in a scheduler/process-level
  * test, not here. */
-int embkfs_run_provenance_selftests(void)
+static int embkfs_run_provenance_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6941,7 +7023,7 @@ int embkfs_run_provenance_selftests(void)
  * merely "some error". Restores the original superblock bytes afterward
  * either way, so this never leaves the live volume's on-disk state
  * altered. */
-int embkfs_run_verifyboot_selftests(void)
+static int embkfs_run_verifyboot_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -7026,7 +7108,7 @@ int embkfs_run_verifyboot_selftests(void)
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
-int embkfs_run_namespace_selftests(void)
+static int embkfs_run_namespace_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -7679,3 +7761,147 @@ int embkfs_run_boot_diagnostics(void)
     embkfs_path_norm_smoke(vol);
     return EMBK_OK;
 }
+
+
+/* ---- Locked public entry points -------------------------------------------
+ * Each of these is reachable DIRECTLY from the kernel console, bypassing the
+ * VFS bridge that used to be the only place the big lock was taken. Taking it
+ * here is what closes that gap. The lock is recursive by owner thread, so an
+ * _impl that calls another public entry point underneath costs a depth++ and
+ * nothing else. */
+int embkfs_run_path_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_path_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_allocator_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_allocator_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_tree_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_tree_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_object_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_object_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_shrink_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_shrink_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_timestamp_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_timestamp_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_multivol_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_multivol_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_compress_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_compress_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_selfheal_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_selfheal_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_snapshot_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_snapshot_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_snapreg_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_snapreg_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_provenance_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_provenance_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_verifyboot_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_verifyboot_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_namespace_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_namespace_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_create_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_delete_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_rollback_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+

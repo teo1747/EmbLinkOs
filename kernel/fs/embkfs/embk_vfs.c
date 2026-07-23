@@ -13,66 +13,19 @@
 #include "include/errno.h"
 #include "process/process.h"   /* sched_lock/sched_block_current_locked/wait_queue */
 
-/* --------------------------------------------------------------------------
- * THE EMBKFS BIG LOCK. embkfs.c is full of shared `static uint8_t buf[4096]`
- * node/probe buffers ("kernel stack is tiny") -- fine when every caller was
- * the single kernel console, an SMP data race the moment two cores descend
- * the tree at once. It stayed LATENT while the boot image was a single-leaf
- * tree (racing descents read the SAME block into the shared buffer --
- * identical bytes, invisible); the first 2-leaf image made concurrent
- * descents read DIFFERENT blocks, and the Merkle check caught core B
- * validating core A's just-loaded leaf as the root (observed live:
- * `run /term.elf` racing home's clockw spawn -- "block 17 checksum
- * 0xF7E73490 != parent's 0x6D1CCFF1", where F7E73490 was leaf 19's csum).
+/* THE EMBKFS BIG LOCK now lives in embkfs.c, with the state it protects (the
+ * shared static scratch buffers and the per-volume read cache) -- see the long
+ * comment there for why it exists, why it is a sleeping lock, and why it is
+ * recursive by owner thread. It moved out of this file so the kernel console's
+ * DIRECT embkfs_* calls (`snap`, `test embkfs ...`) could be covered too;
+ * while it was a static here, those went around it.
  *
- * Fix: serialize EVERY embkfs entry through this ONE sleeping mutex, taken
- * here at the VFS boundary (the single choke point all userspace + the ELF
- * loader flow through). A SLEEPING lock, not a spinlock: these ops block on
- * disk I/O; waiters are ordinary schedulable threads on a wait queue.
- * Coarse by design -- correctness first; per-volume/per-path locking is a
- * later optimization. NEVER call fs_lock() with g_sched_lock held. (The
- * kernel console's direct embkfs_* calls -- snap, test embkfs -- bypass
- * this; they predate SMP userspace. Documented, not fixed.)
- * -------------------------------------------------------------------------- */
-static int g_fs_busy = 0;
-static struct thread *g_fs_owner = 0;   /* valid only while busy */
-static int g_fs_depth = 0;
-static struct wait_queue g_fs_wq;       /* zero-init = empty */
-
-/* RECURSIVE by owner thread, deliberately: vfs_ls's readdir CALLBACK stats
- * each entry (the boot dump's size column), so stat legitimately nests
- * inside a locked readdir -- a non-recursive lock self-deadlocked the boot
- * at `ls /:` on the very first locked build. Owner identity is
- * current_thread; the only NULL-current context that runs fs code is the
- * single pre-adoption boot CPU, so NULL==NULL can't alias two threads. */
-static void fs_lock(void)
-{
-    sched_lock();
-    if (g_fs_busy && g_fs_owner == current_thread) {
-        g_fs_depth++;
-        sched_unlock();
-        return;
-    }
-    while (g_fs_busy) {
-        sched_block_current_locked(&g_fs_wq);   /* returns UNLOCKED */
-        sched_lock();
-    }
-    g_fs_busy = 1;
-    g_fs_owner = current_thread;
-    g_fs_depth = 1;
-    sched_unlock();
-}
-
-static void fs_unlock(void)
-{
-    sched_lock();
-    if (--g_fs_depth == 0) {
-        g_fs_busy = 0;
-        g_fs_owner = 0;
-        wait_queue_wake_one(&g_fs_wq);
-    }
-    sched_unlock();
-}
+ * These wrappers stay because the bridge still wants an explicit locked region
+ * per VFS op: the public API each one calls takes the lock again underneath
+ * (recursion makes that free), but several ops call more than one API function
+ * and must not let another core interleave BETWEEN them. */
+static inline void fs_lock(void)   { embkfs_lock(); }
+static inline void fs_unlock(void) { embkfs_unlock(); }
 
 /* The fs_data stashed in a mount for an EMBKFS volume IS the embkfs_volume*
  * the kernel already mounted. This makes the cast explicit and named. */
