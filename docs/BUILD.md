@@ -133,18 +133,36 @@ the tree: `__thread` (no PT_TLS via tcc link), C++, and the kernel
 they do not shrink the claim: THE SYSTEM CAN REBUILD THE SYSTEM'S OWN
 PROGRAMS.
 
-**Amended 2026-07-23.** This list used to include `libembk.so` apps —
-"the dynamic path is gcc-shaped." That is no longer true: `test tcc dyn`
-compiles and dynamically links an EmUI widget on-OS and the kernel runs
-it (PORTS.md § "The GUI wall"). Two honest qualifications, so the
-correction does not overshoot:
+**Amended 2026-07-23 — the GUI left this list, in two steps.** It used to
+read "`libembk.so` apps (the dynamic path is gcc-shaped)". First `test
+tcc dyn` showed the *toolchain* could do it (PORTS.md § "The GUI wall").
+That alone did not earn the amendment: a capability nothing exercises is
+not a rebuild claim, so the exclusion stood on a missing manifest rather
+than a missing compiler — a weaker reason, and worth saying out loud
+rather than quietly deleting the line.
 
-  - the capability is the **toolchain's**; no EmbBuild manifest builds a
-    GUI app yet, and until one does and is verified, "EmbBuild rebuilds
-    the GUI" is unproven, not merely unwritten;
-  - a GUI manifest needs the dynamic link line (`-rdynamic`, the `.so`
-    before `-lc`, `emlink_dynstubs.o`, `libtcc1.o`), which is a stanza
-    shape v1 has never executed.
+`/data/src/ui/build.ebm` (authored as `user/bin/clockw.build.ebm`) is
+that manifest, and **`test embbuild gui`** is the proof: EmbBuild
+compiles and dynamically links the clock widget on-OS, the staged ELF is
+`ET_EXEC phnum=5` (the direct readout that the dynamic path was taken —
+static gets 2), the kernel binds it to `libembk.so`, the compositor
+windows it, it renders, a rerun reports `0 ran, 3 up_to_date`, and the
+adopted binary at `/data/apps/clockw/clockw.elf` runs too.
+
+The stanza shape is what was new, and §2's grammar took it unchanged —
+no `-static`, `-rdynamic`, the `.so` named as a link input before `-lc`,
+`emlink_dynstubs.o`, `libtcc1.o`. That the manifest format needed no
+extension for a link line this different is the strongest evidence so
+far that "recipes are argv arrays" was the right primitive.
+
+**One honest wrinkle, recorded because it is the format's real cost.**
+The first draft of that manifest listed eight header inputs; the
+transitive `#include` closure is twelve. It would have built correctly
+and gone silently stale on a `backend.h` edit — §2.4's "explicit first"
+is only true if the explicit list is *right*, and a hand-written list
+scales badly exactly where it matters. The list is now derived by
+walking the include graph. This is the concrete argument for
+auto-depfiles (§2.4's deferred item), and it is no longer hypothetical.
 
 ## 7. Where make lives
 

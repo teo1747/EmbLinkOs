@@ -422,6 +422,7 @@ static void selftests_print_commands(void)
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
     kprintf("  test embbuild shell\n");
+    kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -2131,6 +2132,123 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("\n[cmd] test embbuild shell: %s\n",
                 ok ? "OK -- the shell that runs is a shell the OS built" : "FAIL");
+        return 1;
+    }
+
+/* EMBBUILD'S FIRST GUI TARGET (docs/BUILD.md §6).
+ *
+ * Everything before this rebuilt STATIC C. The GUI was excluded twice over:
+ * first because tcc could not link a libembk.so app at all, then -- once
+ * `test tcc dyn` removed that -- because no manifest named one. This closes
+ * the second gap, and it is the difference between "the toolchain could" and
+ * "the OS does".
+ *
+ * Why it is a separate test from `test tcc dyn`: that one drives tcc DIRECTLY
+ * with a hand-written argv. This one goes through the build tool, which means
+ * the dynamic link line has to survive being written down as a manifest
+ * stanza -- a shape v1 had never executed (no -static, -rdynamic, the .so as
+ * a link input before -lc, emlink_dynstubs.o, libtcc1.o).
+ *
+ *   (1) the manifest builds: 3 ran, 0 up_to_date
+ *   (2) SHAPE: the staged ELF is ET_EXEC with phnum>2 -- the direct readout
+ *       that the DYNAMIC path was taken (a static link gets 2). Asserting
+ *       this before running it means a static-shaped binary fails HERE, with
+ *       a number, rather than mysteriously later.
+ *   (3) it RUNS: the kernel binds it to libembk.so, the compositor gives it
+ *       a window, the widget stays alive. Rendering is the actual claim.
+ *   (4) IDEMPOTENCE: a second run says 0 ran -- the content stamps are honest
+ *       about a GUI target too, not just static C.
+ *   (5) the ADOPTED binary at /data/apps/clockw/clockw.elf (written by the
+ *       manifest's own install stanza) runs as well. */
+    if (strcmp(cmd, "test embbuild gui") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild gui: VFS not registered\n"); return 1; }
+        static char cap[4096];
+        int ok = 1, rc;
+        char *bb  = "/data/apps/embbuild/embbuild.elf";
+        char *st  = "/data/build/out/clockw/clockw.elf";
+        char *ins = "/data/apps/clockw/clockw.elf";
+        char *env[] = { "HOME=/", NULL };
+
+        /* Start from a clean slate: a leftover output would let a no-op run
+         * look like a successful build (CONTRIBUTING lie #1). */
+        (void)vfs_unlink_path("/data/build/stamps/clockw/clockw.o");
+        (void)vfs_unlink_path("/data/build/stamps/clockw/clockw.elf");
+        (void)vfs_unlink_path("/data/build/stamps/clockw/install");
+        (void)vfs_unlink_path(st);
+
+        kprintf("[embbuild-gui] (1) building the clock widget from /data/src/ui\n");
+        char *m[] = { bb, "/data/src/ui/build.ebm", NULL };
+        rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        if (rc != 0 || !emb_find(cap, "3 ran, 0 up_to_date")) {
+            kprintf("[embbuild-gui] (1) FAIL rc=%d\n", rc); ok = 0;
+        }
+
+        /* (2) the shape -- the whole point of the target */
+        if (ok) {
+            unsigned char hdr[64] = {0};
+            struct vfs_stat s;
+            int have = (vfs_stat(st, &s) == 0);
+            if (have) {
+                int fd = vfs_open(st, O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+            }
+            int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[16] == 2;
+            unsigned phnum = have ? (unsigned)(hdr[56] | (hdr[57] << 8)) : 0;
+            kprintf("[embbuild-gui] (2) staged: %llu bytes, ET_EXEC=%d phnum=%u (2=static, >2=dynamic)\n",
+                    have ? (unsigned long long)s.size : 0ULL, is_exec, phnum);
+            if (!is_exec || phnum < 3) { kprintf("[embbuild-gui] (2) FAIL: not the dynamic shape\n"); ok = 0; }
+        }
+
+        /* (3) it runs -- the kernel binds it, the compositor windows it */
+        if (ok) {
+            char *aw[] = { st, NULL };
+            int wp = process_create_env(st, aw, 1, env, NULL, 0);
+            kprintf("[embbuild-gui] (3) spawn EmbBuild-built widget -> pid=%d\n", wp);
+            if (wp < 0) ok = 0;
+            else {
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {   /* ~2 guest-s */
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)wp);
+                kprintf("[embbuild-gui] (3) widget alive: %s\n",
+                        alive ? "YES (loaded + rendering)" : "no (exited/crashed)");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)wp);
+                process_wait((uint32_t)wp);
+            }
+        }
+
+        /* (4) the stamps are honest about a GUI target too */
+        if (ok) {
+            rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+            kprintf("[embbuild-gui] (4) rerun (want 0 ran) rc=%d\n", rc);
+            if (rc != 0 || !emb_find(cap, "0 ran, 3 up_to_date")) {
+                kprintf("[embbuild-gui] (4) FAIL: stamps disagree\n"); ok = 0;
+            }
+        }
+
+        /* (5) the adopted binary is a working widget */
+        if (ok) {
+            char *ai[] = { ins, NULL };
+            int ip = process_create_env(ins, ai, 1, env, NULL, 0);
+            kprintf("[embbuild-gui] (5) spawn ADOPTED %s -> pid=%d\n", ins, ip);
+            if (ip < 0) ok = 0;
+            else {
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)ip);
+                kprintf("[embbuild-gui] (5) adopted widget alive: %s\n", alive ? "YES" : "no");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)ip);
+                process_wait((uint32_t)ip);
+            }
+        }
+
+        kprintf("\n[cmd] test embbuild gui: %s\n",
+                ok ? "OK -- the OS built its own GUI app, and it renders" : "FAIL");
         return 1;
     }
 

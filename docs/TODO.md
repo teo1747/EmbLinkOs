@@ -724,7 +724,21 @@ compositor, and dynamic linking are all built and live-verified; what
 follows are known gaps and rough edges, not missing features. Since
 2026-07-23 the OS also **builds** EmUI apps on itself (`test tcc dyn`):
 tcc compiles and dynamically links against `libembk.so`, and the widget
-renders. See `docs/PORTS.md` § "The GUI wall, and how it came down".
+renders — and since the same day EmbBuild **builds** one from a manifest
+(`test embbuild gui`, `/data/src/ui/build.ebm`), so the rebuild-self claim
+covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
+how it came down" and BUILD.md §6.
+
+- [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
+  and the rest of `user/bin/*.c` are still host-built only. This is now
+  breadth, not capability — each needs the same three-stanza shape plus its
+  own header closure.
+- [ ] **Header inputs in manifests are hand-written and can go silently
+  stale.** The clockw manifest's first draft listed 8 of its 12 transitive
+  headers; it would have built fine and skipped rebuilds on a `backend.h`
+  edit. Auto-depfiles (BUILD.md §2.4's deferred item) are the fix; until
+  then, derive the list from the include graph rather than from the top of
+  the .c file.
 
 - [ ] **Dynamic linker: eager relocation only, no lazy PLT binding.** Every
   `R_X86_64_JUMP_SLOT` is resolved at load time in

@@ -932,17 +932,30 @@ What's left:
    the shell plus the sval-family tools — *not* the GUI. So this is
    "rebuilds its own **static-C** userland."
 
-   **Updated 2026-07-23 — the capability half of that boundary moved.**
-   This entry used to say TCC "cannot produce" `libembk.so` apps. It can:
-   `test tcc dyn` compiles an EmUI widget on-OS, dynamically links it
-   against `libembk.so`, and the kernel loads and renders it (PORTS.md
-   § "The GUI wall, and how it came down"). What that closed was a
-   *toolchain* gap; what it did **not** close is the rebuild-self claim
-   for the GUI, because no EmbBuild manifest builds a GUI app yet. Until
-   one does and is verified live, the accurate sentence stays "rebuilds
-   its own static-C userland" — the remaining work is now breadth
-   (a manifest with the dynamic link stanza), not capability. TLS and
-   C++ are still genuine TCC limits, and the kernel still wants GCC.
+   **Updated 2026-07-23 — the GUI came inside, and "static-C" can go.**
+   This entry used to say TCC "cannot produce" `libembk.so` apps, which
+   made "static-C userland" the honest ceiling. Both halves have now
+   moved, in order, and the order is the point:
+
+   1. **The capability.** `test tcc dyn` — tcc compiles an EmUI widget
+      on-OS, dynamically links it against `libembk.so`, and the kernel
+      loads and renders it (PORTS.md § "The GUI wall, and how it came
+      down"). The blocker turned out to be a **kernel** bug of ours, not
+      a tcc limit.
+   2. **The rebuild claim.** A capability nothing exercises is not a
+      rebuild claim, so this stayed pending a manifest.
+      **`test embbuild gui`** supplies it: EmbBuild builds the clock
+      widget from `/data/src/ui/build.ebm`, the staged ELF is `ET_EXEC
+      phnum=5` (dynamic, not static), it renders, the rerun says `0 ran,
+      3 up_to_date`, and the adopted `/data/apps/clockw/clockw.elf`
+      runs.
+
+   So the accurate sentence is now **"the OS rebuilds its own userland —
+   the shell and the GUI included"**, and what remains is genuinely
+   breadth: one widget has a manifest, the other EmUI apps do not.
+   Still real limits, unchanged: `__thread`/TLS (no PT_TLS via the tcc
+   link), C++, and the kernel (wants GCC — its driver fork/execs
+   `cc1`/`as`/`ld`, which this OS structurally cannot do).
    The original entry, for the record:
 
    **embbuild** — the make-equivalent, the last named item between

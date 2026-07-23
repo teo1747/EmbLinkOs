@@ -780,6 +780,13 @@ def discover_userland_objects(build_dir="build"):
     ck = _read_file("user/bin/clockw.c")
     if ck is not None:
         objects.append((b"data/src/ui/clockw.c", L.DT_REG, L.S_IFREG | L.PERM_FILE, ck))
+    # ...and the MANIFEST that builds it: EmbBuild's first GUI target. Until
+    # this shipped, "the OS rebuilds its userland" excluded the GUI -- first
+    # because tcc could not link a libembk.so app at all, then, once it could,
+    # because no manifest named one. `test embbuild gui` is the proof.
+    ckm = _read_file("user/bin/clockw.build.ebm")
+    if ckm is not None:
+        objects.append((b"data/src/ui/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ckm))
 
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the

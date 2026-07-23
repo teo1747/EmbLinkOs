@@ -15,7 +15,7 @@ disagreement with tcc — see the section below.
 | C++ / libstdc++ | runs | `test cxx` → 13/13 | — |
 | CPython 3.14 | runs | `test python` → "hello from CPython on EmbLink" | `-cpu max` |
 | git 2.49 | runs | `test git repo` → a real root commit | `-cpu max` |
-| **TCC 0.9.27** | **runs; builds the OS's own tools *and* its GUI apps** | **`test tcc real` → `exit=42` + byte-exact stdio; `test tcc dyn` → a tcc-built EmUI widget renders a frame** | — |
+| **TCC 0.9.27** | **runs; builds the OS's own tools *and* its GUI apps** | **`test tcc real` → `exit=42` + byte-exact stdio; `test tcc dyn` + `test embbuild gui` → an EmUI widget the OS built itself renders a frame** | — |
 
 `-cpu max` is not a QEMU nicety: `getentropy()` here is RDRAND-backed and
 **refuses to fabricate entropy**, returning `ENOSYS` on a CPU without it. Both
@@ -250,6 +250,16 @@ Three things had to be true at once, and only one of them was tcc's fault:
    inside `libembk.so` at `DYLIB_VA_BASE`), and a weak reference to a genuinely
    absent symbol failed the load instead of binding to 0 — which is what weak
    *means*.
+
+**And then the build tool learned the shape.** `test tcc dyn` drives tcc
+directly, with a hand-written argv — which proves the *toolchain* can do it and
+nothing more. `test embbuild gui` closes the remaining distance: EmbBuild
+builds the same widget from `/data/src/ui/build.ebm`, and the dynamic link line
+survives being written down as a manifest stanza (BUILD.md §6). The staged ELF
+comes out `ET_EXEC phnum=5`, the kernel binds it, it renders, the rerun reports
+`0 ran, 3 up_to_date`, and the adopted binary runs. Note that EmbBuild's
+grammar needed **no extension** for a link line this different from the static
+ones — the evidence that "recipes are argv arrays" was the right primitive.
 
 **The method is worth more than the fix.** The failing artifact was reproduced
 **on the host** by building a host-native tcc from the same patched source

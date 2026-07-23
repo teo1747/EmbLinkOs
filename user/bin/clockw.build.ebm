@@ -1,0 +1,61 @@
+# /data/src/ui/build.ebm -- EmbBuild's FIRST GUI target (docs/BUILD.md §6).
+#
+# Everything before this manifest rebuilt STATIC C: the shell, the sval tools,
+# EmbBuild itself. The GUI was excluded, and until 2026-07-23 the exclusion was
+# a capability -- tcc could not produce a libembk.so-linked app at all. `test
+# tcc dyn` removed that (PORTS.md, "The GUI wall"), which left the claim
+# resting on nothing but a missing manifest. This is the missing manifest.
+#
+# It mirrors `test tcc dyn`'s proven argvs, retargeted at staging (§3): objects
+# and the linked ELF land in /data/build/out/clockw/, and only the install
+# stanza touches the mutable app dir. Nothing here crosses the /system seal.
+#
+# WHAT MAKES THIS STANZA SHAPE DIFFERENT, and why v1 had never run one:
+#   - no -static. The app must come out ET_EXEC WITH a PT_DYNAMIC (phnum 5,
+#     not 2) so the in-kernel loader binds it to libembk.so. There is no
+#     ld.so here; the kernel is the linker.
+#   - -rdynamic re-exports the app's own static newlib, because libembk.so's
+#     libc imports (vsnprintf, cosf, ...) can only resolve back into the app.
+#     newlib is non-PIC, so it cannot live in the .so.
+#   - /system/lib/libembk.so is named as a LINK INPUT and must precede -lc, so
+#     tcc pulls in the libc members the .so needs (tcc patch 0004).
+#   - emlink_dynstubs.o supplies crt0's weak bracket symbols as weak absolute
+#     0. tcc reads no linker script, so newlib.ld's PROVIDE()s do not exist
+#     here and the brackets would otherwise become unresolvable imports.
+#   - libtcc1.o supplies the float/64-bit intrinsics tcc's codegen EMITS but
+#     gcc inlines -- so they are absent from x86_64 libgcc.
+# Drop any one of those five and the link still "succeeds"; the failure shows
+# up at load, or at a wild address. That is why they are spelled out.
+#
+# Header inputs are listed BY HAND, and TRANSITIVELY (§2.4: explicit first;
+# auto-depfiles are compression, earned later). clockw.c names only four
+# headers; the closure through them is eleven. em.h pulls ui.h + theme.h, ui.h
+# pulls instance.h, instance.h pulls scene.h/layout.h/scope.h, and the backend
+# trio + signal.h come in behind those. Editing ANY of them must rebuild this
+# app, and with a hand-written list that is true only if the list is right --
+# so it was derived by walking the #include graph, not by reading the top of
+# clockw.c. (The first draft of this manifest listed eight and would have gone
+# quietly stale on a backend.h edit. That is the cost §2.4 is buying down, and
+# the reason auto-depfiles are on the roadmap.)
+
+project: clockw
+
+name: clockw.o
+kind: compile
+inputs: /data/src/ui/clockw.c /data/src/ui/dsl/em.h /data/src/ui/declare/ui.h /data/src/ui/declare/instance.h /data/src/ui/scene/scene.h /data/src/ui/layout/layout.h /data/src/ui/reactive/scope.h /data/src/ui/reactive/signal.h /data/src/ui/theme/theme.h /data/src/ui/backend/backend.h /data/src/ui/backend/font.h /data/src/ui/backend/render_target.h /system/abi/include/embk.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/ui/scene -I/data/src/ui/backend -I/data/src/ui/layout -I/data/src/ui/reactive -I/data/src/ui/declare -I/data/src/ui/theme -I/data/src/ui/kit -I/data/src/ui/dsl -I/system/abi/include /data/src/ui/clockw.c -o /data/build/out/clockw/clockw.o
+output: /data/build/out/clockw/clockw.o
+
+name: clockw.elf
+kind: link
+inputs: /data/build/out/clockw/clockw.o /system/lib/libembk.so /system/abi/emlink_dynstubs.o /system/abi/libtcc1.o
+args: /data/apps/tcc/tcc.elf -nostdlib -rdynamic /system/abi/crt0.o /system/abi/syscalls.o /data/build/out/clockw/clockw.o /system/lib/libembk.so /system/abi/emlink_dynstubs.o -L/system/abi -lc -lm /system/abi/libtcc1.o -o /data/build/out/clockw/clockw.elf
+output: /data/build/out/clockw/clockw.elf
+
+# Adoption, same shape as the shell target: the app dir is mutable, so the
+# TCC-built widget replaces the GCC-built one. The RUNNING widget is untouched
+# -- its ELF was fully loaded at spawn -- so this takes effect at next launch.
+name: install
+kind: install
+inputs: /data/build/out/clockw/clockw.elf
+output: /data/apps/clockw/clockw.elf
