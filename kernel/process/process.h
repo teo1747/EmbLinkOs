@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "include/types.h"
+#include "process/capabilities.h"   /* per-process capability set */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "fs/fd.h"
@@ -314,6 +315,14 @@ struct process {
                                 * compare parent->pid == parent_pid too, not
                                 * just "parent is a non-free slot". */
 
+    /* Coarse resource-class capability set (see capabilities.h). Seeded to
+     * EMBK_CAP_ALL for init (spawned by the kernel, the root of authority) and
+     * for kernel threads; a child's set is `embk_caps_attenuate`d from its
+     * parent's at spawn, so it is always a subset of the parent's. This is the
+     * grantor set EMBX §6 step 9 checks a binary's declaration against; nothing
+     * gates a syscall on it yet. */
+    uint64_t cap_set;
+
     /* Intrusive list of this process's OWN currently-live (non-zombie)
      * children, head = child_list, linked through each child's child_next.
      * Not consulted by exit/reap/wait at all today -- populated purely so
@@ -474,6 +483,30 @@ int process_create(const char *path, char *const argv[], int argc,
 int process_create_env(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count);
+
+/**
+ * @brief Spawn WITH an explicit capability request — the attenuating spawn.
+ *
+ * process_create_env() is this with requested_caps == EMBK_CAP_INHERIT (the
+ * child gets the parent's whole set). Pass a real subset to attenuate: the
+ * child is born holding exactly `requested_caps`, PROVIDED that set is a subset
+ * of the spawning process's own (embk_caps_attenuate). A request for any
+ * capability the parent does not hold is refused with -EMBK_EPERM before the
+ * child's address space is created — the kernel side of EMBX §6 step 9. This is
+ * the primitive the eventual spawn syscall and EMBX loader call; today only
+ * the kernel (and `test caps`) do.
+ */
+int process_create_caps(const char *path, char *const argv[], int argc,
+                        char *const envp[],
+                        const struct spawn_file_action *actions, int n_count,
+                        uint64_t requested_caps);
+
+/** Capability set of the CURRENTLY running process (the grantor at a spawn),
+ *  or EMBK_CAP_ALL in a kernel context with no current process. */
+uint64_t process_current_caps(void);
+
+/** Capability set of the process with `pid`, or 0 if no such live process. */
+uint64_t process_caps_by_pid(uint32_t pid);
 
 /**
  * @brief Switch to the next ready thread in the scheduler.

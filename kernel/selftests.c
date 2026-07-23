@@ -379,6 +379,7 @@ static void selftests_print_commands(void)
     kprintf("  test blockrace\n");
     kprintf("  test usercopy\n");
     kprintf("  test pmm\n");
+    kprintf("  test caps\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -618,6 +619,106 @@ int selftests_handle_command(const char *cmd)
  * This reports BITS PER ALLOCATION, which is the whole claim in one number:
  * near 1 means the search is O(1) amortised; large means it is still walking.
  * Re-run after touching pmm_alloc_page. */
+/* PER-PROCESS CAPABILITIES: seed at init, attenuate at spawn, and the
+ * invariant that makes both worth having (EMBX_Specification_v2 §5.2).
+ *
+ * Two halves, the way everything in this tree is tested: the POLICY is a pure
+ * function (embk_caps_attenuate) exhausted directly, and the PLUMBING gets one
+ * integration create to prove a real child is born holding exactly its granted
+ * set. Splitting them means the invariant is checked without depending on
+ * scheduling, and the wire-up is checked without re-deriving the invariant. */
+    if (strcmp(cmd, "test caps") == 0) {
+        int ok = 1;
+        uint64_t out;
+
+        #define CAP(id) EMBK_CAP_BIT(id)
+        #define WANT(expr, msg) do { if (!(expr)) { \
+            kprintf("[caps] FAIL: %s\n", (msg)); ok = 0; } } while (0)
+
+        /* --- the invariant, exhausted on the pure function --- */
+
+        /* a subset request from a full-authority grantor: granted verbatim */
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, CAP(EMBK_CAP_FILESYSTEM), &out) == 0
+             && out == CAP(EMBK_CAP_FILESYSTEM),
+             "ALL grantor should grant {FS} exactly");
+
+        /* INHERIT resolves to the grantor's whole set, unchanged */
+        WANT(embk_caps_attenuate(CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_GPU),
+                                 EMBK_CAP_INHERIT, &out) == 0
+             && out == (CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_GPU)),
+             "INHERIT should copy the grantor set");
+
+        /* THE REFUSAL: asking for a capability the grantor does not hold */
+        WANT(embk_caps_attenuate(CAP(EMBK_CAP_FILESYSTEM),
+                                 CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_NETWORK),
+                                 &out) != 0,
+             "{FS} grantor must REFUSE a request for {FS,NET}");
+
+        /* a capless grantor can grant nothing but the empty set */
+        WANT(embk_caps_attenuate(0, CAP(EMBK_CAP_FILESYSTEM), &out) != 0,
+             "empty grantor must refuse any nonzero request");
+        WANT(embk_caps_attenuate(0, 0, &out) == 0 && out == 0,
+             "empty grantor may grant the empty set");
+
+        /* MONOTONICITY down a two-level tree: a set can only ever SHRINK.
+         * init(ALL) -> shell{FS,NET} -> child. The child asking for NET is
+         * fine (subset); asking for GPU -- which the shell never had -- is
+         * refused, EVEN THOUGH init did have it. That is the whole property:
+         * you cannot regain below what a parent dropped above. */
+        uint64_t shell;
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL,
+                                 CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_NETWORK),
+                                 &shell) == 0, "init should grant the shell {FS,NET}");
+        WANT(embk_caps_attenuate(shell, CAP(EMBK_CAP_NETWORK), &out) == 0
+             && out == CAP(EMBK_CAP_NETWORK),
+             "shell{FS,NET} should grant a child {NET}");
+        WANT(embk_caps_attenuate(shell, CAP(EMBK_CAP_GPU), &out) != 0,
+             "shell{FS,NET} must REFUSE {GPU} though init held it -- monotonicity");
+
+        /* EMBK_CAP_ALL really is bits 1..9 and nothing else (no bit 0, no id>9) */
+        WANT((EMBK_CAP_ALL & 1ULL) == 0, "cap_id 0 must never be in ALL");
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, EMBK_CAP_BIT(10), &out) != 0,
+             "an unknown cap id (>MAX) is not in ALL, so it is refused");
+
+        /* --- integration: a real child is born with exactly its grant --- */
+
+        /* Kernel context here holds full authority, so it can grant {FS}. Spawn
+         * a trivial program with ONLY {FILESYSTEM}; it need not even run for the
+         * check -- we inspect the born process's set. hello.elf exits promptly
+         * so the slot reaps itself. */
+        if (ok && g_vfs_ready) {
+            const char *hp = "/data/apps/hello/hello.elf";
+            struct vfs_stat st;
+            if (vfs_stat(hp, &st) == 0) {
+                char *a[] = { (char *)hp, NULL };
+                char *env[] = { (char *)"HOME=/", NULL };
+                int pid = process_create_caps(hp, a, 1, env, NULL, 0,
+                                              CAP(EMBK_CAP_FILESYSTEM));
+                if (pid < 0) {
+                    kprintf("[caps] FAIL: attenuated spawn returned %d\n", pid); ok = 0;
+                } else {
+                    uint64_t born = process_caps_by_pid((uint32_t)pid);
+                    kprintf("[caps] child pid %d born with cap_set 0x%llx (want 0x%llx)\n",
+                            pid, (unsigned long long)born,
+                            (unsigned long long)CAP(EMBK_CAP_FILESYSTEM));
+                    if (born != CAP(EMBK_CAP_FILESYSTEM)) {
+                        kprintf("[caps] FAIL: child did not receive exactly {FS}\n"); ok = 0;
+                    }
+                    process_wait((uint32_t)pid);   /* let it run + reap */
+                }
+            } else {
+                kprintf("[caps] (skipped integration: %s not on image)\n", hp);
+            }
+        }
+
+        #undef CAP
+        #undef WANT
+        kprintf("\n[cmd] test caps: %s\n",
+                ok ? "OK -- seeded at init, attenuated at spawn, monotonic down the tree"
+                   : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test pmm") == 0) {
         #define PMM_N 2048
         static uint64_t pages[PMM_N];

@@ -120,6 +120,10 @@ static struct process *process_alloc(void) {
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
+            /* Default to kernel authority. Overwritten by process_create_caps
+             * for user processes (attenuated from the parent); left as-is for
+             * kernel threads, which ARE the kernel and hold the full set. */
+            process_table[i].cap_set = EMBK_CAP_ALL;
             /* -1, not the zeroed-by-memset 0: 0 is a VALID cpu_table[]
              * index (the BSP) -- meaningless until live_thread_count hits
              * 0 for the first time (see the field's comment), but starting
@@ -425,6 +429,24 @@ int process_alive(uint32_t pid) {
     int alive = (p != NULL && p->live_thread_count > 0);
     spin_unlock(&g_sched_lock);
     return alive;
+}
+
+/* The grantor set at a spawn: the current process's capabilities, or full
+ * kernel authority when there is no current process (the boot CPU creating
+ * init). The EMBX loader will read this as "what may I grant this binary". */
+uint64_t process_current_caps(void) {
+    return current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+}
+
+/* Capabilities of `pid`, or 0 (no authority) if there is no such live slot.
+ * Reads under g_sched_lock like process_alive, since the table is shared. */
+uint64_t process_caps_by_pid(uint32_t pid) {
+    if (pid == 0) return 0;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    uint64_t caps = p ? p->cap_set : 0;
+    spin_unlock(&g_sched_lock);
+    return caps;
 }
 
 /* Is `p->parent` still genuinely alive, i.e. still the SAME process that
@@ -1049,10 +1071,23 @@ int process_create(const char *path, char *const argv[], int argc,
     return process_create_env(path, argv, argc, NULL, actions, n_count);
 }
 
-/* Create a new process from an ELF executable */
+/* Inherit the parent's whole capability set (no attenuation) -- the default
+ * every existing spawn site gets. Attenuating spawns call process_create_caps
+ * directly with a subset. */
 int process_create_env(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count) {
+    return process_create_caps(path, argv, argc, envp, actions, n_count,
+                               EMBK_CAP_INHERIT);
+}
+
+/* Create a new process from an ELF executable, WITH an explicit capability
+ * request. process_create_env() below is the requested_caps == EMBK_CAP_INHERIT
+ * wrapper. */
+int process_create_caps(const char *path, char *const argv[], int argc,
+                       char *const envp[],
+                       const struct spawn_file_action *actions, int n_count,
+                       uint64_t requested_caps) {
     /* Count + budget-check envp BEFORE any allocation, so an over-budget request
      * costs nothing and, more importantly, is REJECTED rather than truncated:
      * a child silently missing half its environment is a bug that surfaces far
@@ -1079,6 +1114,23 @@ int process_create_env(const char *path, char *const argv[], int argc,
      * pid to 0; they don't need to touch parent/parent_pid). */
     proc->parent = current_thread ? current_process : NULL;
     proc->parent_pid = current_thread ? current_process->pid : 0;
+
+    /* Attenuate from the parent (EMBX §6 step 9, kernel side). The grantor is
+     * the spawning process; with no current process this is the kernel creating
+     * init, which holds EMBK_CAP_ALL. A request for anything the parent does not
+     * hold is refused HERE -- before the address space exists and before we are
+     * on the parent's child_list -- so the failure path is just "release the
+     * slot", identical to the ENOMEM path below. */
+    {
+        uint64_t parent_caps = current_thread ? current_process->cap_set
+                                              : EMBK_CAP_ALL;
+        uint64_t granted;
+        if (embk_caps_attenuate(parent_caps, requested_caps, &granted) != 0) {
+            proc->pid = 0;                 /* undo process_alloc()'s reservation */
+            return -EMBK_EPERM;            /* asked for a capability not held */
+        }
+        proc->cap_set = granted;
+    }
     proc->zombie_next = NULL;
     proc->zombie_head = NULL;
     proc->child_list = NULL;
