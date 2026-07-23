@@ -66,6 +66,16 @@ else
     echo "  PATCH    0003-static-link-relocate-got"
     patch -p1 -d "$TCC_SRC" < "$HERE/0003-static-link-relocate-got.patch"
 fi
+# 0004: a shared lib's undefined libc symbols must be pulled INTO the dynamic
+# app (no runtime libc.so here; newlib is static). Without it EmUI apps built
+# on-OS ship without vsnprintf/cosf/... and the in-kernel loader can't resolve
+# them for libembk.so. Found making the toolchain build GUI apps on-OS.
+if grep -q 'patch 0004' "$TCC_SRC/tccelf.c"; then
+    echo "  patch    0004 already applied"
+else
+    echo "  PATCH    0004-dynexe-pull-shared-lib-libc-imports"
+    patch -p1 -d "$TCC_SRC" < "$HERE/0004-dynexe-pull-shared-lib-libc-imports.patch"
+fi
 
 # --- configure ---------------------------------------------------------------
 # Each flag is decided by an EmbLink FACT; see docs/BUILD_SETUP.md for the why:

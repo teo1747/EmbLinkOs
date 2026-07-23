@@ -71,6 +71,15 @@ struct elf64_rela { uint64_t r_offset; uint64_t r_info; int64_t r_addend; } __at
 #define R_X86_64_RELATIVE  8
 
 #define SHN_UNDEF 0
+#define SHN_ABS   0xfff1        /* st_value is an absolute value, NOT a VA */
+
+/* st_info packs bind in the high nibble. STB_WEAK matters to the loader: an
+ * UNDEFINED weak symbol is not an error -- it binds to 0 by definition, and
+ * code that references one is required to test it before use. */
+#define ELF64_ST_BIND(i) ((uint8_t)((i) >> 4))
+#define STB_GLOBAL 1
+#define STB_WEAK   2
+
 #define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
 #define ELF64_R_TYPE(i) ((uint32_t)((i) & 0xffffffffULL))
 

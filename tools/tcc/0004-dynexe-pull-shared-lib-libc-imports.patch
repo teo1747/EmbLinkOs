@@ -1,0 +1,42 @@
+Subject: [PATCH 4/4] dynamic exe: pull a shared lib's undefined libc symbols in
+
+On a normal Linux target a shared library's undefined symbols (libembk.so
+imports memcpy/vsnprintf/cosf/...) resolve at runtime from libc.so.6. EmbLink
+has no runtime libc.so -- newlib is static inside every executable -- so those
+symbols must be pulled INTO the app from a following archive (-lc/-lm) and
+exported (-rdynamic), which is exactly what GNU ld does with
+`libembk.so -lc --export-dynamic`.
+
+Upstream tcc records the .so's undefined symbols only in dynsymtab and later
+just warns ("undefined dynamic symbol vsnprintf"), so the produced app ships
+WITHOUT those functions and the in-kernel dynamic loader fails to resolve them
+for libembk.so (ENOEXEC). Promote each of the .so's undefined non-local
+symbols into symtab_section so the subsequent archive scan satisfies it.
+
+Gated on -rdynamic: that flag is precisely the "provide-and-export for the .so"
+model this OS uses for every dynamic app, so ordinary (non-rdynamic) links are
+untouched. Found while making the on-OS toolchain build EmUI apps (the GUI wall).
+---
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -2790,6 +2790,20 @@
+         name = (char *) dynstr + sym->st_name;
+         set_elf_sym(s1->dynsymtab_section, sym->st_value, sym->st_size,
+                     sym->st_info, sym->st_other, sym->st_shndx, name);
++        /* EmbLink patch 0004: this OS has no runtime libc.so -- newlib is
++           STATIC inside every app, so a shared lib's undefined libc symbol
++           must be PULLED INTO the app from a following archive (-lc/-lm) and
++           exported (-rdynamic), exactly as GNU ld does. Upstream tcc records
++           the .so's UNDEF only in dynsymtab and later just warns, so the app
++           ships without vsnprintf/cosf/... and the in-kernel loader cannot
++           resolve them for libembk.so. Promote the .so's UNDEF into
++           symtab_section so the following archive scan satisfies it. Gated on
++           -rdynamic (the provide-and-export-for-the-.so model), leaving
++           ordinary links untouched. */
++        if (s1->rdynamic && sym->st_shndx == SHN_UNDEF)
++            set_elf_sym(symtab_section, 0, 0,
++                        ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
++                        SHN_UNDEF, name);
+     }
+ 
+     /* load all referenced DLLs */

@@ -69,6 +69,7 @@ NOW_NS = int(time.time() * 1_000_000_000)
 # Empty (env unset -> no libc.a packed) is honest: tcc can still compile (-c),
 # it just cannot link, which is exactly the truth of that image.
 NEWLIB_LIBC = os.environ.get("EMBK_NEWLIB_LIBC", "")
+NEWLIB_LIBM = os.environ.get("EMBK_NEWLIB_LIBM", "")   # libm.a: cosf/sinf for EmUI apps
 
 # The HEADER trees tcc searches ON the OS (same Makefile-owns-the-path rule as
 # NEWLIB_LIBC above):
@@ -743,6 +744,22 @@ def discover_userland_objects(build_dir="build"):
     if libc is not None:
         objects.append((b"system/abi/libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
 
+    # DYNAMIC-LINK ABI (so on-OS tcc can build EmUI apps against libembk.so):
+    #   libm.a   -- cosf/sinf and friends that libembk.so imports and that -lm
+    #               must pull into the app (Makefile-derived, like libc.a)
+    #   libtcc1.o -- the float/64-bit intrinsics tcc emits but x86_64 libgcc
+    #               lacks (gcc inlines them); cross-built as build/libtcc1.o
+    #   emlink_dynstubs.o -- crt0's weak bracket symbols as weak-abs-0, the
+    #               tcc-world equivalent of newlib.ld's PROVIDE()s
+    libm = _read_file(NEWLIB_LIBM) if NEWLIB_LIBM else None
+    if libm is not None:
+        objects.append((b"system/abi/libm.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libm))
+    for host, name in (("build/libtcc1.o", b"system/abi/libtcc1.o"),
+                       ("build/emlink_dynstubs.o", b"system/abi/emlink_dynstubs.o")):
+        blob = _read_file(host)
+        if blob is not None:
+            objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
     # THE HEADERS (the other half of "targeting EmbLinkOS"): newlib's include
     # tree under /system/abi/include (declaring the libc is part of the sealed
     # ABI contract, next to the objects that implement it), and tcc's own
@@ -754,6 +771,15 @@ def discover_userland_objects(build_dir="build"):
     # header-free toys. ~140 files, ~1.1 MB.
     objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
     objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+
+    # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
+    # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
+    # wall" coming down. The ui/ tree ships to /data/src/ui/ preserving its subdir
+    # shape (the app's -I set mirrors it); clockw.c beside it.
+    objects.extend(_tree_objects("ui", b"data/src/ui/", ".h"))
+    ck = _read_file("user/bin/clockw.c")
+    if ck is not None:
+        objects.append((b"data/src/ui/clockw.c", L.DT_REG, L.S_IFREG | L.PERM_FILE, ck))
 
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the

@@ -417,6 +417,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc compile\n");
     kprintf("  test tcc link\n");
     kprintf("  test tcc real\n");
+    kprintf("  test tcc dyn\n");
     kprintf("  test tcc tally\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
@@ -1779,6 +1780,97 @@ int selftests_handle_command(const char *cmd)
         #undef IFCHK
         kprintf("\n[cmd] test writestorm: %s (%d/200, %d IF leak(s))\n",
                 (i == 200 && if_leaks == 0) ? "OK" : "FAIL", i, if_leaks);
+        return 1;
+    }
+
+/* THE GUI WALL COMES DOWN: on-OS tcc COMPILES + DYNAMIC-LINKS a real EmUI app
+ * (clockw) against /system/lib/libembk.so, and the kernel LOADS + RUNS it.
+ *
+ * Static C was already self-hostable; the block was that TCC could not produce
+ * the dynamic ET_EXEC the in-kernel loader binds to libembk.so. Four things
+ * make it work now (all cross-shipped to /system/abi, all proven on the host
+ * first): tcc patch 0004 (pull the .so's undefined libc symbols INTO the app so
+ * -lc/-lm satisfy them and -rdynamic exports them back -- no runtime libc.so
+ * here), libtcc1.o (the float intrinsics tcc emits but x86_64 libgcc lacks),
+ * emlink_dynstubs.o (crt0's weak bracket symbols as weak-abs-0 -- newlib.ld's
+ * PROVIDE()s, which tcc has no linker script for), and libm.a (cosf/sinf).
+ *
+ * Proof: the produced clockw2.elf is ET_EXEC with PT_DYNAMIC, and it SPAWNS and
+ * stays alive as a widget (home spawns the gcc-built clockw the identical way).
+ * The whole point is the dynamic load succeeding on a tcc-built binary. */
+    if (strcmp(cmd, "test tcc dyn") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc dyn: VFS not registered\n"); return 1; }
+        char *env[] = { "HOME=/", NULL };
+        int ok = 1;
+        (void)vfs_unlink_path("/data/tmp/clockw2.o");
+        (void)vfs_unlink_path("/data/apps/clockw2/clockw2.elf");
+        (void)vfs_mkdir_path("/data/apps/clockw2");
+
+        /* (1) compile: tcc -c against the on-image ui headers + newlib */
+        char *ac[] = { "/data/apps/tcc/tcc.elf", "-c",
+                       "-I/data/src/ui/scene", "-I/data/src/ui/backend",
+                       "-I/data/src/ui/layout", "-I/data/src/ui/reactive",
+                       "-I/data/src/ui/declare", "-I/data/src/ui/theme",
+                       "-I/data/src/ui/kit", "-I/data/src/ui/dsl",
+                       "-I/system/abi/include",
+                       "/data/src/ui/clockw.c", "-o", "/data/tmp/clockw2.o" };
+        int p = process_create_env("/data/apps/tcc/tcc.elf", ac, 14, env, NULL, 0);
+        int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+        kprintf("[tcc dyn] compile exit=%d\n", c);
+        if (p < 0 || c != 0) ok = 0;
+
+        /* (2) DYNAMIC LINK against libembk.so + the dynamic-link ABI. -rdynamic
+         * exports the app's newlib for the .so to bind back to; no -static. */
+        if (ok) {
+            char *al[] = { "/data/apps/tcc/tcc.elf", "-nostdlib", "-rdynamic",
+                           "/system/abi/crt0.o", "/system/abi/syscalls.o",
+                           "/data/tmp/clockw2.o", "/system/lib/libembk.so",
+                           "/system/abi/emlink_dynstubs.o", "-L/system/abi",
+                           "-lc", "-lm", "/system/abi/libtcc1.o",
+                           "-o", "/data/apps/clockw2/clockw2.elf" };
+            p = process_create_env("/data/apps/tcc/tcc.elf", al, 14, env, NULL, 0);
+            c = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[tcc dyn] link exit=%d\n", c);
+            if (p < 0 || c != 0) ok = 0;
+        }
+
+        /* (2b) the shape the loader requires: ET_EXEC + PT_DYNAMIC (phnum>2) */
+        if (ok) {
+            unsigned char hdr[64] = {0}; struct vfs_stat st;
+            int have = (vfs_stat("/data/apps/clockw2/clockw2.elf", &st) == 0);
+            if (have) { int fd = vfs_open("/data/apps/clockw2/clockw2.elf", O_RDONLY, 0);
+                        if (fd >= 0) { size_t r=0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); } }
+            int is_exec = have && hdr[0]==0x7f && hdr[1]=='E' && hdr[16]==2;
+            unsigned phnum = have ? (unsigned)(hdr[56] | (hdr[57]<<8)) : 0;
+            kprintf("[tcc dyn] clockw2.elf: %llu bytes, ET_EXEC=%d phnum=%u (dynamic>2)\n",
+                    have ? (unsigned long long)st.size : 0ULL, is_exec, phnum);
+            if (!is_exec || phnum < 3) ok = 0;
+        }
+
+        /* (3) THE LOAD: spawn the tcc-built dynamic app. The kernel loads it,
+         * binds it to libembk.so (two-way), and it runs as a widget. If the
+         * dynamic load failed it would return < 0 here, loudly on serial. */
+        if (ok) {
+            char *aw[] = { "/data/apps/clockw2/clockw2.elf", NULL };
+            int wp = process_create_env("/data/apps/clockw2/clockw2.elf", aw, 1, env, NULL, 0);
+            kprintf("[tcc dyn] spawn tcc-built widget -> pid=%d\n", wp);
+            if (wp < 0) ok = 0;
+            else {
+                /* let it run a few ticks; a widget stays alive rendering. */
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {   /* ~2 guest-s */
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)wp);
+                kprintf("[tcc dyn] widget alive after run: %s\n", alive ? "YES (loaded + running)" : "no (exited/crashed)");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)wp);
+                process_wait((uint32_t)wp);
+            }
+        }
+
+        kprintf("\n[cmd] test tcc dyn: %s\n",
+                ok ? "OK -- the OS compiled, linked, and RAN a GUI app" : "FAIL");
         return 1;
     }
 

@@ -183,11 +183,22 @@ static int parse_dynamic(const uint8_t *image, const struct elf64_phdr *ph, uint
 
 /* Resolve a DEFINED global symbol by name across the modules (skipping
  * `skip` if non-NULL -- an R_X86_64_COPY source must come from ANOTHER
- * module, never the requester's own dynsym). Fills *def_mod/*def_sym when
- * provided. Returns the symbol's actual VA, or 0 if unresolved. */
-static uint64_t resolve_sym_ex(struct dynmod *mods, int nmods, const char *name,
-                               const struct dynmod *skip,
-                               struct dynmod **def_mod, const struct elf64_sym **def_sym)
+ * module, never the requester's own dynsym). Fills def_mod/def_sym when
+ * provided.
+ *
+ * Returns TRUE/FALSE for "was it found", and writes the value through
+ * *val_out. It does NOT return the value, because a symbol's legitimate value
+ * can be 0 and a returned 0 cannot be told apart from "not found" -- which is
+ * precisely the bug that made every tcc-built EmUI app fail to load: the six
+ * weak crt0 bracket symbols are defined SHN_ABS 0 by emlink_dynstubs.o, were
+ * FOUND here, and were then reported as UNRESOLVED by the caller.
+ *
+ * SHN_ABS is an absolute value, not an address: it must NOT be biased. For the
+ * ET_EXEC app (bias 0) that is invisible; for the .so (bias DYLIB_VA_BASE) it
+ * would turn a 0 into a wild pointer. */
+static bool resolve_sym_ex(struct dynmod *mods, int nmods, const char *name,
+                           const struct dynmod *skip, uint64_t *val_out,
+                           struct dynmod **def_mod, const struct elf64_sym **def_sym)
 {
     for (int k = 0; k < nmods; k++) {
         struct dynmod *m = &mods[k];
@@ -198,16 +209,19 @@ static uint64_t resolve_sym_ex(struct dynmod *mods, int nmods, const char *name,
             if (kstreq(m->strtab + s->st_name, name)) {
                 if (def_mod) *def_mod = m;
                 if (def_sym) *def_sym = s;
-                return m->bias + s->st_value;
+                if (val_out)
+                    *val_out = (s->st_shndx == SHN_ABS) ? s->st_value
+                                                        : m->bias + s->st_value;
+                return true;
             }
         }
     }
-    return 0;
+    return false;
 }
 
-static uint64_t resolve_sym(struct dynmod *mods, int nmods, const char *name)
+static bool resolve_sym(struct dynmod *mods, int nmods, const char *name, uint64_t *val_out)
 {
-    return resolve_sym_ex(mods, nmods, name, 0, 0, 0);
+    return resolve_sym_ex(mods, nmods, name, 0, val_out, 0, 0);
 }
 
 /* Write one 8-aligned qword into a loaded user page (via the kernel direct map,
@@ -267,7 +281,7 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
             const struct elf64_sym *own = &m->symtab[ELF64_R_SYM(r->r_info)];
             const char *name = m->strtab + own->st_name;
             struct dynmod *dm = 0; const struct elf64_sym *ds = 0;
-            if (!resolve_sym_ex(mods, nmods, name, m, &dm, &ds)) {
+            if (!resolve_sym_ex(mods, nmods, name, m, 0, &dm, &ds)) {
                 serial_write_string("ELF dynlink: COPY source not found: ");
                 serial_write_string(name);
                 serial_write_string("\n");
@@ -281,12 +295,19 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
                    type == R_X86_64_JUMP_SLOT) {
             const struct elf64_sym *s = &m->symtab[ELF64_R_SYM(r->r_info)];
             const char *name = m->strtab + s->st_name;
-            uint64_t symval = resolve_sym(mods, nmods, name);
-            if (!symval) {
-                serial_write_string("ELF dynlink: UNRESOLVED symbol '");
-                serial_write_string(name);
-                serial_write_string("'\n");
-                return -EMBK_ENOEXEC;
+            uint64_t symval = 0;
+            if (!resolve_sym(mods, nmods, name, &symval)) {
+                /* Genuinely absent. A WEAK reference to it is legal and binds
+                 * to 0 -- that is what weak MEANS, and the referring code is
+                 * required to test the symbol before using it. Only a STRONG
+                 * reference to a missing symbol is an error. */
+                if (ELF64_ST_BIND(s->st_info) != STB_WEAK) {
+                    serial_write_string("ELF dynlink: UNRESOLVED symbol '");
+                    serial_write_string(name);
+                    serial_write_string("'\n");
+                    return -EMBK_ENOEXEC;
+                }
+                symval = 0;
             }
             val = (type == R_X86_64_64) ? symval + (uint64_t)r->r_addend : symval;
         } else {
