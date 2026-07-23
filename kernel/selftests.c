@@ -382,6 +382,7 @@ static void selftests_print_commands(void)
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
+    kprintf("  test capgate\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -656,6 +657,45 @@ int selftests_handle_command(const char *cmd)
  * The refuse case is exercised by seeding a launcher with only {NET} and having
  * IT try to load the {FS}-declaring binary -- because the kernel console holds
  * full authority and could never show the denial itself. */
+/* RING 3: the capability actually GATES a resource. A GPU surface is the
+ * handle a UI process needs before it can draw; sys_surface_create now refuses
+ * it to a process that does not hold EMBK_CAP_GPU. That closes the loop the
+ * whole capability model was for: a declaration (ring 1/2) is not decorative --
+ * it decides what the process can obtain.
+ *
+ * capgpu asks for a surface and exits 2 if granted, 0 if refused. We spawn it
+ * twice with DIFFERENT seeds and check both: without GPU it must be refused,
+ * with GPU it must be granted. One direction alone proves nothing (a gate that
+ * always denies passes the first; one that never gates passes the second). */
+    if (strcmp(cmd, "test capgate") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
+        const char *gp = "/data/apps/capgpu/capgpu.elf";
+        struct vfs_stat st;
+        if (vfs_stat(gp, &st) != 0) { kprintf("\n[cmd] test capgate: %s not on image\n", gp); return 1; }
+        char *a[] = { (char *)gp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* (1) WITHOUT GPU: seed {FILESYSTEM} only -> surface refused -> exit 0 */
+        uint64_t no_gpu = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int p1 = process_create_caps(gp, a, 1, env, NULL, 0, no_gpu);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[capgate] no GPU cap:  capgpu exit=%d (0 = surface refused)\n", c1);
+        if (c1 != 0) { kprintf("[capgate] FAIL: a process WITHOUT GPU got a surface\n"); ok = 0; }
+
+        /* (2) WITH GPU: seed {FILESYSTEM,GPU} -> surface granted -> exit 2 */
+        uint64_t with_gpu = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_GPU);
+        int p2 = process_create_caps(gp, a, 1, env, NULL, 0, with_gpu);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[capgate] with GPU cap: capgpu exit=%d (2 = surface granted)\n", c2);
+        if (c2 != 2) { kprintf("[capgate] FAIL: a process WITH GPU was denied a surface\n"); ok = 0; }
+
+        kprintf("\n[cmd] test capgate: %s\n",
+                ok ? "OK -- the GPU surface handle is gated on EMBK_CAP_GPU, both ways"
+                   : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test embx") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test embx: VFS not registered\n"); return 1; }
         const char *xp = "/data/apps/capchildx/capchild.embx";

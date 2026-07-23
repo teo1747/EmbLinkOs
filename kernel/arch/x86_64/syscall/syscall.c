@@ -1015,6 +1015,20 @@ static int64_t sys_gettimeofday(struct regs *r) {
  * create; the caller for the rest. See surface.h and the design spec. */
 
 static int64_t sys_surface_create(struct regs *r) {
+    /* RING 3: the capability GATE on handle installation. A GPU surface is the
+     * handle a process needs before it can draw anything; withhold it from a
+     * process that does not hold EMBK_CAP_GPU and every downstream surface op
+     * has nothing to act on -- so the coarse capability gates WHICH handles get
+     * installed, and the existing object-handle model does the actual
+     * enforcement (this is the reconciliation in capabilities.h, made real).
+     *
+     * No app regresses: everything spawned today inherits EMBK_CAP_ALL from
+     * init, so it holds GPU. Only a process DELIBERATELY spawned without it --
+     * an EMBX binary that did not declare GPU, or a SET_CAPS-attenuated child --
+     * is refused, which is the whole point. */
+    if (!(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_GPU)))
+        return -EMBK_EPERM;
+
     uint32_t w = (uint32_t)r->rdi, h = (uint32_t)r->rsi;
     uint32_t fmt = (uint32_t)r->rdx, n = (uint32_t)r->r10;
     struct surface_info *user_out = (struct surface_info *)r->r8;
