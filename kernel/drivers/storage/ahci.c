@@ -475,7 +475,15 @@ void ahci_init(void) {
     // 1. Find the AHCI controller via PCI
     uint8_t bus, device, function;
     if (!find_ahci_controller(&bus, &device, &function)) {
-        kprintf("AHCI controller not found\n");
+        /* Not an error, and the old wording ("AHCI controller not found") read
+         * like one -- it sits directly under a banner, right after the ATA
+         * section that just succeeded, so it looks like the disk stack half
+         * failed. It is a PROBE RESULT: QEMU's default -drive if=ide gives a
+         * PIIX3 IDE controller (PCI class 1, subclass 1), and AHCI is subclass
+         * 6. There is simply no such device on this machine, the IDE driver
+         * already owns the disks, and boot continues normally. Say that. */
+        kprintf("AHCI: no controller on this machine (PCI class 1/6 absent) -- "
+                "normal when disks are IDE; ATA already owns them\n");
         return;
     }
     kprintf("AHCI: controller at PCI %x:%x.%x\n",
