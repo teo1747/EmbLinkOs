@@ -363,6 +363,18 @@ build/ioracer.o: user/bin/ioracer.c | $(BUILD)
 build/ioracer.elf: build/crt0.o build/syscalls.o build/ioracer.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/ioracer.o -lc -lgcc -o $@
 
+# capchild / capspawn -- the ring-1 capability-attenuation test pair. Static
+# newlib console programs (no UI). capspawn is spawned by `test spawncaps` with
+# a limited cap set and drives the rest across the spawn syscall.
+build/capchild.o: user/bin/capchild.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capchild.o -lc -lgcc -o $@
+build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capspawn.o -lc -lgcc -o $@
+
 # --- shell.elf: the EmbLink structured shell (shell/) --------------------------
 # Static newlib link (hello.elf's shape, not the EmUI dynamic one -- the shell
 # has no UI dependency). Kernel-convention includes: one -Ishell root,
@@ -518,7 +530,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/capchild.c user/bin/capspawn.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -675,6 +687,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
+               build/capchild.elf build/capspawn.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

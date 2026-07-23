@@ -672,11 +672,24 @@ static int64_t sys_spawn(struct regs *r) {
         envp_kernel[envc] = NULL;
     }
 
+    /* A SPAWN_ACTION_SET_CAPS action, if present, carries the child's requested
+     * capability set in `flags`. Absent => EMBK_CAP_INHERIT (the child gets the
+     * parent's whole set, the default every existing spawn already gets).
+     * process_create_caps enforces the request is a subset of THIS process's
+     * own set -- the userspace side of EMBX §6 step 9. */
+    uint64_t requested_caps = EMBK_CAP_INHERIT;
+    for (int i = 0; i < n_count; i++) {
+        if (actions_kernel[i].kind == SPAWN_ACTION_SET_CAPS) {
+            requested_caps = (uint64_t)(uint32_t)actions_kernel[i].flags;
+            break;
+        }
+    }
+
     /* user_envp==0 stays NULL, NOT an empty vector: "no environment" is the
      * default and a distinct, honest answer from "an empty environment". */
-    int pid = process_create_env(path, argv_kernel, argc,
+    int pid = process_create_caps(path, argv_kernel, argc,
                                  user_envp ? envp_kernel : NULL,
-                                 actions_kernel, n_count);
+                                 actions_kernel, n_count, requested_caps);
     /* Safe already: process_create_env() COPIES every string into the child's
      * own stack before returning -- that is its documented contract. */
     if (envp_buf) kfree(envp_buf);
@@ -1462,6 +1475,15 @@ static int64_t sys_tty_mode(struct regs *r) {
     return (uint64_t)old;
 }
 
+/* getcaps() -> this process's coarse resource-class capability set
+ * (capabilities.h). The introspection half of the capability model: a program
+ * can ask what it was granted rather than probe-by-failing. Also the witness
+ * `test spawncaps` uses to prove attenuation crossed the syscall boundary. */
+static int64_t sys_getcaps(struct regs *r) {
+    (void)r;
+    return (int64_t)process_current_caps();
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -1532,6 +1554,7 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_key_event_poll 65
 #define SYS_key_mods       66
 #define SYS_tty_mode       67
+#define SYS_getcaps        68
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1602,6 +1625,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_key_event_poll] = sys_key_event_poll,
     [SYS_key_mods]       = sys_key_mods,
     [SYS_tty_mode]       = sys_tty_mode,
+    [SYS_getcaps]        = sys_getcaps,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

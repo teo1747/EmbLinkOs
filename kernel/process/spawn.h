@@ -50,6 +50,14 @@
                                                // child receives it at its first free slot. The
                                                // bootstrap for two-process channel tests.
 #define SPAWN_ACTION_INSTALL_OBJ     4         // install a byte-stream obj-handle (a pipe end)
+#define SPAWN_ACTION_SET_CAPS        5         // attenuate the child's capability set: `flags`
+                                               // carries the requested cap bitmask (capabilities.h
+                                               // cap IDs). Enforced <= the spawning process's own
+                                               // set; absent => child INHERITs the parent's full
+                                               // set. Not a file action -- consumed by sys_spawn to
+                                               // pick the process_create_caps() request; the action
+                                               // processor skips it. Reuses `flags` so the ABI
+                                               // struct does not grow.
                                                // the PARENT holds as a plain FD in the child:
                                                // `src_obj_handle` names the parent's handle,
                                                // `target_fd` the child fd it lands on (0/1 for

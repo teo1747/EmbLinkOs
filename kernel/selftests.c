@@ -380,6 +380,7 @@ static void selftests_print_commands(void)
     kprintf("  test usercopy\n");
     kprintf("  test pmm\n");
     kprintf("  test caps\n");
+    kprintf("  test spawncaps\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -627,6 +628,50 @@ int selftests_handle_command(const char *cmd)
  * integration create to prove a real child is born holding exactly its granted
  * set. Splitting them means the invariant is checked without depending on
  * scheduling, and the wire-up is checked without re-deriving the invariant. */
+/* RING 1: capability attenuation ACROSS THE SPAWN SYSCALL.
+ *
+ * `test caps` proved the kernel mechanism; this proves a USERSPACE parent can
+ * attenuate a child through sys_spawn's SET_CAPS action, and -- the part that
+ * needs a limited parent -- that it cannot grant what it does not hold.
+ *
+ * The trick is the SEED: we spawn capspawn itself with only {FS,NET} (via the
+ * kernel-internal process_create_caps, which is allowed to attenuate from full
+ * kernel authority). capspawn then, holding {FS,NET}, drives the userspace
+ * spawns and self-checks -- exit 0 only if all four of its steps hold, or a
+ * distinct 11..14 naming which failed. So a single exit code carries the whole
+ * result across the boundary. */
+    if (strcmp(cmd, "test spawncaps") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test spawncaps: VFS not registered\n"); return 1; }
+        const char *sp = "/data/apps/capspawn/capspawn.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test spawncaps: %s not on image\n", sp); return 1; }
+
+        char *a[] = { (char *)sp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t seed = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        kprintf("[spawncaps] spawning capspawn with a LIMITED set {FS,NET} = 0x%llx\n",
+                (unsigned long long)seed);
+        int pid = process_create_caps(sp, a, 1, env, NULL, 0, seed);
+        if (pid < 0) { kprintf("[spawncaps] seed spawn failed: %s\n", embk_strerror(pid)); 
+                       kprintf("\n[cmd] test spawncaps: FAIL\n"); return 1; }
+        int code = process_wait((uint32_t)pid);
+
+        /* capspawn's exit code IS the verdict. 0 = every step passed; 11..14
+         * name the failing step (see capspawn.c). */
+        const char *why = "unknown";
+        switch (code) {
+            case 0:  why = "all four steps passed"; break;
+            case 11: why = "capspawn's OWN caps were not {FS,NET} (seed/getcaps broken)"; break;
+            case 12: why = "attenuating a child to {FS} did not yield {FS}"; break;
+            case 13: why = "granting the full {FS,NET} did not yield {FS,NET}"; break;
+            case 14: why = "requesting {GPU} it does NOT hold was NOT refused"; break;
+        }
+        kprintf("[spawncaps] capspawn exit=%d -> %s\n", code, why);
+        kprintf("\n[cmd] test spawncaps: %s\n", code == 0 ? "OK -- userspace attenuation enforced, "
+                "and a parent cannot grant what it lacks" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test caps") == 0) {
         int ok = 1;
         uint64_t out;

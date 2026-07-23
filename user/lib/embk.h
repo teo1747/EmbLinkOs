@@ -70,6 +70,21 @@
  * action-passing app rebuilt when they do). */
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
+#define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
+
+/* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
+ * A child's set is a subset of its parent's; declare a subset via a
+ * SET_CAPS spawn action, or read your own with embk_getcaps(). */
+#define EMBK_CAP_FILESYSTEM  1
+#define EMBK_CAP_NETWORK     2
+#define EMBK_CAP_GPU         3
+#define EMBK_CAP_AUDIO       4
+#define EMBK_CAP_CAMERA      5
+#define EMBK_CAP_USB         6
+#define EMBK_CAP_SERIAL      7
+#define EMBK_CAP_RAWDISK     8
+#define EMBK_CAP_KERNEL_EXT  9
+#define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
     int           target_fd;    /* fd this action populates in the child */
@@ -246,6 +261,21 @@ static inline int64_t embk_spawn_env(const char *path, char *const argv[],
 /* embk_spawn_env() with NO environment for the child. This is the plain spawn:
  * every existing caller keeps its exact behaviour, because "no environment" is
  * what they always got. */
+/* This process's own capability set (a bitmask of EMBK_CAP_BIT(id)). */
+static inline unsigned long embk_getcaps(void) {
+    return (unsigned long)embk_syscall0(EMBK_SYS_getcaps);
+}
+
+/* Fill `a` as a SET_CAPS action requesting `cap_mask` for the child. Add it to
+ * the actions array you pass to embk_spawn; the kernel enforces the mask is a
+ * subset of THIS process's caps and refuses (-EMBK_EPERM) otherwise. */
+static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
+                                        unsigned cap_mask) {
+    a->kind = EMBK_SPAWN_ACTION_SET_CAPS;
+    a->target_fd = 0; a->path[0] = 0; a->flags = (int)cap_mask;
+    a->mode = 0; a->src_obj_handle = 0;
+}
+
 static inline int64_t embk_spawn(const char *path, char *const argv[],
                                  const struct embk_spawn_file_action *actions,
                                  int n_actions) {

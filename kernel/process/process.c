@@ -1269,6 +1269,10 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                 proc->pid = 0;
                 return irc;
             }
+        } else if (act->kind == SPAWN_ACTION_SET_CAPS) {
+            /* Not a file action -- the capability request was already extracted
+             * by sys_spawn and applied via requested_caps at creation. Skip it
+             * here so it is neither an error nor double-handled. */
         } else {
             vmm_destroy_address_space(pml4);
             proc->pid = 0;
