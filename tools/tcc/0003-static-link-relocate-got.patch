@@ -1,0 +1,40 @@
+Subject: [PATCH 3/3] x86_64: relocate the GOT in static links
+
+The relocation walk explicitly skips s1->got -- correct for dynamic output,
+where the loader fills the GOT at load time, and fatal for -static, where
+nobody ever will: every slot stays zero. tcc itself emits R_X86_64_GOTPCREL
+data accesses (newlib's `stderr`/`errno` are _impure_ptr dereferences; even
+some file-static accesses go through the GOT), so any nontrivial static
+binary dereferences NULL on its first stdio or errno touch.
+
+Found by EmbLinkOS target #3 -- EmbBuild rebuilding EmbBuild: the TCC-built
+build tool crashed at CR2=0 in parse_manifest, writing its own stanza
+counter through an unfilled GOT slot. Smaller programs (tally, sysinfo)
+survived by luck: their only GOT slots sat in unvisited error paths.
+
+Sibling of patch 0001 (static PLT32->PC32): same disease, one table over.
+The fix is one condition -- the GOT's relocations (GLOB_DAT against symtab,
+already emitted by put_got_entry, already handled by the relocator) simply
+get applied when static_link is set.
+---
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -1850,8 +1850,16 @@
+         /* On X86 gdb 7.3 works in any case but gdb 6.6 will crash if SHF_ALLOC
+         checking is removed */
+ #else
+-        if (s->reloc && s != s1->got)
+-        /* On X86_64 gdb 7.3 will crash if SHF_ALLOC checking is present */
++        if (s->reloc && (s != s1->got || s1->static_link))
++        /* On X86_64 gdb 7.3 will crash if SHF_ALLOC checking is present.
++           EmbLink patch 0003 (sibling of 0001's PLT fix): in a STATIC link
++           there is no dynamic loader to fill the GOT, yet tcc emits
++           R_X86_64_GOTPCREL data accesses (e.g. every newlib `stderr` =
++           _impure_ptr deref) whose slots would stay ZERO -- a guaranteed
++           NULL dereference at the first errno/stdio touch. The GOT's own
++           relocs (GLOB_DAT against symtab) are already emitted by
++           put_got_entry and the relocator already handles them; the walk
++           just skipped the section. Relocate it when static. */
+ #endif
+             relocate_section(s1, s);
+     }

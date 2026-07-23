@@ -133,6 +133,8 @@ static inline int64_t embk_syscall3(int64_t n, int64_t a1, int64_t a2, int64_t a
     return ret;
 }
 
+#ifndef __TINYC__
+
 static inline int64_t embk_syscall4(int64_t n, int64_t a1, int64_t a2, int64_t a3,
                                      int64_t a4) {
     int64_t ret;
@@ -165,6 +167,47 @@ static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a
         : "rcx", "r11", "memory");
     return ret;
 }
+
+#else /* __TINYC__ ------------------------------------------------------------
+ * TCC is the ON-OS compiler, so this header being gcc-only was an ABI bug:
+ * tcc 0.9.27 does not honor `register ... asm("r10")` bindings -- it sees the
+ * plain "r" constraints and its allocator runs out at the sixth operand
+ * ("asm constraint 6 ('r') could not be satisfied", found by target #3,
+ * EmbBuild rebuilding EmbBuild). This branch uses ONLY letter-constrained
+ * operands (a/D/S/d/c -- all tcc supports) and passes the high arguments
+ * through MEMORY: rcx points at a small array and the template loads
+ * r10/r8/r9 itself before the int. rcx is trashed by the kernel path after
+ * use, which gcc's constraint rules would object to -- gcc never sees this
+ * branch. Loading zeros for unused high args is harmless: the kernel reads
+ * only the registers the syscall's arity names. */
+
+static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4, int64_t a5, int64_t a6) {
+    int64_t ret;
+    int64_t ex[3];
+    ex[0] = a4; ex[1] = a5; ex[2] = a6;
+    __asm__ volatile (
+        "mov 0(%5), %%r10\n\t"
+        "mov 8(%5), %%r8\n\t"
+        "mov 16(%5), %%r9\n\t"
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "c"(ex)
+        : "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static inline int64_t embk_syscall4(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4) {
+    return embk_syscall6(n, a1, a2, a3, a4, 0, 0);
+}
+
+static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4, int64_t a5) {
+    return embk_syscall6(n, a1, a2, a3, a4, a5, 0);
+}
+
+#endif /* __TINYC__ */
 
 /* The kernel returns a small negative value (-EMBK_*, all < 4096 in
  * magnitude) on failure and a normal value (fd, byte count, address, pid,

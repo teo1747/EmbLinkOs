@@ -1,0 +1,80 @@
+# /data/src/shell/build.ebm -- v2: THE SHELL REBUILDS THE SHELL (BUILD.md §3).
+# Eleven units, one link, and DELIBERATELY NO install stanza: shell.elf lives
+# in /system/bin, which is sealed -- EmbBuild stages, and ADOPTION is a
+# separate act (snapshot, copy, reboot) performed by the system, not by the
+# build tool. The staged artifact is verified runnable (-c oracles) before
+# anyone considers adopting it.
+
+project: shell
+
+name: main.o
+kind: compile
+inputs: /data/src/shell/main.c /data/src/shell/lex/lex.h /data/src/shell/parse/parse.h /data/src/shell/eval/eval.h /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h /data/src/shell/hist/hist.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell -I/system/abi/include /data/src/shell/main.c -o /data/build/out/shell/main.o
+output: /data/build/out/shell/main.o
+
+name: lex.o
+kind: compile
+inputs: /data/src/shell/lex/lex.c /data/src/shell/lex/lex.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/lex/lex.c -o /data/build/out/shell/lex.o
+output: /data/build/out/shell/lex.o
+
+name: parse.o
+kind: compile
+inputs: /data/src/shell/parse/parse.c /data/src/shell/parse/parse.h /data/src/shell/lex/lex.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/parse/parse.c -o /data/build/out/shell/parse.o
+output: /data/build/out/shell/parse.o
+
+name: eval.o
+kind: compile
+inputs: /data/src/shell/eval/eval.c /data/src/shell/eval/eval.h /data/src/shell/parse/parse.h /data/src/shell/lex/lex.h /data/src/shell/value/value.h /data/src/shell/builtins/builtins.h /data/src/shell/sval/sval.h /data/src/shell/wire/wire.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/eval/eval.c -o /data/build/out/shell/eval.o
+output: /data/build/out/shell/eval.o
+
+name: eval_extern.o
+kind: compile
+inputs: /data/src/shell/eval/eval_extern.c /data/src/shell/eval/eval.h /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell -I/system/abi/include /data/src/shell/eval/eval_extern.c -o /data/build/out/shell/eval_extern.o
+output: /data/build/out/shell/eval_extern.o
+
+name: builtins.o
+kind: compile
+inputs: /data/src/shell/builtins/builtins.c /data/src/shell/builtins/builtins.h /data/src/shell/value/value.h /data/src/shell/eval/eval.h /data/src/shell/sval/sval.h /data/src/shell/wire/wire.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/builtins/builtins.c -o /data/build/out/shell/builtins.o
+output: /data/build/out/shell/builtins.o
+
+name: builtins_os.o
+kind: compile
+inputs: /data/src/shell/builtins/builtins_os.c /data/src/shell/builtins/builtins.h /data/src/shell/value/value.h /data/src/shell/sval/sval.h /data/src/shell/wire/wire.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell -I/system/abi/include /data/src/shell/builtins/builtins_os.c -o /data/build/out/shell/builtins_os.o
+output: /data/build/out/shell/builtins_os.o
+
+name: hist.o
+kind: compile
+inputs: /data/src/shell/hist/hist.c /data/src/shell/hist/hist.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/hist/hist.c -o /data/build/out/shell/hist.o
+output: /data/build/out/shell/hist.o
+
+name: sval.o
+kind: compile
+inputs: /data/src/shell/sval/sval.c /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/sval/sval.c -o /data/build/out/shell/sval.o
+output: /data/build/out/shell/sval.o
+
+name: value.o
+kind: compile
+inputs: /data/src/shell/value/value.c /data/src/shell/value/value.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/value/value.c -o /data/build/out/shell/value.o
+output: /data/build/out/shell/value.o
+
+name: wire.o
+kind: compile
+inputs: /data/src/shell/wire/wire.c /data/src/shell/wire/wire.h /data/src/shell/value/value.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/wire/wire.c -o /data/build/out/shell/wire.o
+output: /data/build/out/shell/wire.o
+
+name: shell.elf
+kind: link
+inputs: /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o
+args: /data/apps/tcc/tcc.elf -static -nostdlib /system/abi/crt0.o /system/abi/syscalls.o /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o -lc -o /data/build/out/shell/shell.elf
+output: /data/build/out/shell/shell.elf

@@ -763,14 +763,49 @@ def discover_userland_objects(build_dir="build"):
     # and installs over /data/apps/tally/tally.elf: the first component of the
     # system rebuilt by the system. An explicit list, not a tree walk -- the
     # closure is the point (7 files, ~1400 lines), not the whole shell/.
-    _TALLY_SRC = ("tools/tally.c", "sval/sval.c", "sval/sval.h",
+    # v2 (BUILD.md §3): the FULL shell closure -- every unit shell.elf links,
+    # so the shell can rebuild the shell. Still an explicit list, not a tree
+    # walk: tools/ and test/ stay off the image (host tests don't belong on
+    # the OS), and the list IS the claim of what the rebuild needs.
+    _SHELL_SRC = ("main.c",
+                  "lex/lex.c", "lex/lex.h",
+                  "parse/parse.c", "parse/parse.h",
+                  "eval/eval.c", "eval/eval_extern.c", "eval/eval.h",
+                  "builtins/builtins.c", "builtins/builtins_os.c",
+                  "builtins/builtins.h",
+                  "hist/hist.c", "hist/hist.h",
+                  "tools/tally.c",
+                  "sval/sval.c", "sval/sval.h",
                   "value/value.c", "value/value.h",
-                  "wire/wire.c", "wire/wire.h")
-    for rel in _TALLY_SRC:
+                  "wire/wire.c", "wire/wire.h",
+                  "build.ebm")
+    for rel in _SHELL_SRC:
         blob = _read_file(f"shell/{rel}")
         if blob is not None:
             objects.append((b"data/src/shell/" + rel.encode(),
                             L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
+    # EmbBuild's world (docs/BUILD.md): the tally PROJECT (its source + the
+    # first manifest) at /data/src/tally/, and EmbBuild's own source at
+    # /data/src/embbuild/ -- the precondition for target #3, `embbuild
+    # embbuild`. tally.c appears in BOTH /data/src/shell (the test tcc tally
+    # closure, unchanged) and /data/src/tally (the manifest's project) -- a
+    # 2 KB duplication kept so the existing green test stays untouched;
+    # collapse when embbuild subsumes the hand-rolled test.
+    for host, image in (("shell/tools/tally.c",            b"data/src/tally/tally.c"),
+                        ("shell/tools/tally.build.ebm",    b"data/src/tally/build.ebm"),
+                        ("shell/tools/sysinfo.c",          b"data/src/sysinfo/sysinfo.c"),
+                        ("shell/tools/sysinfo.build.ebm",  b"data/src/sysinfo/build.ebm"),
+                        ("shell/tools/embbuild.c",         b"data/src/embbuild/embbuild.c"),
+                        ("shell/tools/embbuild.build.ebm", b"data/src/embbuild/build.ebm"),
+                        # embk.h + embk_syscall.h: the ABI's userspace surface
+                        # -- sysinfo.c and embbuild.c #include them, so
+                        # declaring the ABI joins the ABI (BUILD.md's rule).
+                        ("user/lib/embk.h",                b"system/abi/include/embk.h"),
+                        ("user/lib/embk_syscall.h",        b"system/abi/include/embk_syscall.h")):
+        blob = _read_file(host)
+        if blob is not None:
+            objects.append((image, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
     # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
     # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the
