@@ -586,6 +586,19 @@ int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 void embkfs_lock(void);
 void embkfs_unlock(void);
 
+/* How hard is that one lock actually being leaned on? Answering this is the
+ * prerequisite for making it finer-grained: per-volume or per-object locking
+ * means first un-sharing 34 static scratch buffers in embkfs.c, and that is
+ * only worth doing if something is genuinely waiting. */
+struct embkfs_lockstat {
+    uint64_t acquires;   /* top-level acquisitions (recursion excluded) */
+    uint64_t recursive;  /* re-entries by the owner: free, no waiting    */
+    uint64_t waits;      /* acquisitions that had to BLOCK               */
+    uint64_t wait_us;    /* wall microseconds spent blocked              */
+};
+void embkfs_lockstat_get(struct embkfs_lockstat *out);
+void embkfs_lockstat_reset(void);
+
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
  * EMBKFS volume (or its superblock is corrupt). */

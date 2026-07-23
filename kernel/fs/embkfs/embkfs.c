@@ -6,6 +6,7 @@
 #include "include/errno.h"
 #include "include/kstring.h"   /* memcmp, strlen */
 #include "drivers/timer/rtc.h"       /* rtc_now_ns — real inode timestamps (v2.2) */
+#include "drivers/timer/hpet.h"       /* fs-lock contention timing */
 #include "drivers/timer/pit.h"       /* pit_delay_ms — selftest RTC-resolution wait */
 #include "fs/embkfs/embkfs_compress.h"         /* per-extent compression (v2.2 Phase 3) */
 #include "crypto/xts.h"        /* AES-256-XTS (v2.2 Phase 4) */
@@ -64,17 +65,53 @@ static struct thread *g_fs_owner = 0;   /* valid only while busy */
 static int g_fs_depth = 0;
 static struct wait_queue g_fs_wq;       /* zero-init = empty */
 
+/* Contention instrumentation. The obvious next move on this lock is to make it
+ * finer-grained (per-volume, or per-object), and that is a large change: 34
+ * shared `static` scratch buffers in this file would have to become per-caller
+ * first, because THEY are what the lock is really protecting. Before paying
+ * that, measure whether anything is actually waiting -- the same rule the I/O
+ * path rebuild was held to. `waits` counts acquisitions that had to block;
+ * `wait_us` is the wall time they spent blocked. */
+static struct embkfs_lockstat g_lockstat;
+
+/* Same shape as block.c's blk_now_us: the HPET is the only wall clock here,
+ * and a machine without one just reports 0 rather than a fabricated number. */
+static uint64_t fs_now_us(void)
+{
+    if (!hpet_available()) return 0;
+    uint64_t pf = hpet_period_fs();
+    if (!pf) return 0;
+    uint64_t tpus = 1000000000ULL / pf;
+    if (tpus == 0) tpus = 1;
+    return hpet_read_counter() / tpus;
+}
+
+void embkfs_lockstat_get(struct embkfs_lockstat *out) { if (out) *out = g_lockstat; }
+void embkfs_lockstat_reset(void)
+{
+    g_lockstat.acquires = 0; g_lockstat.recursive = 0;
+    g_lockstat.waits = 0; g_lockstat.wait_us = 0;
+}
+
 void embkfs_lock(void)
 {
     sched_lock();
     if (g_fs_busy && g_fs_owner == current_thread) {
         g_fs_depth++;
+        g_lockstat.recursive++;
         sched_unlock();
         return;
     }
+    g_lockstat.acquires++;
+    bool waited = g_fs_busy;
+    uint64_t t0 = waited ? fs_now_us() : 0;
     while (g_fs_busy) {
         sched_block_current_locked(&g_fs_wq);   /* returns UNLOCKED */
         sched_lock();
+    }
+    if (waited) {
+        g_lockstat.waits++;
+        g_lockstat.wait_us += fs_now_us() - t0;
     }
     g_fs_busy = 1;
     g_fs_owner = current_thread;

@@ -818,11 +818,32 @@ how it came down" and BUILD.md §6.
     every public entry point takes it. The bridge delegates. Recursion by
     owner thread is what makes that compose (a selftest holding the lock can
     still call the public API underneath it).
-  - [ ] Still coarse: ONE lock for the whole filesystem, not per-volume or
-    per-path. Correctness first; nothing has yet asked for the concurrency.
-    Two known consequences, both latency not correctness: `test embkfs
-    timestamps` holds it across a ~2s RTC-resolution wait, and any long
-    selftest blocks unrelated fs I/O for its duration.
+  - [ ] Still coarse: ONE lock for the whole filesystem. **Measured before
+    deciding what to do about it** (`test blockrace` reports it; counters live
+    in `struct embkfs_lockstat`). Under 4 concurrent readers:
+
+        fs big lock: 860 acquire(s), 0 recursive, 65 waited (7%), 31464 ms blocked
+
+    **~484 ms blocked per wait** (guest time — TCG inflates it, but the ratio
+    and the per-wait magnitude are the signal). So the contention is real, not
+    theoretical. Two conclusions, both of which change what "fix it" means:
+    - **Per-VOLUME locking is worthless here.** One EMBKFS volume carries all
+      traffic (`/`; `/run` is epfs, a different filesystem). Splitting the lock
+      per volume splits nothing. This was the obvious-sounding fix and the
+      measurement killed it.
+    - **The cost is HOLD TIME, not granularity.** ~484 ms per wait is the
+      duration of another reader's *whole-object* load — EMBKFS pulls an entire
+      object into `rcache` inside one locked region. A waiter blocks for all of
+      it. Shortening the critical section is therefore a bigger and much
+      cheaper win than subdividing the lock.
+    - Prerequisite for per-OBJECT locking, if it is ever wanted: **34 shared
+      `static uint8_t [4096]` scratch buffers in embkfs.c** would have to
+      become per-caller first — *they* are what the lock actually protects
+      (see the big-lock comment). That is the real price, and it should not be
+      paid until shortening the hold time has been tried.
+    - Also latency, not correctness: `test embkfs timestamps` holds the lock
+      across a ~2s RTC-resolution wait, and any long selftest blocks unrelated
+      fs I/O for its duration.
   - ⚠️ **The rule that keeps it safe:** never hold this lock across a wait on
     *another thread* doing fs I/O (spawn-and-wait, say) — the child's ops take
     the same lock from a different thread and would block on a holder that is

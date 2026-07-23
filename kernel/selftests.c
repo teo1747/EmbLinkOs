@@ -578,7 +578,9 @@ int selftests_handle_command(const char *cmd)
         int ok = 1, mismatch = 0;
 
         struct embk_blkstat b0, b1;
+        struct embkfs_lockstat l0, l1;
         embk_blkstat_get(&b0);
+        embkfs_lockstat_get(&l0);
 
         /* Spawn ALL of them before waiting on any. Waiting between spawns
          * would serialise them in the TEST, which would hide whether the
@@ -605,6 +607,7 @@ int selftests_handle_command(const char *cmd)
         }
 
         embk_blkstat_get(&b1);
+        embkfs_lockstat_get(&l1);
         uint64_t breads = b1.bounce_reads - b0.bounce_reads;
         uint64_t bcont  = b1.bounce_contended - b0.bounce_contended;
         kprintf("[blockrace] bounce path: %llu read(s), %llu contended\n",
@@ -638,6 +641,29 @@ int selftests_handle_command(const char *cmd)
         kprintf("[blockrace] (%llu device bounce reads for ~3 MB logical -- the rest was\n"
                 "            served by EMBKFS's object cache, never reaching block.c)\n",
                 (unsigned long long)breads);
+
+        /* The EMBKFS big lock, measured under the only genuinely concurrent fs
+         * load in the tree. This is the number that decides whether
+         * finer-grained (per-volume / per-object) locking is worth the 34
+         * shared scratch buffers that would have to be un-shared first. A high
+         * wait time says the coarse lock is costing real throughput; a low one
+         * says leave it alone and spend the effort elsewhere. Measured before
+         * optimised, the same rule the I/O-path rebuild was held to. */
+        {
+            uint64_t acq = l1.acquires - l0.acquires;
+            uint64_t rec = l1.recursive - l0.recursive;
+            uint64_t wts = l1.waits - l0.waits;
+            uint64_t wus = l1.wait_us - l0.wait_us;
+            kprintf("[blockrace] fs big lock: %llu acquire(s), %llu recursive, "
+                    "%llu waited (%llu%%), %llu ms blocked\n",
+                    (unsigned long long)acq, (unsigned long long)rec,
+                    (unsigned long long)wts,
+                    (unsigned long long)(acq ? (wts * 100) / acq : 0),
+                    (unsigned long long)(wus / 1000));
+            kprintf("[blockrace]   (this is the number that decides whether per-volume /\n"
+                    "               per-object fs locking is worth un-sharing 34 static\n"
+                    "               scratch buffers in embkfs.c -- measure, then decide)\n");
+        }
 
         kprintf("\n[cmd] test blockrace: %s\n",
                 ok ? "OK -- 4 concurrent readers, every byte its own"
