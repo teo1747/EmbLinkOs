@@ -227,8 +227,14 @@ left to do.
 ### Timer / Time
 - [x] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
   both discovered via ACPI.
-- [ ] Tick handler only does counter++ — eventually: preemption check +
-  scheduler invocation (once there are processes).
+- [x] ~~Tick handler only does counter++ — eventually: preemption check +
+  scheduler invocation~~ — **preemption is live**, it just is not in the handler
+  this entry was looking at. `timer.c`'s PIT handler (IRQ 0) really does only
+  `ticks++`, and correctly: it is the legacy wall clock. The scheduler runs off
+  the **LAPIC timer** — `lapic_timer_handler()` EOIs, re-arms the one-shot
+  TSC-deadline, then calls `schedule()`, on **every core's own tick**. Only the
+  BSP advances the shared tick counter, deliberately, so it stays a wall clock
+  rather than becoming a sum over online cores.
 
 ---
 
@@ -279,7 +285,9 @@ left to do.
     now lives in partition.c.
     Verified against `sfdisk` as an independent oracle (`make part_gpt.img`):
     3/3 partitions, start+length exact.
-    - [ ] Backup header (last LBA) not tried when the primary's CRC fails —
+    - [ ] *(verified still open — `partition.c:225` returns 0 with the comment
+  "the backup header at the last LBA could be tried; not yet")* Backup header
+  (last LBA) not tried when the primary's CRC fails —
       we refuse rather than recover. The recovery is the point of the backup.
     - [ ] Entry-array CRC (`partition_entry_array_crc32`) not checked; only the
       header's.
@@ -294,8 +302,9 @@ left to do.
     Verified against `sfdisk` (`make part_ext.img`): sda1/5/6/7 exact.
     🪤 Names went TWO-digit: logicals start at 5 and GPT allows 128, so the old
     single digit made `sda12` collide with `sda2` — two devices, one name.
-  - [ ] Scan must run after `sti` (ATA read path is IRQ-driven). Placed in
-    main.c right before block enumeration / mount probe for that reason.
+  - [x] ~~Scan must run after `sti` (ATA read path is IRQ-driven)~~ — done, and
+    the entry already described the fix: it sits in `main.c` immediately before
+    block enumeration / mount probe precisely so interrupts are on by then.
 - [x] ~~Block-layer reads/writes on IDE secondary channel hang~~ — done
   (EMBKFS v2 Phase 21), see the ATA/DMA entry above. Disks on the
   secondary channel (3rd/4th drive) now work; FAT32's test disk staying
@@ -359,14 +368,33 @@ left to do.
 
 ## PCI
 
-- [ ] BARs parsed but not stored in the pci_device struct — only printed.
+- [~] BARs are not cached in `struct pci_device`, but "only printed" is wrong:
+  `pci_read_bar()` reads and **sizes** any BAR on demand and returns a typed
+  `struct pci_bar` (address, size, MMIO-vs-IO, 64-bit, prefetchable, valid),
+  and every driver that needs one calls it (ATA's BAR4, xHCI, virtio-gpu, ...).
+  What is missing is only the caching.
+  - [ ] Cache them in `pci_device` if a caller ever needs BARs without a
+    config-space round trip. Nothing does today — enumeration is once at boot.
   Cache them so drivers retrieve without re-reading.
 - [ ] No ECAM/MCFG (PCIe memory-mapped config) — only legacy CAM. Parse the
   MCFG ACPI table, map config space, support 4KB extended config.
 - [ ] No recursive bridge scanning — brute force works but doesn't follow
   secondary buses behind PCI-to-PCI bridges properly.
-- [ ] No capability-list parsing (MSI/MSI-X, power management).
-- [ ] No interrupt routing — wire device INTx/MSI to IO-APIC/LAPIC.
+- [x] ~~No capability-list parsing (MSI/MSI-X, power management)~~ — the
+  capability list IS walked: `pci.c` checks the status-register capabilities
+  bit, then chains through looking for **MSI (id 0x05)** and **MSI-X (id
+  0x11)**, and programs table entry 0 to deliver a chosen vector
+  (`pci_enable_msi` / `pci_enable_msix`). xHCI uses the MSI-X path in anger.
+  - [ ] Still unparsed: **power management** (id 0x01) and everything else on
+    the chain — only the two interrupt capabilities are looked for.
+- [x] ~~No interrupt routing — wire device INTx/MSI to IO-APIC/LAPIC~~ — both
+  directions exist: ISA/INTx lines go through the IO-APIC with MADT overrides
+  applied (visible at boot, e.g. `IO-APIC: ISA IRQ 14 -> GSI 14 (edge)` then
+  `GSI 14 -> vector 46`), and MSI/MSI-X are programmed straight to a LAPIC
+  vector by `pci_enable_msi`/`pci_enable_msix`.
+  - [ ] Still absent: reading the **ACPI `_PRT`** to discover a PCI device's
+    INTx→GSI mapping. Today a driver is told its line rather than deriving it,
+    which works because this machine's devices are known.
 - [ ] No device-specific driver-binding mechanism yet.
 - [ ] Vendor/device ID → human-name database (currently only class names).
 
@@ -680,8 +708,18 @@ interrupt-driven.
   deadlock), `test thread smp` OK (8 threads/one proc — the process_alloc change).
   - [ ] ⚠️ **The race trigger is still not covered by a test** — every suite is
     effectively single-threaded per fd table, so the lock is never contended.
-    Same gap the bounce-buffer lock has; a concurrent open/close hammer (N
-    threads, assert no two fds alias one slot) is the shared missing harness.
+    A concurrent open/close hammer (N processes, assert no two fds alias one
+    slot) is the missing harness.
+    - **The template now exists**: `test blockrace` + `user/bin/ioracer.c` do
+      exactly this shape for the block layer — spawn N processes *before*
+      waiting on any, then assert on content rather than on return codes, and
+      report whether the lock was actually contended so a vacuous pass is
+      visible. Copy that structure; the fd version needs an ioracer-equivalent
+      that opens/closes rather than reads.
+    - Worth knowing before writing it: the bounce-buffer version came back
+      **zero-contended** because the EMBKFS big lock serialises above it. Check
+      whether the fd table has a similar layer above before concluding the
+      absence of contention means the lock is unnecessary.
 - [x] ~~O_TRUNC reserved but not honored.~~ **DONE** — `fd.c` shrinks to zero
   through the VFS truncate op at open time.
 - [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
@@ -1229,8 +1267,10 @@ substantially complete.
 
 ## Core / Library
 
-- [ ] Refactor done: kprintf + snprintf share one format_string core. Future:
-  add %b (binary) / field-precision if needed; both wrappers benefit.
+- [x] ~~Refactor: kprintf + snprintf share one `format_string` core~~ — done
+  (the entry said so while staying checked-open).
+  - [ ] Optional extras, only if something needs them: `%b` (binary) and
+    field-precision. Both wrappers would benefit for free.
 - [ ] kstring: only the subset in use is implemented. Add more (strstr, strtok,
   memchr, etc.) as needed — don't pre-build the whole libc.
 
@@ -1248,8 +1288,14 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
-- [ ] **embbuild** — the native build tool (the make-equivalent — DECIDED and
-  now DESIGNED: `docs/BUILD.md` is the ratification document + v1 spec;
+- [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
+  **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
+  by `test embbuild` (cases a–f including the §3 `/system` install refusal),
+  `test embbuild self` (EmbBuild rebuilds EmbBuild, cross-checked by a
+  two-implementations oracle), `test embbuild shell` (the shell rebuilds the
+  shell and the OS adopts it), and `test embbuild gui` (a `libembk.so` EmUI app
+  built from a manifest and adopted). The design record below is kept because
+  the reasoning is still the justification for the shape:
   manifest format, content-hash stamps, stage/adopt via atomic rename,
   `/data/build/` tree, `test embbuild` acceptance).
   The fork was audited and ratified: a **native structured tool**, not a make
@@ -1269,8 +1315,11 @@ substantially complete.
   make itself arrives later as opt-in compat with the foreign-tree ports
   story. Nice detail available: build it on the sval SDK, which is on-image
   and already proven self-rebuildable.
-  - [ ] v1 staleness detail: hash file bytes in userspace; exposing a cheap
-    content identity from EMBKFS's CoW generation machinery is a later kernel
-    item, pulled by need.
-  - [ ] Prerequisite already DONE: separate compile-then-link with
-    tcc-produced objects, proven live (`test tcc tally`).
+  - [x] v1 staleness detail: hashing file bytes in userspace — **that is what
+    shipped** (CRC32C over inputs + argv + tool version).
+    - [ ] Still open, and still "pulled by need": exposing a cheap content
+      identity from EMBKFS's CoW generation machinery, so a stamp need not
+      re-read the file to know it changed.
+  - [x] Prerequisite DONE: separate compile-then-link with tcc-produced
+    objects, proven live (`test tcc tally`). *(Was checked-open while its own
+    text said "already DONE".)*
