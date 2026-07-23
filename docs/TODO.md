@@ -964,9 +964,24 @@ how it came down" and BUILD.md §6.
   link, and land on the image with zero build-file edits. *(Minor residual:
   deleting an app's `.c` leaves a stale `build/*.elf` that keeps getting
   packed until `make clean` — adding is free, removing needs the clean.)*
-- [ ] **No real TTY.** The framebuffer console is output-only (no
-  scrollback, no line editing); a text shell (see Architecture roadmap)
-  needs this built first.
+- [x] ~~**No real TTY.** The framebuffer console is output-only (no
+  scrollback, no line editing)~~ — **a real TTY exists** (`kernel/tty/`): a
+  line discipline with cooked and raw modes, line buffering, echo, backspace
+  erase (which refuses to back over the prompt), `^D` EOF on an empty line,
+  and `^C` cancellation returning `-EMBK_ECANCELED`. The console fd's read op
+  in `fs/fd.c` is a thin shim over `tty_read()`, so everything a terminal does
+  that a raw keyboard does not lives in one place. Proven by `test tty`
+  (injection-driven, so it needs no real key presses): **OK**.
+  - The entry bundled two different things and only one of them is still open:
+    **line editing** is done (input side), **scrollback** is not (output side).
+    `console.c`'s `scroll_up()` is overflow scrolling — it advances the screen
+    when text reaches the bottom — not a history buffer you can page back
+    through. Those are separate features and the original wording made them
+    look like one gap.
+  - [ ] **No scrollback history.** Output that scrolls off the top is gone;
+    there is no saved-line ring to page back through. Wanted for reading a long
+    boot log or a command's output on the framebuffer console — the serial log
+    is the current workaround, which is why this has never bitten hard.
 - [ ] **`home.elf` plays an informal init/service-manager role** (spawns and
   tracks every app the user launches, including the clock widget at boot)
   without being a real PID-1/service-manager abstraction — fine for a
