@@ -10,6 +10,7 @@
 #include "include/errno.h"
 #include "include/kstring.h"
 #include "arch/x86_64/syscall/elf.h"
+#include "arch/x86_64/syscall/embx.h"   /* EMBX loader dispatch */
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
 #include "arch/x86_64/cpu/kcontext.h"
@@ -1171,11 +1172,28 @@ int process_create_caps(const char *path, char *const argv[], int argc,
      * elf_load maps into pml4 and copies through P2V). stash the entry point for the trampoline jump to*/
 
     uint64_t entry_point = 0;
-    int rc = elf_load_from_file(path, pml4, &entry_point);
+    /* Dispatch on the image format. An EMBX binary carries its OWN declared
+     * capability set, checked against this (parent) process's set inside the
+     * loader (EMBX §6 step 9) -- so it OVERRIDES the caller-attenuated cap_set
+     * set above: the binary declares what it needs, the parent grants or the
+     * load fails. An ELF has no declaration and keeps the cap_set from the
+     * requested_caps attenuation above (ring 1's SET_CAPS action, or INHERIT). */
+    uint8_t magic8[8] = {0};
+    { int mfd = vfs_open(path, O_RDONLY, 0);
+      if (mfd >= 0) { size_t g = 0; vfs_fd_read(mfd, magic8, sizeof magic8, &g); vfs_close(mfd); } }
+    int rc;
+    if (embx_is_magic(magic8)) {
+        uint64_t parent_caps = current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+        uint64_t granted = 0;
+        rc = embx_load_from_file(path, pml4, parent_caps, &entry_point, &granted);
+        if (rc == EMBK_OK) proc->cap_set = granted;   /* declared + granted */
+    } else {
+        rc = elf_load_from_file(path, pml4, &entry_point);
+    }
     if (rc != EMBK_OK) {
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
-        return rc;  // ELF load failed
+        return rc;  // image load failed (ELF/EMBX, incl. -EMBK_EPERM for a cap denial)
     }
 
     fds_init_stdio(proc);

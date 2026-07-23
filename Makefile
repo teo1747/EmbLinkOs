@@ -61,6 +61,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
              kernel/arch/x86_64/syscall/elf.c \
+             kernel/arch/x86_64/syscall/embx.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
 			 kernel/tty/tty.c \
@@ -370,10 +371,21 @@ build/capchild.o: user/bin/capchild.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capchild.o -lc -lgcc -o $@
+
+# capchild.embx -- the ring-2 fixture: capchild repackaged as an EMBX APP with a
+# DECLARED capability table {FILESYSTEM}. The loader checks that declaration
+# against the grantor (step 9) and the born process gets exactly it, which
+# capchild then reports via its exit code. mkembx.py is the byte-exact producer.
+build/capchild.embx: build/capchild.elf tools/embx/mkembx.py | $(BUILD)
+	python3 tools/embx/mkembx.py build/capchild.elf $@ --cap FILESYSTEM
 build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capspawn.o -lc -lgcc -o $@
+build/capreload.o: user/bin/capreload.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capreload.elf: build/crt0.o build/syscalls.o build/capreload.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capreload.o -lc -lgcc -o $@
 
 # --- shell.elf: the EmbLink structured shell (shell/) --------------------------
 # Static newlib link (hello.elf's shape, not the EmUI dynamic one -- the shell
@@ -530,7 +542,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/capchild.c user/bin/capspawn.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -687,7 +699,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
-               build/capchild.elf build/capspawn.elf \
+               build/capchild.elf build/capspawn.elf build/capreload.elf build/capchild.embx \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

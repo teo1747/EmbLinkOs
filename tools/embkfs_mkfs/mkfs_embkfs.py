@@ -811,6 +811,14 @@ def discover_userland_objects(build_dir="build"):
     for name, fill in ((b"data/racea.bin", b"A"), (b"data/raceb.bin", b"B")):
         objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, fill * (256 * 1024)))
 
+    # EMBX ring-2 fixture: capchild repackaged as a native EMBX APP declaring
+    # {FILESYSTEM}. Not a *.elf, so the auto-discovery above skips it; pack it
+    # explicitly. `test embx` loads it and checks step 9 + the born cap set.
+    cx = _read_file("build/capchild.embx")
+    if cx is not None:
+        objects.append((b"data/apps/capchildx/capchild.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, cx))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single

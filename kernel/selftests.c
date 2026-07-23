@@ -381,6 +381,7 @@ static void selftests_print_commands(void)
     kprintf("  test pmm\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
+    kprintf("  test embx\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
@@ -640,6 +641,68 @@ int selftests_handle_command(const char *cmd)
  * spawns and self-checks -- exit 0 only if all four of its steps hold, or a
  * distinct 11..14 naming which failed. So a single exit code carries the whole
  * result across the boundary. */
+/* RING 2: the EMBX loader end to end, with the capability check that is the
+ * format's reason for existing.
+ *
+ * capchild.embx is capchild repackaged as a native EMBX APP DECLARING
+ * {FILESYSTEM}. Two things are proven, and the second is the point:
+ *   ACCEPT: loaded from a grantor that holds FS, it runs, is born with exactly
+ *           the declared set, and reports it -- exit code 2 == {FS}. So the
+ *           declaration flowed through step 9 into the process's cap_set: the
+ *           binary declared its own authority and got it.
+ *   REFUSE: loaded from a grantor that LACKS FS (a launcher seeded {NETWORK}),
+ *           step 9 denies it with -EMBK_EPERM BEFORE anything is mapped. This
+ *           is the whole difference between an EMBX binary and an ELF one.
+ * The refuse case is exercised by seeding a launcher with only {NET} and having
+ * IT try to load the {FS}-declaring binary -- because the kernel console holds
+ * full authority and could never show the denial itself. */
+    if (strcmp(cmd, "test embx") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embx: VFS not registered\n"); return 1; }
+        const char *xp = "/data/apps/capchildx/capchild.embx";
+        struct vfs_stat st;
+        if (vfs_stat(xp, &st) != 0) { kprintf("\n[cmd] test embx: %s not on image\n", xp); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* ACCEPT: kernel context holds full authority, so {FS} is grantable.
+         * The EMBX binary runs and exits with its born cap set. */
+        char *a[] = { (char *)xp, NULL };
+        kprintf("[embx] ACCEPT: loading %s from a full-authority grantor\n", xp);
+        int pid = process_create_env(xp, a, 1, env, NULL, 0);
+        if (pid < 0) {
+            kprintf("[embx] FAIL: load returned %s (want success)\n", embk_strerror(pid)); ok = 0;
+        } else {
+            int code = process_wait((uint32_t)pid);
+            uint64_t want = (uint64_t)EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);   /* == 2 */
+            kprintf("[embx] EMBX APP ran, exit=%d (== its born cap_set; want %llu={FS})\n",
+                    code, (unsigned long long)want);
+            if (code != (int)want) { kprintf("[embx] FAIL: declared {FS} did not become the born cap set\n"); ok = 0; }
+        }
+
+        /* REFUSE: seed a launcher with ONLY {NETWORK}; it loads the same EMBX
+         * (which declares {FS}); step 9 must deny it. capreload.elf does the
+         * load and exits 0 on the EXPECTED denial, nonzero otherwise. */
+        if (ok) {
+            const char *lp = "/data/apps/capreload/capreload.elf";
+            if (vfs_stat(lp, &st) == 0) {
+                char *la[] = { (char *)lp, NULL };
+                uint64_t net_only = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+                kprintf("[embx] REFUSE: launcher seeded {NET} tries to load the {FS}-declaring EMBX\n");
+                int lpid = process_create_caps(lp, la, 1, env, NULL, 0, net_only);
+                int lcode = lpid >= 0 ? process_wait((uint32_t)lpid) : -1;
+                kprintf("[embx] launcher exit=%d (0 = it correctly saw the denial)\n", lcode);
+                if (lcode != 0) { kprintf("[embx] FAIL: step-9 denial not observed as expected\n"); ok = 0; }
+            } else {
+                kprintf("[embx] (refuse case skipped: capreload.elf not on image)\n");
+            }
+        }
+
+        kprintf("\n[cmd] test embx: %s\n",
+                ok ? "OK -- EMBX APP loads, its declared caps become the process's, "
+                     "and a grantor lacking them is refused at step 9" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test spawncaps") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test spawncaps: VFS not registered\n"); return 1; }
         const char *sp = "/data/apps/capspawn/capspawn.elf";
